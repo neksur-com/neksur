@@ -27,10 +27,10 @@ htmlcov/
 venv/
 env/
 
-# Virtualenv lockfiles
+# Virtualenv lockfiles (lockfiles handled per-tool; uv.lock added in Wave 1 when versions pin)
 poetry.lock
 uv.lock
-.python-version
+# NOTE: .python-version IS tracked (it pins the project runtime per docs/decisions/D-W0-runtime-pick.md).
 
 # IDEs
 .idea/
