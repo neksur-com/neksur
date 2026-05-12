@@ -1,0 +1,54 @@
+# =====================================================================
+# atlas.hcl.rejected — Atlas configuration for the Phase 0 W1 spike.
+#
+# This file is RETAINED FOR TRACEABILITY ONLY. It represents the Atlas
+# wrapper that was evaluated during the Atlas-vs-sqitch spike for
+# Plan 00-02 Task 2a. The spike concluded sqitch wins (see
+# docs/decisions/D-W1-migration-tool.md — LOCKED). The runtime tool is
+# sqitch; this file is NOT used by infra/migrations/run-migrations.sh.
+#
+# Why it's kept:
+#   1. Demonstrates exactly how Atlas would have been wired for AGE.
+#   2. Makes the spike outcome auditable — a future engineer
+#      revisiting the decision can run this file through `atlas migrate
+#      apply` and confirm the friction described in the ADR.
+#   3. Documents the `migration { sql = file(...) }` raw-SQL escape
+#      hatch as the only viable Atlas mode for AGE-bearing migrations.
+# =====================================================================
+
+# Each of the three sample migrations needs the SAME pattern: read a
+# raw SQL file from disk and execute it. There is no HCL-declarative
+# representation for `create_vlabel` / `create_elabel` / RLS-on-AGE-tables.
+
+# Connection variables (would be filled by the runner if Atlas were used).
+variable "dburl" {
+  type    = string
+  default = "postgres://localhost:5432/postgres?sslmode=disable"
+}
+
+env "phase0" {
+  url = var.dburl
+
+  # Atlas's `dir` directive points at a directory of versioned SQL files.
+  # Because nothing here is HCL-declarative, this whole block reduces to
+  # "run the SQL files in order" — which sqitch does natively, with
+  # better revert support and a plan file format that captures dependencies.
+  migration {
+    dir = "file://migrations"
+    # Atlas insists on a baseline; for AGE-bearing migrations there is
+    # no meaningful diff target, so we pin the lowest version.
+    baseline = "V0001"
+    revisions_schema = "public"
+  }
+}
+
+# Note for the future reader:
+#
+#   The Plan 00-02 spike found that even with this minimal config, Atlas's
+#   `atlas schema inspect` against a migrated database reports AGE's
+#   internal partition tables (_ag_label_vertex, _ag_label_edge) as
+#   "orphan" objects it offers to drop. Suppressing them requires an
+#   ever-growing `exclude_pattern` list — that is the inverted-gravity
+#   pattern Phase 0 should not invest in.
+#
+#   See docs/decisions/D-W1-migration-tool.md for the full rationale.
