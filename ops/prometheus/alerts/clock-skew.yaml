@@ -1,0 +1,49 @@
+# Clock-skew PromQL alert rules — two-tier WARN / PAGE per C-TECH-10.
+#
+# Verifies C-TECH-10 (clock-skew contract):
+#   - 100ms drift sustained 1min → WARN (early signal to investigate NTP)
+#   - 500ms drift sustained 1min → PAGE (audit-log timestamp ordering at risk)
+#
+# Source metric: chrony_tracking_last_offset_seconds (emitted by the chrony
+# exporter — installed on every Postgres node per 00-RESEARCH.md §Standard
+# Stack and Plan 00-05 Wave 4).
+#
+# Both thresholds come from 00-RESEARCH.md §Pitfall 8 (clock-skew tiering)
+# and §Open Questions #4 (PromQL exact form).
+#
+# Runbook: runbooks/clock-skew.md (Plan 00-05).
+
+groups:
+  - name: clock_skew
+    rules:
+      - alert: ClockSkewWarn
+        expr: abs(chrony_tracking_last_offset_seconds) > 0.1
+        for: 1m
+        labels:
+          severity: warn
+          contract: C-TECH-10
+        annotations:
+          summary: "Clock skew > 100ms sustained 1min (C-TECH-10 WARN tier)"
+          description: |
+            chrony reports clock offset > 100ms sustained for 1min on at
+            least one Postgres node. Audit-log timestamp ordering is not
+            yet at risk, but NTP health should be verified before drift
+            crosses the 500ms PAGE threshold.
+
+            Runbook: runbooks/clock-skew.md
+
+      - alert: ClockSkewPage
+        expr: abs(chrony_tracking_last_offset_seconds) > 0.5
+        for: 1m
+        labels:
+          severity: page
+          contract: C-TECH-10
+        annotations:
+          summary: "Clock skew > 500ms sustained 1min (C-TECH-10 PAGE tier)"
+          description: |
+            chrony reports clock offset > 500ms sustained for 1min. This
+            breaches the C-TECH-10 PAGE threshold — audit-log timestamp
+            ordering across replicas may be inconsistent and PITR target
+            time may be ambiguous. Page on-call immediately.
+
+            Runbook: runbooks/clock-skew.md

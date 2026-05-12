@@ -1,0 +1,32 @@
+# Cypher query latency PromQL alert rule.
+#
+# Verifies D-001.14 (Cypher query observability contract):
+# P99 of cypher_duration_ms must stay ≤2000ms; sustained breach for 5min pages.
+#
+# The cypher_duration_ms histogram metric itself is emitted by the
+# observability middleware shipped in Plan 00-05 (Wave 4 — Cypher observability
+# middleware). This file exists in Wave 0 so the rule can be unit-tested with
+# promtool and committed to git as the audit trail required by threat
+# T-0-W0-ALERT-WIRE (see 00-01-PLAN.md).
+#
+# Runbook: runbooks/cypher-latency-breach.md (Plan 00-05).
+
+groups:
+  - name: cypher_latency
+    rules:
+      - alert: CypherP99LatencyBreach
+        expr: histogram_quantile(0.99, sum by (le) (rate(cypher_duration_ms_bucket[5m]))) > 2000
+        for: 5m
+        labels:
+          severity: page
+          contract: D-001.14
+        annotations:
+          summary: "Cypher P99 latency exceeded 2s sustained for 5min (D-001.14)"
+          description: |
+            P99 of cypher_duration_ms over the last 5min is above 2000ms,
+            sustained for 5min. This violates the D-001.14 Cypher query
+            observability latency budget. Investigate via the metric
+            cypher_duration_ms_bucket grouped by tenant and query_kind to
+            identify the offending traffic shape.
+
+            Runbook: runbooks/cypher-latency-breach.md
