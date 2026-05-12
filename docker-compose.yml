@@ -1,0 +1,38 @@
+# Neksur Core — local-dev compose file
+#
+# Phase 0 single-node Postgres + Apache AGE setup for developer laptops.
+# Patroni cluster, pgBackRest, etcd, OPA sidecar, etc. land in subsequent
+# plans (00-03 Wave 2 Patroni HA, 00-04 Wave 3 backup/PITR). This is the
+# minimum that lets `make migrate DB_URL=...` + `go test ./tests/...`
+# work end-to-end against a real DB.
+
+services:
+  postgres:
+    # The image is built from infra/postgres/Dockerfile, which extends
+    # apache/age:release_PG16_1.6.0 with pgaudit (production gate; the
+    # base image lacks it and V0001 conditionally skips with a NOTICE).
+    build:
+      context: ./infra/postgres
+      dockerfile: Dockerfile
+    image: neksur/postgres-age:phase0-dev
+    container_name: neksur-postgres-dev
+    environment:
+      POSTGRES_USER: neksur
+      POSTGRES_PASSWORD: neksur_dev
+      POSTGRES_DB: neksur
+    ports:
+      # 5432 on the host so psql / Go integration runs locally bind here.
+      - "5432:5432"
+    volumes:
+      - neksur_pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/postgresql.base.conf:/etc/postgresql/postgresql.base.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neksur -d neksur"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  neksur_pgdata:
+    driver: local

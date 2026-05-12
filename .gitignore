@@ -5,32 +5,22 @@
 # macOS
 .DS_Store
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
+# Go build / test artifacts
+bin/
 dist/
-*.egg-info/
-.eggs/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-.hypothesis/
-.venv/
-venv/
-env/
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+profile.out
+cpu.prof
+mem.prof
+vendor/
 
-# Virtualenv lockfiles (lockfiles handled per-tool; uv.lock added in Wave 1 when versions pin)
-poetry.lock
-uv.lock
-# NOTE: .python-version IS tracked (it pins the project runtime per docs/decisions/D-W0-runtime-pick.md).
+# Go module / build caches (these live under $GOPATH/pkg or $GOCACHE by default,
+# but listed defensively in case of a project-local override).
+.gocache/
 
 # IDEs
 .idea/
@@ -53,7 +43,10 @@ pgdata/
 .env.*.local
 
 # Test artifacts
-.coverage.*
-coverage.xml
 junit.xml
 .testcontainers/
+
+# Frontend (web/) build output — Phase 1+; pre-emptively listed
+web/node_modules/
+web/dist/
+web/.vite/
