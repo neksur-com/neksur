@@ -1,0 +1,30 @@
+-- =====================================================================
+-- V0001 — Enable required Postgres extensions for the Neksur stack.
+--
+-- Order: this migration MUST run before V0010 (which `LOAD 'age'` and
+-- creates the graph). Each extension is its own statement; per Pitfall 7
+-- (00-RESEARCH.md), AGE catalog mutations are not always fully transactional,
+-- so we isolate the extension installs with explicit transaction comment
+-- headers — if one fails, the operator inspects exactly that statement.
+--
+-- pgaudit + pg_stat_statements also require entries in
+-- shared_preload_libraries (set in infra/postgres/postgresql.base.conf:
+-- shared_preload_libraries = 'age,pgaudit,pg_stat_statements'). The
+-- CREATE EXTENSION calls here register the SQL objects; the loader
+-- itself is configured at Postgres-server startup.
+--
+-- Pitfall 1 (00-RESEARCH.md): "AGE graph name" and "Postgres schema name"
+-- are distinct. The AGE graph created in V0010 is named `neksur`; do NOT
+-- confuse it with future application schemas (prefix `neksur_app_*`).
+-- See infra/postgres/age-naming.md.
+-- =====================================================================
+
+-- Transaction header: pg_stat_statements (cheap; harmless if already loaded)
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Transaction header: pgaudit (DDL audit trail — Phase 6 hardens further)
+CREATE EXTENSION IF NOT EXISTS pgaudit;
+
+-- Transaction header: age (graph extension — must come last so any
+-- failure leaves the lighter extensions installed and inspectable)
+CREATE EXTENSION IF NOT EXISTS age;
