@@ -83,6 +83,12 @@ SELECT create_elabel('neksur', 'GOVERNS');
 -- ----- Post-creation verification -----------------------------------------
 -- Per Pitfall 7 we MUST verify the counts in-band. A count mismatch raises
 -- inside the DO block, causing this migration's BEGIN/COMMIT to rollback.
+--
+-- Note: AGE's `create_graph()` auto-creates two synthetic labels
+-- `_ag_label_vertex` and `_ag_label_edge` (the "default" containers used
+-- when a label is unspecified). They are NOT part of the D-001.05/.06
+-- contract — our 19 + 24 count excludes them. The filter `name NOT LIKE
+-- '\_ag\_label\_%'` ESCAPE '\' explicitly excludes them.
 DO $$
 DECLARE
     vcount INT;
@@ -93,12 +99,14 @@ BEGIN
     SELECT count(*) INTO vcount
     FROM ag_catalog.ag_label
     WHERE graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = 'neksur')
-      AND kind = 'v';
+      AND kind = 'v'
+      AND name NOT LIKE E'\\_ag\\_label\\_%' ESCAPE E'\\';
 
     SELECT count(*) INTO ecount
     FROM ag_catalog.ag_label
     WHERE graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = 'neksur')
-      AND kind = 'e';
+      AND kind = 'e'
+      AND name NOT LIKE E'\\_ag\\_label\\_%' ESCAPE E'\\';
 
     IF vcount <> expected_vcount THEN
         RAISE EXCEPTION 'V0010 vlabel count mismatch: expected %, got % — D-001.05 amended by D-003.06 requires 19', expected_vcount, vcount;

@@ -22,8 +22,28 @@
 -- Transaction header: pg_stat_statements (cheap; harmless if already loaded)
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
--- Transaction header: pgaudit (DDL audit trail — Phase 6 hardens further)
-CREATE EXTENSION IF NOT EXISTS pgaudit;
+-- Transaction header: pgaudit (DDL audit trail — Phase 6 hardens further).
+--
+-- pgaudit is REQUIRED in production (Phase 0 production image bundles it
+-- via infra/postgres/Dockerfile). In testcontainer-only dev/test runs the
+-- base apache/age image does NOT include it, so we conditionally install:
+-- if the extension files are present, create it; otherwise emit a NOTICE
+-- and continue. The Phase 0 test gates don't depend on pgaudit (it's the
+-- stepping stone to the Phase 6 hash-chain audit log); production gates
+-- WILL fail on the image-builder step if the package is missing.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_available_extensions WHERE name = 'pgaudit'
+    ) THEN
+        CREATE EXTENSION IF NOT EXISTS pgaudit;
+    ELSE
+        RAISE NOTICE 'pgaudit not available (testcontainer image); '
+                     'skipped. Production image must include it — see '
+                     'infra/postgres/Dockerfile.';
+    END IF;
+END
+$$ LANGUAGE plpgsql;
 
 -- Transaction header: age (graph extension — must come last so any
 -- failure leaves the lighter extensions installed and inspectable)

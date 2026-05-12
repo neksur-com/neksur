@@ -19,7 +19,7 @@
 LOAD 'age';
 SET search_path = ag_catalog, "$user", public;
 
--- vlabel count (expect 19)
+-- vlabel count (expect 19; excludes AGE's synthetic _ag_label_vertex)
 SELECT
     CASE WHEN count(*) = 19 THEN 'PASS' ELSE 'FAIL' END AS status,
     'vlabel_count' AS check_name,
@@ -27,9 +27,10 @@ SELECT
     19 AS expected
 FROM ag_catalog.ag_label
 WHERE graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = 'neksur')
-  AND kind = 'v';
+  AND kind = 'v'
+  AND name NOT LIKE E'\\_ag\\_label\\_%' ESCAPE E'\\';
 
--- elabel count (expect 24)
+-- elabel count (expect 24; excludes AGE's synthetic _ag_label_edge)
 SELECT
     CASE WHEN count(*) = 24 THEN 'PASS' ELSE 'FAIL' END AS status,
     'elabel_count' AS check_name,
@@ -37,7 +38,8 @@ SELECT
     24 AS expected
 FROM ag_catalog.ag_label
 WHERE graph = (SELECT graphid FROM ag_catalog.ag_graph WHERE name = 'neksur')
-  AND kind = 'e';
+  AND kind = 'e'
+  AND name NOT LIKE E'\\_ag\\_label\\_%' ESCAPE E'\\';
 
 -- Required extensions
 SELECT

@@ -38,22 +38,29 @@ if TYPE_CHECKING:
 async def set_tenant_context(conn: "AsyncConnection", tenant_id: str) -> None:
     """Set ``app.current_tenant`` for the surrounding transaction.
 
-    Uses ``SET LOCAL`` so the value is bound to the transaction lifetime
-    only — ``ROLLBACK``/``COMMIT`` clears it. The tenant id is bound as
-    a parameter (``%s``), NEVER concatenated into the SQL string, to
-    eliminate the injection surface even for trusted callers.
+    Uses ``set_config(name, value, true)`` — equivalent to ``SET LOCAL``
+    but parameter-bindable (Postgres rejects ``$1`` substitution for the
+    value of a bare ``SET LOCAL`` statement; the function form accepts
+    proper bind parameters). The ``is_local=true`` argument scopes the
+    value to the active transaction; ``ROLLBACK``/``COMMIT`` clears it.
+
+    The tenant id is bound as a parameter (``%s``), NEVER concatenated
+    into the SQL string, to eliminate the injection surface even for
+    trusted callers (T-0-INJ floor; Phase 5 ADR-004 hardens further).
 
     Args:
         conn: open async psycopg connection inside an active transaction.
         tenant_id: opaque tenant identifier; Postgres treats it as
             ``text`` and the RLS policy in V0030 compares it via
-            ``(properties->>'tenant_id') = current_setting(...)``.
+            ``(properties->>'tenant_id'::text) = current_setting(...)``.
 
     Raises:
-        psycopg.Error: any Postgres-level failure (e.g., "SET LOCAL can
-            only be used in a transaction").
+        psycopg.Error: any Postgres-level failure.
     """
-    await conn.execute("SET LOCAL app.current_tenant = %s", (tenant_id,))
+    await conn.execute(
+        "SELECT set_config('app.current_tenant', %s, true)",
+        (tenant_id,),
+    )
 
 
 async def reset_session(conn: "AsyncConnection") -> None:
