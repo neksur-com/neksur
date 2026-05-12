@@ -1,3 +1,7 @@
+# Private planning material — symlinked from sibling repo, never committed to Core
+/.planning
+/base
+
 # macOS
 .DS_Store
 
