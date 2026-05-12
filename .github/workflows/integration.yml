@@ -13,36 +13,34 @@ concurrency:
 
 jobs:
   integration:
-    name: pytest tests/integration (Postgres 16 + AGE 1.6.0 via testcontainers)
+    name: go test ./tests/integration ./tests/security (Postgres 16 + AGE 1.6.0 via testcontainers-go)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          python-version-file: .python-version
-          cache: pip
+          go-version-file: go.mod
+          cache: true
 
       - name: Verify Docker is available
         # ubuntu-latest runners ship Docker pre-installed; this step makes the
         # dependency explicit so a future runner image change surfaces here.
         run: docker version
 
-      - name: Install project (dev deps)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
       - name: Pre-pull AGE image (cache for the run)
-        # testcontainers will pull on first use, but doing it explicitly gives
-        # us a clearer log line on test-fixture cold-start.
+        # testcontainers-go will pull on first use, but doing it explicitly
+        # gives us a clearer log line on test-fixture cold-start and avoids
+        # the per-test-package implicit pull race.
         run: docker pull apache/age:release_PG16_1.6.0
 
-      - name: Run integration tests
+      - name: Run integration + security tests
         env:
-          # testcontainers + Docker socket — defaults on ubuntu-latest.
+          # testcontainers-go uses Docker socket; defaults work on
+          # ubuntu-latest. The reaper container ("ryuk") is enabled by
+          # default — keeps stale containers cleaned up.
           TESTCONTAINERS_RYUK_DISABLED: "false"
-        run: pytest tests/integration -x -m integration
+        run: go test ./tests/integration/... ./tests/security/... -race -count=1 -timeout=20m

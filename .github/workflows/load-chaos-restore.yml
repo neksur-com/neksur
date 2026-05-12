@@ -26,17 +26,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          python-version-file: .python-version
-          cache: pip
-      - name: Install project (dev deps)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          go-version-file: go.mod
+          cache: true
       - name: Run load suite
-        run: pytest tests/load -x -m load
+        # `go test -tags=load` selects the load-tagged tests once Plan 06
+        # implements them. Until then the stub package returns an
+        # ErrNotImplemented sentinel that the runner should accept.
+        run: go test ./tests/load/... -tags=load -timeout=120m -count=1
 
   chaos:
     name: Chaos drills (Plan 00-03 / Wave 2 — Patroni kill-primary)
@@ -45,17 +44,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          python-version-file: .python-version
-          cache: pip
-      - name: Install project (dev deps)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          go-version-file: go.mod
+          cache: true
       - name: Run chaos suite
-        run: pytest tests/chaos -x -m chaos
+        # `go test -tags=chaos` selects the chaos-tagged tests once Plan
+        # 03 implements them. Until then the stub package returns an
+        # ErrNotImplemented sentinel.
+        run: go test ./tests/chaos/... -tags=chaos -timeout=30m -count=1
 
   restore:
     name: Restore drills (Plan 00-04 / Wave 3 — pgBackRest PITR + monthly)
@@ -64,16 +62,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: .python-version
-          cache: pip
-      - name: Install project (dev deps)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
       - name: PITR restore drill
+        # Bash skeletons — Plan 04 will fill in the real logic. The
+        # `--assert-rto-under N` arg is the contract the scripts
+        # already understand; until implemented they exit with a
+        # known non-zero status that the runner will surface.
         run: bash tests/dr/restore_pit.sh --assert-rto-under 3600
       - name: Chaos restore (RPO assertion)
         run: bash tests/dr/chaos_restore.sh --assert-rpo-under 900

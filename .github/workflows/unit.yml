@@ -15,23 +15,32 @@ concurrency:
 
 jobs:
   unit:
-    name: pytest tests/unit
+    name: go test ./internal/... (no Docker required)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          python-version-file: .python-version
-          cache: pip
+          # Read the Go version from go.mod — single source of truth.
+          go-version-file: go.mod
+          # Built-in module + build cache via setup-go.
+          cache: true
 
-      - name: Install project (dev deps)
+      - name: Go version (diagnostic)
+        run: go version
+
+      - name: Verify go.mod tidy
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          go mod tidy
+          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+            echo "ERROR: go.mod or go.sum is not tidy. Run 'go mod tidy' locally and commit." >&2
+            git diff go.mod go.sum
+            exit 1
+          fi
 
       - name: Run unit tests
-        run: pytest tests/unit -x -q
+        run: go test ./internal/... -race -count=1 -short
