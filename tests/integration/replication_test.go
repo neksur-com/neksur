@@ -42,9 +42,12 @@ import (
 )
 
 const (
-	// haproxyPrimaryDSNRepl is HAProxy's primary frontend (port 5000).
-	// All writes go here so HAProxy routes to the current Patroni leader.
-	haproxyPrimaryDSNRepl = "postgres://postgres:postgres@localhost:5000/postgres?sslmode=disable"
+	// haproxyPrimaryDSNRepl is HAProxy's primary frontend. Inside the
+	// container HAProxy listens on 5000; docker-compose maps host 5500
+	// → container 5000 to dodge the macOS AirPlay Receiver conflict
+	// (live verify 2026-05-13). All writes go here so HAProxy routes
+	// to the current Patroni leader.
+	haproxyPrimaryDSNRepl = "postgres://postgres:postgres@localhost:5500/postgres?sslmode=disable"
 
 	// pg-node-1 direct DSN for primary-side pg_stat_replication queries.
 	// docker-compose.ha.yml maps pg-node-1's 5432 → host 5411.
@@ -81,6 +84,13 @@ func TestReplicaLagUnderLoad(t *testing.T) {
 	})
 	if err := startHACluster(ctx, t); err != nil {
 		t.Fatalf("startHACluster: %v", err)
+	}
+	// Provision AGE in the fresh cluster: CREATE EXTENSION + create_graph.
+	// docker-compose.ha.yml brings up Patroni-managed Postgres without our
+	// Plan 02 migrations; this is the minimum needed for cypher() calls to
+	// resolve. Idempotent.
+	if err := setupAGEForReplicationTest(ctx, t); err != nil {
+		t.Fatalf("setupAGEForReplicationTest: %v", err)
 	}
 
 	// Background write load — multiple workers because a single goroutine
@@ -319,9 +329,15 @@ func startHACluster(ctx context.Context, t *testing.T) error {
 			continue
 		}
 		// Look for "role": "master" in the body — cheap textual check
-		// avoids decoding the full payload here.
-		if (strings.Contains(body, `"role": "master"`) || strings.Contains(body, `"role": "leader"`)) &&
-			strings.Count(body, `"role": "replica"`) >= 2 {
+		// avoids decoding the full payload here. With synchronous_mode=true
+		// one follower reports role="sync_standby"; count both forms so we
+		// see all >=2 followers in the 3-node cluster (bug #17 — without
+		// sync_standby in the counter the settle check times out at 180s).
+		hasLeader := strings.Contains(body, `"role": "master"`) || strings.Contains(body, `"role": "leader"`)
+		followers := strings.Count(body, `"role": "replica"`) +
+			strings.Count(body, `"role": "sync_standby"`) +
+			strings.Count(body, `"role": "synchronous_standby"`)
+		if hasLeader && followers >= 2 {
 			t.Logf("HA cluster settled")
 			return nil
 		}
@@ -341,6 +357,101 @@ func stopHACluster(ctx context.Context, t *testing.T) {
 	if err := cmd.Run(); err != nil {
 		t.Logf("docker compose down -v: %v", err)
 	}
+}
+
+// setupAGEForReplicationTest runs the minimum SQL to make `cypher('neksur', ...)`
+// calls resolve against the fresh Patroni-managed cluster:
+//
+//	CREATE EXTENSION IF NOT EXISTS age;
+//	LOAD 'age';
+//	SELECT create_graph('neksur') WHERE NOT EXISTS (...);
+//
+// Mirrors tests/chaos/patroni_chaos.go::setupAGEViaHAProxy but lives here
+// because build-tag composition prevents importing the chaos package from
+// the integration tier. Idempotent — safe to call on every test run.
+//
+// Discovers the Patroni leader via REST and execs psql against it (the
+// DDL only succeeds on the leader; Patroni would reject CREATE EXTENSION
+// on a replica).
+func setupAGEForReplicationTest(ctx context.Context, t *testing.T) error {
+	t.Helper()
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		return fmt.Errorf("find repo root: %w", err)
+	}
+	composePath := filepath.Join(repoRoot, "infra", "docker-compose.ha.yml")
+
+	leader, err := findReplicationLeader(ctx)
+	if err != nil {
+		return fmt.Errorf("find leader: %w", err)
+	}
+
+	// AGE functions live in ag_catalog; psql -c does not auto-extend the
+	// search_path after CREATE EXTENSION, so qualify create_graph
+	// explicitly (bug #18 — without it psql errors with "function
+	// create_graph(unknown) does not exist").
+	sql := `CREATE EXTENSION IF NOT EXISTS age;
+LOAD 'age';
+SELECT ag_catalog.create_graph('neksur')
+  WHERE NOT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'neksur');`
+
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath,
+		"exec", "-T", "-u", "postgres", leader,
+		"psql", "-d", "postgres", "-c", sql,
+	)
+	stderr := &strings.Builder{}
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("psql exec on %s: %w (stderr: %s)", leader, err, strings.TrimSpace(stderr.String()))
+	}
+	t.Logf("AGE setup OK on leader %s", leader)
+	return nil
+}
+
+// findReplicationLeader queries Patroni REST and returns the current
+// leader's name (master/leader role).
+func findReplicationLeader(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8011/cluster", nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	body, _ := readAndClose(resp)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("patroni REST: status %d body=%s", resp.StatusCode, body)
+	}
+	// Cheap regex-free parse: find each member block and check role.
+	// Format: {"name": "pg-node-X", "role": "master", ...}
+	// We need: ("name": "pg-node-X") that precedes ("role": "master")
+	// within the same member object.
+	idx := 0
+	for {
+		nameStart := strings.Index(body[idx:], `"name": "`)
+		if nameStart < 0 {
+			break
+		}
+		nameStart += idx + len(`"name": "`)
+		nameEnd := strings.Index(body[nameStart:], `"`)
+		if nameEnd < 0 {
+			break
+		}
+		memberName := body[nameStart : nameStart+nameEnd]
+		// Find the role within this member's object (until next `}` or end).
+		memberEnd := strings.Index(body[nameStart+nameEnd:], "}")
+		if memberEnd < 0 {
+			break
+		}
+		memberBlock := body[nameStart+nameEnd : nameStart+nameEnd+memberEnd]
+		if strings.Contains(memberBlock, `"role": "master"`) || strings.Contains(memberBlock, `"role": "leader"`) {
+			return memberName, nil
+		}
+		idx = nameStart + nameEnd + memberEnd
+	}
+	return "", fmt.Errorf("no leader found in Patroni cluster")
 }
 
 // findRepoRoot walks up from CWD looking for go.mod.

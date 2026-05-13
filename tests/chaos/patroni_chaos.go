@@ -117,10 +117,37 @@ func patroniRESTPort() string {
 	return "8011"
 }
 
+// patroniRESTPorts are all known host-mapped Patroni REST ports for the
+// chaos compose. fetchClusterAny tries them in order — robust against
+// any single node being killed mid-chaos (live verify bug #19: a chaos
+// test that kills the node at PATRONI_REST_PORT would otherwise deadlock
+// in WaitForNewLeader polling a dead REST endpoint).
+var patroniRESTPorts = []string{"8011", "8012", "8013"}
+
 // httpClient is the package-shared HTTP client used for all Patroni REST
 // polls. 5s timeout balances against ctx-driven per-call cancellation:
 // the 5s ceiling catches stuck reads, ctx catches caller-imposed deadlines.
 var httpClient = &http.Client{Timeout: 5 * time.Second}
+
+// fetchClusterAny tries each known Patroni REST port in order and returns
+// the first successful response. Used by all polling paths so a chaos
+// test that has killed any single node still gets a survivable REST
+// endpoint to talk to (live verify bug #19).
+func fetchClusterAny(ctx context.Context) (*patroniCluster, error) {
+	var lastErr error
+	for _, port := range patroniRESTPorts {
+		cl, err := fetchCluster(ctx, fmt.Sprintf("http://localhost:%s", port))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return cl, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no Patroni REST ports configured")
+	}
+	return nil, fmt.Errorf("all Patroni REST ports failed: %w", lastErr)
+}
 
 // fetchCluster GETs `/cluster` from the given Patroni REST URL and
 // unmarshals to patroniCluster. Returns a wrapped error on any failure
@@ -158,11 +185,20 @@ func findLeader(cl *patroniCluster) string {
 	return ""
 }
 
-// countReplicas returns the number of members whose role is "replica".
+// countReplicas returns the number of members serving as a follower —
+// counting both async "replica" and Patroni's synchronous_mode role
+// "sync_standby". With synchronous_mode=true (Plan 00-03 contract) one
+// node is elected as the sync standby and reports role="sync_standby";
+// the remaining async followers report role="replica". A version that
+// counted only "replica" would never see >=2 followers in a 3-node
+// cluster and the settle check would timeout (live verify bug #17).
+//
+// "synchronous_standby" is included for forward compat with Patroni
+// versions that emit the longer form.
 func countReplicas(cl *patroniCluster) int {
 	n := 0
 	for _, m := range cl.Members {
-		if m.Role == "replica" {
+		if m.Role == "replica" || m.Role == "sync_standby" || m.Role == "synchronous_standby" {
 			n++
 		}
 	}
@@ -205,13 +241,18 @@ const haproxyPrimaryProbeAddr = "localhost:5500"
 // pg_basebackup + WAL replay on each replica. ~3-5min wall-clock on
 // arm64/macOS; faster on Linux + dedicated build.
 func StartCluster(ctx context.Context) (string, error) {
-	baseURL := fmt.Sprintf("http://localhost:%s", patroniRESTPort())
-
 	// Short-circuit: if the cluster is already settled, skip `up -d`
 	// (it's slow even when idempotent — docker has to inspect each
-	// container's healthcheck state).
-	if cl, err := fetchCluster(ctx, baseURL); err == nil {
+	// container's healthcheck state). Still run setupAGEViaHAProxy
+	// because the cluster may have come up manually without our AGE
+	// provisioning — the helper is idempotent (CREATE EXTENSION IF
+	// NOT EXISTS + conditional create_graph) so it costs ~50ms when
+	// already provisioned.
+	if cl, err := fetchClusterAny(ctx); err == nil {
 		if leader := findLeader(cl); leader != "" && countReplicas(cl) >= 2 {
+			if err := setupAGEViaHAProxy(ctx); err != nil {
+				return "", fmt.Errorf("cluster already settled (leader=%s) but AGE setup failed: %w", leader, err)
+			}
 			return leader, nil
 		}
 	}
@@ -238,7 +279,7 @@ func StartCluster(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("chaos: StartCluster: timeout (%s) waiting for cluster to settle (last err: %v)", startClusterTimeout, lastErr)
 		}
 
-		cl, err := fetchCluster(ctx, baseURL)
+		cl, err := fetchClusterAny(ctx)
 		if err != nil {
 			lastErr = err
 			continue
@@ -352,10 +393,15 @@ func binaryWriteUint32(b []byte, v uint32) {
 // neksur/postgres-age:phase0 image because postgresql-client-16 is a
 // transitive dep of postgresql-16.
 func setupAGEViaHAProxy(ctx context.Context) error {
+	// All AGE functions and tables are in ag_catalog; psql -c does not
+	// auto-extend the search_path after CREATE EXTENSION, so qualify
+	// every AGE call explicitly. Without qualification create_graph
+	// errors with "function create_graph(unknown) does not exist" (bug
+	// #18, live verify 2026-05-13).
 	sql := `
 CREATE EXTENSION IF NOT EXISTS age;
 LOAD 'age';
-SELECT create_graph('neksur')
+SELECT ag_catalog.create_graph('neksur')
   WHERE NOT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'neksur');
 `
 	// Use docker compose exec to run psql as the postgres superuser
@@ -366,8 +412,10 @@ SELECT create_graph('neksur')
 	// would refuse to run it on a replica) and we retry on the leader.
 	//
 	// Discover leader name from Patroni REST so we always run on the
-	// authoritative node.
-	cl, err := fetchCluster(ctx, fmt.Sprintf("http://localhost:%s", patroniRESTPort()))
+	// authoritative node. fetchClusterAny rotates over all known ports
+	// so this works even when one node is dead (e.g., between chaos
+	// subtests that kill different leaders).
+	cl, err := fetchClusterAny(ctx)
 	if err != nil {
 		return fmt.Errorf("setupAGE: fetchCluster: %w", err)
 	}
@@ -427,7 +475,6 @@ func WaitForNewLeader(ctx context.Context, prevLeader string, timeout time.Durat
 		return "", time.Time{}, errors.New("chaos: WaitForNewLeader: empty prevLeader")
 	}
 
-	baseURL := fmt.Sprintf("http://localhost:%s", patroniRESTPort())
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -444,16 +491,14 @@ func WaitForNewLeader(ctx context.Context, prevLeader string, timeout time.Durat
 			return "", time.Time{}, fmt.Errorf("chaos: WaitForNewLeader: timeout after %s (last err: %v)", timeout, lastErr)
 		}
 
-		cl, err := fetchCluster(ctx, baseURL)
+		// fetchClusterAny tries each Patroni REST port — the killed
+		// leader's port will fail with connect-refused, but any
+		// survivor returns the same etcd-backed cluster view. Without
+		// this rotation, killing the node at PATRONI_REST_PORT would
+		// strand WaitForNewLeader on a dead endpoint (live verify
+		// bug #19).
+		cl, err := fetchClusterAny(ctx)
 		if err != nil {
-			// Polling against the killed leader's REST port would always
-			// fail; PATRONI_REST_PORT defaults to pg-node-1's mapping
-			// (8011). When pg-node-1 is the killed leader, the test must
-			// override PATRONI_REST_PORT to a survivor's port BEFORE
-			// calling WaitForNewLeader, OR the chaos test must select a
-			// non-pg-node-1 victim. We capture the error and keep
-			// polling — a transient connect-refused while etcd settles
-			// is expected.
 			lastErr = err
 			continue
 		}
