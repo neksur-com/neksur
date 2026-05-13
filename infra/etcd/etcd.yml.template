@@ -1,0 +1,75 @@
+# etcd 3.5+ configuration for the Neksur Phase 0 Wave 2 DCS.
+#
+# Patroni uses etcd as its distributed configuration store (DCS) for leader
+# election, cluster state, and parameter distribution. Per D-W2-ha-tool the
+# Phase 0 cluster is 3 nodes — survives 1 simultaneous failure (Raft quorum =
+# floor(n/2)+1 = 2 of 3).
+#
+# This file is a Jinja2-style template. Render per node by the deployer:
+#
+#   {{ node_name }}        — unique etcd member name (e.g., etcd-1)
+#   {{ node_ip }}          — IP this node advertises for client + peer
+#   {{ initial_cluster }}  — comma-separated initial cluster spec
+#                              (e.g., "etcd-1=https://10.0.0.21:2380,
+#                                      etcd-2=https://10.0.0.22:2380,
+#                                      etcd-3=https://10.0.0.23:2380")
+#
+# T-0-HA mitigation: cert-auth is enforced on BOTH client and peer surfaces.
+# Cert files themselves are operator-provisioned (not committed to this repo).
+# The runbook documents the cert layout: /etc/etcd/certs/{ca,server,peer}.{crt,key}.
+
+name: {{ node_name }}
+data-dir: /var/lib/etcd
+wal-dir: /var/lib/etcd/wal
+
+# Client (Patroni / etcdctl / app) URLs.
+listen-client-urls: https://0.0.0.0:2379
+advertise-client-urls: https://{{ node_ip }}:2379
+
+# Peer (other etcd members) URLs.
+listen-peer-urls: https://0.0.0.0:2380
+initial-advertise-peer-urls: https://{{ node_ip }}:2380
+
+# Initial cluster bootstrap. Operator sets initial-cluster-state to `existing`
+# when adding members to an already-running cluster.
+initial-cluster: {{ initial_cluster }}
+initial-cluster-state: new
+initial-cluster-token: neksur-pg-etcd
+
+# Auto-compact every 1h, retain 24h. Patroni's churn is low (one update per
+# loop_wait=10s per node) but defensive compaction prevents disk-bloat
+# surprise on long-running clusters.
+auto-compaction-retention: 24h
+auto-compaction-mode: periodic
+quota-backend-bytes: 8589934592   # 8 GB safety cap
+
+# T-0-HA — client certificate authentication.
+# Patroni's etcd3 client config (in patroni.yml.template) ships with
+# protocol: https; deployer must mount matching client certs at the
+# operator-documented paths.
+client-transport-security:
+  cert-file: /etc/etcd/certs/server.crt
+  key-file: /etc/etcd/certs/server.key
+  client-cert-auth: true            # T-0-HA: require client cert on every client
+  trusted-ca-file: /etc/etcd/certs/ca.crt
+  auto-tls: false                   # explicit certs only
+
+# T-0-HA — peer certificate authentication.
+peer-transport-security:
+  cert-file: /etc/etcd/certs/peer.crt
+  key-file: /etc/etcd/certs/peer.key
+  peer-cert-auth: true              # T-0-HA: require peer cert on every peer
+  trusted-ca-file: /etc/etcd/certs/ca.crt
+  auto-tls: false
+
+# Logging.
+log-level: info
+log-outputs:
+  - stderr
+
+# Snapshots — etcd snapshots its log every N committed entries.
+snapshot-count: 100000
+
+# Metrics endpoint for Prometheus scrape (Wave 4 wires this in).
+listen-metrics-urls: http://0.0.0.0:2381   # internal-only, no auth needed
+enable-pprof: false

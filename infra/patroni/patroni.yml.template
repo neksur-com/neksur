@@ -1,0 +1,122 @@
+# Patroni 4.1+ configuration for the Neksur Phase 0 Wave 2 HA cluster.
+#
+# Source of truth: 00-RESEARCH.md §Patroni Configuration sketch + §Pitfall 9.
+# Decision: docs/decisions/D-W2-ha-tool.md (LOCKED — Patroni over pg_auto_failover).
+#
+# This file is a Jinja2-style template. The four placeholders are rendered per
+# node by the deployer (operator-side) before the daemon starts:
+#
+#   {{ node_name }}      — unique node name in the cluster (e.g., pg-node-1)
+#   {{ node_ip }}        — IP this node advertises for restapi + postgres
+#   {{ etcd_hosts }}     — comma-separated etcd peer list
+#                            (e.g., "10.0.0.21:2379,10.0.0.22:2379,10.0.0.23:2379")
+#   {{ replication_password }} — replication user password (operator-supplied)
+#
+# The DCS / postgres invariants below are NOT rendered — they are baked into
+# the template per the decision in D-W2-ha-tool.md and must not be diverged
+# without an ADR amendment:
+#
+#   ttl: 30                  — D-001.15 failover SLO (kill→leader < 30s)
+#   synchronous_mode: true   — graph-integrity gate (no silent rollback)
+#   shared_preload_libraries: 'age,pgaudit,pg_stat_statements'
+#                            — Pitfall 9 mitigation; A1 hinges on this
+#   archive_timeout: '60'    — Wave 3 DR carryover (RPO floor)
+#
+# Systemd unit: infra/patroni/systemd/patroni.service.
+# Local-test compose: infra/docker-compose.ha.yml.
+
+scope: neksur-pg
+namespace: /db/
+name: {{ node_name }}
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: {{ node_ip }}:8008
+
+etcd3:
+  hosts: {{ etcd_hosts }}
+  protocol: https
+  # cacert / cert / key paths are operator-provisioned; etcd cert-auth is
+  # enforced via etcd's own client-cert-auth: true (see infra/etcd/etcd.yml.template).
+  # Do NOT remove the protocol: https line — etcd in production runs on
+  # mutual TLS per T-0-HA mitigation.
+
+bootstrap:
+  dcs:
+    ttl: 30                            # D-001.15 — failover SLO upper bound
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576   # 1 MB; lower if RPO needs it
+    synchronous_mode: true             # D-W2-ha-tool — graph-integrity gate
+    synchronous_node_count: 1          # at least 1 sync standby must ack writes
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        shared_preload_libraries: 'age,pgaudit,pg_stat_statements'  # A1 — AGE on standby
+        archive_mode: 'on'
+        archive_command: 'pgbackrest --stanza=neksur archive-push %p'  # Plan 00-04
+        archive_timeout: '60'
+        max_wal_senders: '10'
+        max_replication_slots: '5'
+        wal_level: 'replica'
+        hot_standby: 'on'
+        hot_standby_feedback: 'on'
+        synchronous_commit: 'remote_write'
+        wal_keep_size: '1024MB'
+        pgaudit.log: 'ddl,role'
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+  users:
+    admin:
+      password: admin
+      options:
+        - createrole
+        - createdb
+    replicator:
+      password: {{ replication_password }}
+      options:
+        - replication
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: {{ node_ip }}:5432
+  data_dir: /var/lib/postgresql/16/main
+  bin_dir: /usr/lib/postgresql/16/bin
+  config_dir: /etc/postgresql/16/main
+  pgpass: /tmp/pgpass0
+  authentication:
+    replication:
+      username: replicator
+      password: {{ replication_password }}
+    superuser:
+      username: postgres
+      password: postgres
+  parameters:
+    # Per-node parameters — these flow into postgresql.auto.conf via Patroni.
+    # The bootstrap.dcs.postgresql.parameters block above defines the
+    # cluster-wide invariants applied to every node at bootstrap; the block
+    # here applies to the running node and is merged with infra/postgres/
+    # postgresql.ha.conf at startup.
+    unix_socket_directories: '/var/run/postgresql'
+    shared_preload_libraries: 'age,pgaudit,pg_stat_statements'  # A1 — must match bootstrap
+
+  # The HA-mode postgresql.conf is mounted at the standard Postgres location
+  # and Patroni's bootstrap merges the parameters block above on top.
+  # See infra/postgres/postgresql.ha.conf for the full set.
+  custom_conf: /etc/postgresql/16/main/postgresql.ha.conf
+
+watchdog:
+  mode: required          # systemd watchdog enforced — Patroni dies if it can't tick
+  device: /dev/watchdog
+  safety_margin: 5
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

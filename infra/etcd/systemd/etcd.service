@@ -1,0 +1,47 @@
+# etcd 3.5+ systemd unit for the Neksur Phase 0 Wave 2 DCS.
+#
+# Install: copy to /etc/systemd/system/etcd.service on each etcd member,
+# render /etc/etcd/etcd.yml from infra/etcd/etcd.yml.template, then
+# `systemctl daemon-reload && systemctl enable --now etcd`.
+#
+# Per D-W2-ha-tool the cluster is 3 nodes; bring members up one at a time so
+# the bootstrap quorum settles (etcd will refuse to start a 3-node cluster if
+# only 1 member is reachable on the initial-cluster list).
+
+[Unit]
+Description=etcd 3.5+ DCS for Patroni (Neksur)
+After=network.target
+Documentation=https://etcd.io/docs/v3.5/
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+
+ExecStart=/usr/local/bin/etcd --config-file=/etc/etcd/etcd.yml
+
+# etcd handles SIGTERM gracefully — gives ongoing Raft messages time to land.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+# etcd needs many fds (one per peer + one per client connection).
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Standard journal logging — etcd writes to stderr per its own config.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=etcd
+
+[Install]
+WantedBy=multi-user.target

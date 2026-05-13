@@ -1,0 +1,286 @@
+# Local 3-node Patroni + etcd + HAProxy HA cluster for chaos testing.
+#
+# Wave 2 (Plan 00-03) — exercised by tests/chaos/failover_test.go and
+# tests/integration/replication_test.go. Brings up:
+#
+#   etcd-1, etcd-2, etcd-3       — 3-node DCS quorum
+#   pg-node-1, pg-node-2, pg-node-3 — Patroni-managed Postgres+AGE
+#   haproxy                       — front door (5000 = primary, 5001 = replicas, 7000 = stats)
+#
+# Resource budget: ~4-5 GB RAM, ~2 vCPU. Validated against Docker Desktop
+# 7.65 GB allocation. CI must declare matching resources.
+#
+# Cluster bring-up:
+#   docker compose -f infra/docker-compose.ha.yml up -d
+#   patronictl -c /tmp/patronictl.yml list   # should show 1 Leader + 2 Replica
+#
+# Cluster tear-down (also wipes data):
+#   docker compose -f infra/docker-compose.ha.yml down -v
+#
+# Differences from production deployment:
+#   - etcd cert-auth disabled (single-host bridge network — production cert
+#     setup is operator-side per infra/etcd/etcd.yml.template)
+#   - Patroni watchdog: off (Linux softdog inside Docker is unreliable;
+#     production uses systemd's hardware watchdog)
+#   - apache/age:release_PG16_1.6.0 base image (same as testfixture) plus a
+#     side-mounted patroni install — tests start each node as
+#     `bash -c "install patroni && patroni /etc/patroni/patroni.yml"`
+#     (lazy install keeps the compose file dependency-free and matches the
+#     "no production secrets in Dockerfile" rule from infra/postgres/Dockerfile).
+
+# Top-level networks block — bridge network where etcd peers and Patroni
+# REST endpoints reach each other by container name (DNS via Docker's
+# embedded resolver).
+networks:
+  ha-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+# Named volumes — persist etcd state and Postgres data across `docker compose
+# restart` cycles, but `docker compose down -v` wipes them for chaos test
+# isolation.
+volumes:
+  etcd-1-data: {}
+  etcd-2-data: {}
+  etcd-3-data: {}
+  pg-node-1-data: {}
+  pg-node-2-data: {}
+  pg-node-3-data: {}
+
+services:
+
+  # ===========================================================================
+  # etcd — 3-node DCS. quay.io/coreos/etcd:v3.5.13 is the LTS line.
+  # ===========================================================================
+  etcd-1:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd-1
+    hostname: etcd-1
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.21
+    volumes:
+      - etcd-1-data:/var/lib/etcd
+    environment:
+      - ETCD_NAME=etcd-1
+      - ETCD_DATA_DIR=/var/lib/etcd
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-1:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-1:2380
+      - ETCD_INITIAL_CLUSTER=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=neksur-pg-etcd
+      - ETCD_AUTO_COMPACTION_RETENTION=1
+      - ETCD_AUTO_COMPACTION_MODE=periodic
+    command:
+      - /usr/local/bin/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  etcd-2:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd-2
+    hostname: etcd-2
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.22
+    volumes:
+      - etcd-2-data:/var/lib/etcd
+    environment:
+      - ETCD_NAME=etcd-2
+      - ETCD_DATA_DIR=/var/lib/etcd
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-2:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-2:2380
+      - ETCD_INITIAL_CLUSTER=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=neksur-pg-etcd
+      - ETCD_AUTO_COMPACTION_RETENTION=1
+      - ETCD_AUTO_COMPACTION_MODE=periodic
+    command:
+      - /usr/local/bin/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  etcd-3:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd-3
+    hostname: etcd-3
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.23
+    volumes:
+      - etcd-3-data:/var/lib/etcd
+    environment:
+      - ETCD_NAME=etcd-3
+      - ETCD_DATA_DIR=/var/lib/etcd
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd-3:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-3:2380
+      - ETCD_INITIAL_CLUSTER=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=neksur-pg-etcd
+      - ETCD_AUTO_COMPACTION_RETENTION=1
+      - ETCD_AUTO_COMPACTION_MODE=periodic
+    command:
+      - /usr/local/bin/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  # ===========================================================================
+  # Patroni-managed Postgres + AGE nodes. Built from infra/postgres/Dockerfile
+  # (Plan 00-01) — apache/age:release_PG16_1.6.0 + pgaudit + pg_stat_statements.
+  # The compose-time entrypoint installs patroni via pip (one-time per container
+  # cold start) and then runs patroni against a pre-rendered patroni.yml
+  # bind-mounted from infra/patroni/. Each node gets its own rendered config
+  # via the patroni-confs/ subdirectory — the test-only render of the
+  # Jinja2-style template. Production uses Ansible / systemd to render.
+  # ===========================================================================
+  pg-node-1:
+    image: neksur/postgres-age:phase0
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: pg-node-1
+    hostname: pg-node-1
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.11
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    volumes:
+      - pg-node-1-data:/var/lib/postgresql/16/main
+      - ./patroni/patroni-pg-node-1.yml:/etc/patroni/patroni.yml:ro
+      - ./postgres/postgresql.ha.conf:/etc/postgresql/16/main/postgresql.ha.conf:ro
+    ports:
+      - "8011:8008"   # Patroni REST — exposed for chaos test polling
+      - "5411:5432"   # Direct Postgres — exposed for diagnostic / debug
+    environment:
+      - PATRONI_NAME=pg-node-1
+      - PATRONI_LOG_LEVEL=INFO
+    user: postgres
+    # Lazy patroni install — keeps the Dockerfile minimal (production image
+    # bakes patroni in via a separate layer; this compose is for chaos
+    # testing only).
+    command:
+      - bash
+      - -lc
+      - >
+        if ! command -v patroni >/dev/null 2>&1; then
+          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
+        fi;
+        exec patroni /etc/patroni/patroni.yml
+
+  pg-node-2:
+    image: neksur/postgres-age:phase0
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: pg-node-2
+    hostname: pg-node-2
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.12
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    volumes:
+      - pg-node-2-data:/var/lib/postgresql/16/main
+      - ./patroni/patroni-pg-node-2.yml:/etc/patroni/patroni.yml:ro
+      - ./postgres/postgresql.ha.conf:/etc/postgresql/16/main/postgresql.ha.conf:ro
+    ports:
+      - "8012:8008"
+      - "5412:5432"
+    environment:
+      - PATRONI_NAME=pg-node-2
+      - PATRONI_LOG_LEVEL=INFO
+    user: postgres
+    command:
+      - bash
+      - -lc
+      - >
+        if ! command -v patroni >/dev/null 2>&1; then
+          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
+        fi;
+        exec patroni /etc/patroni/patroni.yml
+
+  pg-node-3:
+    image: neksur/postgres-age:phase0
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: pg-node-3
+    hostname: pg-node-3
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.13
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    volumes:
+      - pg-node-3-data:/var/lib/postgresql/16/main
+      - ./patroni/patroni-pg-node-3.yml:/etc/patroni/patroni.yml:ro
+      - ./postgres/postgresql.ha.conf:/etc/postgresql/16/main/postgresql.ha.conf:ro
+    ports:
+      - "8013:8008"
+      - "5413:5432"
+    environment:
+      - PATRONI_NAME=pg-node-3
+      - PATRONI_LOG_LEVEL=INFO
+    user: postgres
+    command:
+      - bash
+      - -lc
+      - >
+        if ! command -v patroni >/dev/null 2>&1; then
+          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
+        fi;
+        exec patroni /etc/patroni/patroni.yml
+
+  # ===========================================================================
+  # HAProxy — front door. Routes 5000 → primary, 5001 → replicas, 7000 → stats.
+  # ===========================================================================
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: haproxy
+    hostname: haproxy
+    networks:
+      ha-net:
+        ipv4_address: 172.30.0.30
+    depends_on:
+      - pg-node-1
+      - pg-node-2
+      - pg-node-3
+    volumes:
+      - ./haproxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "5000:5000"   # primary route
+      - "5001:5001"   # replica route
+      - "7000:7000"   # stats UI

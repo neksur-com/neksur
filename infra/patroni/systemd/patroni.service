@@ -1,0 +1,60 @@
+# Patroni systemd unit for the Neksur Phase 0 Wave 2 HA cluster.
+#
+# Install: copy to /etc/systemd/system/patroni.service on each cluster member,
+# render /etc/patroni/patroni.yml from infra/patroni/patroni.yml.template, then
+# `systemctl daemon-reload && systemctl enable --now patroni`.
+#
+# Per D-W2-ha-tool: the watchdog is required (Patroni's bootstrap.watchdog.mode
+# is `required`). Linux's softdog kernel module must be loaded so /dev/watchdog
+# exists; Patroni uses the watchdog to self-fence if it stops responding.
+#
+# postgres user must exist (apt's postgresql-16 package creates it). The unit
+# does NOT manage Postgres directly — Patroni starts/stops postgres internally.
+
+[Unit]
+Description=Patroni HA orchestrator for Postgres + AGE (Neksur)
+After=syslog.target network.target etcd.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+
+# ExecStartPre ensures the watchdog device is present (softdog module loaded).
+# Failure here is fatal — without the watchdog Patroni's bootstrap.watchdog.mode=required
+# would exit immediately at startup.
+ExecStartPre=/bin/sh -c 'test -e /dev/watchdog || (modprobe softdog && sleep 1 && test -e /dev/watchdog)'
+
+ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml
+
+# Reload re-reads patroni.yml without dropping the leader lock.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Patroni handles its own SIGTERM gracefully (deregisters from etcd, demotes
+# if leader). 30s is more than enough for the standard shutdown sequence.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart on any non-zero exit. Patroni is designed to be daemon-restarted
+# liberally — every restart re-reads etcd state and resumes.
+Restart=on-failure
+RestartSec=5
+
+# Run with restricted privileges where possible.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+# Limits — Postgres + Patroni together need a healthy file-descriptor budget.
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Standard journal logging.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patroni
+
+[Install]
+WantedBy=multi-user.target

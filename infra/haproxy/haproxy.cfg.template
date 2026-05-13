@@ -1,0 +1,100 @@
+# HAProxy 2.x configuration for the Neksur Phase 0 Wave 2 HA front door.
+#
+# Two TCP frontends:
+#   - port 5000 → primary (Patroni REST returns 200 on /master only at the leader)
+#   - port 5001 → replicas (Patroni REST returns 200 on /replica at followers)
+#
+# Per D-W2-ha-tool: the only routing decision is "is this Patroni member the
+# current leader?". Patroni's REST API on port 8008 answers that question
+# authoritatively — `option httpchk GET /master` returns 200 iff the queried
+# member holds the leader lock in etcd. HAProxy retries the check every 3s
+# (default `inter`) so steady-state failover detection is bounded by 3s in
+# the worst case.
+#
+# Application clients connect to:
+#   postgres://neksur_app@<haproxy>:5000/neksur   (writes — primary route)
+#   postgres://neksur_app@<haproxy>:5001/neksur   (reads — replica route)
+#
+# Operators inspect HAProxy state via the stats interface on port 7000.
+
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 4096
+    nbthread 4
+    daemon
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  10m
+    timeout server  10m
+    timeout check   5s
+    retries 3
+
+# -----------------------------------------------------------------------------
+# Stats — operator-facing UI on port 7000. Internal-only; production deployer
+# binds this to the operator network (not exposed to the application network).
+# -----------------------------------------------------------------------------
+listen stats
+    mode http
+    bind *:7000
+    stats enable
+    stats uri /
+    stats refresh 5s
+    stats show-legends
+    stats show-node
+
+# -----------------------------------------------------------------------------
+# Primary frontend — port 5000 — TCP-mode pass-through to whichever Patroni
+# member returns 200 on GET /master.
+#
+# `option httpchk GET /master` is THE definitive Patroni health-check shape;
+# Patroni's REST API guarantees /master returns 200 only on the leader. Any
+# follower (and an isolated former-leader during failover) returns 503.
+#
+# `default-server inter 3s fall 3 rise 2` means: poll every 3s, drop after
+# 3 consecutive failures (~9s), re-add after 2 successes (~6s). This balances
+# detection speed against flap-suppression — failover is bounded by Patroni's
+# ttl=30s anyway, so HAProxy's 9s detection floor never dominates.
+# -----------------------------------------------------------------------------
+frontend postgres_primary_frontend
+    bind *:5000
+    default_backend postgres_primary
+
+backend postgres_primary
+    option httpchk GET /master
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+
+    # In docker-compose.ha.yml the three Patroni nodes resolve as pg-node-1/2/3.
+    # In production the deployer renders these from per-node IPs.
+    server pg-node-1 pg-node-1:5432 check port 8008
+    server pg-node-2 pg-node-2:5432 check port 8008
+    server pg-node-3 pg-node-3:5432 check port 8008
+
+# -----------------------------------------------------------------------------
+# Replica frontend — port 5001 — TCP-mode pass-through to any Patroni member
+# returning 200 on GET /replica. Patroni's REST API guarantees /replica
+# returns 200 only on followers in healthy replication state (replay lag
+# below the configured threshold).
+#
+# `balance leastconn` distributes new connections to the least-loaded
+# replica; healthy replicas are interchangeable for read traffic.
+# -----------------------------------------------------------------------------
+frontend postgres_replica_frontend
+    bind *:5001
+    default_backend postgres_replicas
+
+backend postgres_replicas
+    balance leastconn
+    option httpchk GET /replica
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+
+    server pg-node-1 pg-node-1:5432 check port 8008
+    server pg-node-2 pg-node-2:5432 check port 8008
+    server pg-node-3 pg-node-3:5432 check port 8008

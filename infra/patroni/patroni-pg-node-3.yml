@@ -1,0 +1,83 @@
+# RENDERED Patroni config for pg-node-3 in docker-compose.ha.yml chaos-test mode.
+# See patroni-pg-node-1.yml for the full annotation; this file differs only in
+# `name`, `restapi.connect_address`, and `postgresql.connect_address`.
+
+scope: neksur-pg
+namespace: /db/
+name: pg-node-3
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: pg-node-3:8008
+
+etcd3:
+  hosts: etcd-1:2379,etcd-2:2379,etcd-3:2379
+  protocol: http
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    synchronous_mode: true
+    synchronous_node_count: 1
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        shared_preload_libraries: 'age,pgaudit,pg_stat_statements'
+        archive_mode: 'on'
+        archive_command: '/bin/true'
+        archive_timeout: '60'
+        max_wal_senders: '10'
+        max_replication_slots: '5'
+        wal_level: 'replica'
+        hot_standby: 'on'
+        hot_standby_feedback: 'on'
+        synchronous_commit: 'remote_write'
+        wal_keep_size: '1024MB'
+        pgaudit.log: 'ddl,role'
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - host replication replicator 172.30.0.0/24 scram-sha-256
+    - host all all 172.30.0.0/24 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+  users:
+    admin:
+      password: admin
+      options:
+        - createrole
+        - createdb
+    replicator:
+      password: replicator_chaos_test
+      options:
+        - replication
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: pg-node-3:5432
+  data_dir: /var/lib/postgresql/16/main
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass0
+  authentication:
+    replication:
+      username: replicator
+      password: replicator_chaos_test
+    superuser:
+      username: postgres
+      password: postgres
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+    shared_preload_libraries: 'age,pgaudit,pg_stat_statements'
+
+watchdog:
+  mode: off
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
