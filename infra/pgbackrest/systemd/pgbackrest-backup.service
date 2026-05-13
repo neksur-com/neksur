@@ -1,0 +1,49 @@
+# pgBackRest backup service unit — Phase 0 Wave 3 (Plan 00-04).
+#
+# Single non-templated service that selects full vs incremental at
+# runtime based on day-of-week:
+#
+#   - Sunday   (date +%u == 7)  → --type=full
+#   - Mon-Sat  (date +%u != 7)  → --type=incr
+#
+# Triggered by pgbackrest-backup.timer (which fires daily at 02:00).
+# The crontab alternative (infra/pgbackrest/crontab) hard-codes the
+# two cadences as separate cron lines; this systemd unit collapses
+# them into one timer + one service via the date check.
+#
+# Usage (manual one-shot — auto-detects full vs incr):
+#   systemctl start pgbackrest-backup.service
+#
+# Override (force a specific type):
+#   systemctl set-environment PGBACKREST_TYPE=full
+#   systemctl start pgbackrest-backup.service
+
+[Unit]
+Description=pgBackRest scheduled backup of stanza neksur
+After=network-online.target postgresql.service
+Requires=network-online.target
+ConditionPathExists=!/var/lib/pgbackrest/lock/neksur-backup.lock
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+# Resolve --type from $PGBACKREST_TYPE if set; else from day-of-week
+# (Sunday=7 → full, else incr). The $(date) call runs in the service
+# shell (Type=oneshot is fine with a shell wrapper here).
+ExecStart=/bin/sh -c '\
+    TYPE="$${PGBACKREST_TYPE:-}"; \
+    if [ -z "$$TYPE" ]; then \
+        if [ "$$(date +%%u)" = "7" ]; then TYPE=full; else TYPE=incr; fi; \
+    fi; \
+    exec /usr/bin/pgbackrest --stanza=neksur --type=$$TYPE backup'
+# Full backup of a 200GB fixture takes ~30-45 min on commodity hardware;
+# 2h ceiling gives diagnostic headroom for slow repos / first-run cold
+# cache. Incr backups complete in 2-5 min; the same ceiling applies.
+TimeoutSec=7200
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+
+[Install]
+WantedBy=multi-user.target

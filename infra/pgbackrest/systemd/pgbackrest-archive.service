@@ -1,0 +1,29 @@
+# pgBackRest archive-push service unit — Phase 0 Wave 3 (Plan 00-04).
+#
+# Type=oneshot wrapper around `pgbackrest --stanza=neksur archive-push %p`.
+# Postgres invokes archive-push directly via its `archive_command` setting
+# (configured in patroni.yml.template). This unit is provided as the
+# operator-side fallback for re-pushing WAL segments that failed the
+# inline path (e.g., during repo storage outages — operators replay from
+# a local WAL directory after the repo recovers).
+#
+# Usage:
+#   systemctl start pgbackrest-archive.service
+#
+# This unit is NOT enabled by default — Postgres's archive_command path
+# is the primary archival mechanism; this is for ops-driven backfill.
+
+[Unit]
+Description=pgBackRest Archive Push (manual backfill)
+After=network-online.target postgresql.service
+Requires=network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/pgbackrest --stanza=neksur archive-push %i
+TimeoutSec=600
+
+[Install]
+WantedBy=multi-user.target

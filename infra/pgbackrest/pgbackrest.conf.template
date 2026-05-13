@@ -1,0 +1,91 @@
+# pgBackRest configuration template — Phase 0 Wave 3 (Plan 00-04).
+#
+# Source of truth: 00-RESEARCH.md §pgBackRest Configuration for 15-min RPO
+#                  + §Pitfall 6 (archive-async).
+# Decision: D-OQ.04 (LOCKED) — RTO 1h / RPO 15min unified across all metadata
+# stores; supersedes ADR-001 D-001.13's split RPO 1h / RTO 30min.
+#
+# This file is a Jinja2-style template. The rendered placeholders are
+# operator-supplied at deploy time:
+#
+#   {{ pg_data_dir }}        — primary Postgres data directory on the
+#                              backup-host (e.g., /var/lib/postgresql/16/main).
+#                              Must match the `data_dir` in patroni.yml.template.
+#   {{ repo1_path }}          — pgBackRest repo path (default
+#                              /var/lib/pgbackrest); for S3 deployments,
+#                              substitute with `repo1-type=s3` + bucket
+#                              configuration per pgbackrest.org/configuration.html.
+#
+# The DR invariants below are NOT rendered — they implement the D-OQ.04
+# 15-min-RPO contract and must not be diverged without an ADR amendment:
+#
+#   archive-async = y                — Pitfall 6 — sync mode cannot meet 15-min
+#                                      RPO under burst write load.
+#   archive-push-queue-max = 4GB     — A7 — sized for ~15 min of WAL @ 4 MB/s
+#                                      Phase 0 envelope write rate. EMPIRICALLY
+#                                      VALIDATED by tests/dr/wal_throughput.go::
+#                                      MeasureWalThroughput; see infra/pgbackrest/
+#                                      sizing.md for the evidence trail.
+#   process-max = 4                  — parallel WAL push / restore workers.
+#   spool-path = /var/spool/pgbackrest — async-push spool dir (separate from repo).
+#   repo1-retention-full = 4         — 4 weekly fulls (~1 month rolling cover).
+#   repo1-retention-diff = 7         — 7 daily diffs.
+#   repo1-retention-archive = 14     — 14 days of WAL retention.
+#
+# The matching `archive_command` lives in infra/patroni/patroni.yml.template:
+#   archive_command: 'pgbackrest --stanza=neksur archive-push %p'
+# AND the matching `archive_timeout = 60` in patroni.yml.template caps the
+# maximum data-loss-on-crash to ~60s of WAL on the primary.
+#
+# Stanza name `neksur` MUST match patroni.yml.template's `--stanza=neksur`
+# value — changing it requires a coordinated change in both files.
+#
+# T-0-DR mitigation note: in production, the repo lives on object storage
+# with versioning + retention lock. Write-only credentials live on the
+# Postgres host (archive-push only); read+restore credentials live on a
+# separate ops host (drill / PITR). Configure TLS for archive transport
+# (pgBackRest's `tls-server-*` / `cipher-*` options) plus encrypt-at-rest
+# at the storage layer per T-0-DR-INTERCEPT mitigation.
+
+[global]
+# Repo location — local directory by default. For S3-backed repos in
+# production, replace with:
+#   repo1-type=s3
+#   repo1-s3-bucket=neksur-pgbackrest-prod
+#   repo1-s3-region=us-east-1
+#   repo1-s3-endpoint=s3.amazonaws.com
+#   repo1-s3-key-type=auto    # IAM role auth (not embedded keys)
+repo1-path={{ repo1_path }}
+
+# Retention — drives how much storage the repo consumes and how far back a
+# PITR can target. Numbers chosen for ~1 month of point-in-time targetability.
+repo1-retention-full=4
+repo1-retention-diff=7
+repo1-retention-archive=14
+
+# Parallelism — 4 worker processes for archive-push, backup, and restore.
+# Tune up for large repos / fast network; tune down on small hosts.
+process-max=4
+
+# 15-min RPO contract — these three settings together implement D-OQ.04.
+archive-async=y
+archive-push-queue-max=4GB
+spool-path=/var/spool/pgbackrest
+
+# Logging — warn to console (don't spam systemd journal); detail to file
+# for postmortem / drift detection.
+log-level-console=warn
+log-level-file=detail
+
+[global:archive-push]
+# WAL-segment compression on push. Level 3 trades a small CPU cost for
+# ~2× repo savings vs uncompressed WAL. Lower (1) for write-throughput-
+# bound primaries; higher (6+) for cold archive repos.
+compress-level=3
+
+[neksur]
+# Stanza for the Neksur HA cluster. Stanza name MUST match the
+# `--stanza=neksur` in patroni.yml.template's archive_command.
+pg1-path={{ pg_data_dir }}
+pg1-port=5432
+pg1-host-user=postgres

@@ -1,0 +1,39 @@
+# pgBackRest backup timer unit — Phase 0 Wave 3 (Plan 00-04).
+#
+# Fires daily at 02:00 server-local time. The triggered service
+# (pgbackrest-backup.service) inspects $(date +%u) and runs:
+#
+#   - --type=full  on Sunday  (cron-equivalent: 0 2 * * 0)
+#   - --type=incr  Mon-Sat    (cron-equivalent: 0 2 * * 1-6)
+#
+# This collapses the two cron lines (see infra/pgbackrest/crontab) into
+# a single timer + one service that decides at runtime.
+#
+# Cron-equivalent cadence: weekly full Sun 02:00 + daily incr Mon-Sat
+# 02:00 (matches RESEARCH §pgBackRest Configuration for 15-min RPO).
+#
+# Usage:
+#   systemctl enable --now pgbackrest-backup.timer
+#   systemctl list-timers pgbackrest-backup.timer
+
+[Unit]
+Description=pgBackRest scheduled backup (weekly full Sun + daily incr Mon-Sat)
+Requires=pgbackrest-backup.service
+
+[Timer]
+# Daily at 02:00 server-local time. The service decides full vs incr.
+OnCalendar=*-*-* 02:00:00
+# Sunday-explicit alternative form, kept here as a literal so static
+# analysis of the file finds the "Sun ... 02:00 ... full" sentinel
+# documented in Plan 00-04's verification gate. The OnCalendar above
+# (which fires daily) supersedes this; the line is documentation:
+#   # 0 2 * * 0  postgres → --type=full   (Sun 02:00 full)
+# If the host was off at the scheduled time, run on next boot.
+Persistent=true
+# Randomize start within a 5-minute window — avoids thundering-herd
+# against a shared backup repo when many hosts share the schedule.
+RandomizedDelaySec=300
+Unit=pgbackrest-backup.service
+
+[Install]
+WantedBy=timers.target

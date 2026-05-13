@@ -1,0 +1,31 @@
+# /etc/cron.d/pgbackrest — pgBackRest backup schedule (Phase 0 Wave 3, Plan 00-04).
+#
+# Cron-based alternative to the systemd timer (infra/pgbackrest/systemd/
+# pgbackrest-backup.timer). Use this on hosts without systemd or where
+# the operator's runbook standardizes on cron.
+#
+# Source of truth: 00-RESEARCH.md §pgBackRest Configuration for 15-min RPO.
+#
+# Cadence:
+#   - Weekly FULL backup     Sunday 02:00 (low-traffic window)
+#   - Daily INCREMENTAL      Mon-Sat 02:00
+#   - Continuous archive-push runs INSIDE Postgres via archive_command
+#     (configured in infra/patroni/patroni.yml.template) — this cron
+#     does NOT schedule archive-push; that is per-segment, not per-day.
+#
+# Field reference (cron format):
+#   m h dom mon dow user command
+#
+# Note: full backup at 02:00 Sunday + 14-day archive retention
+# (repo1-retention-archive=14) gives ~2 weeks of point-in-time
+# targetability covering at most 4 fulls (repo1-retention-full=4).
+
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=ops@example.com
+
+# Weekly full Sunday 02:00.
+0 2 * * 0 postgres pgbackrest --stanza=neksur --type=full backup
+
+# Daily incremental Mon-Sat 02:00.
+0 2 * * 1-6 postgres pgbackrest --stanza=neksur --type=incr backup
