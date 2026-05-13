@@ -1,0 +1,88 @@
+# Prometheus configuration — Plan 00-05 Wave 4.
+#
+# Scrapes the three observability targets that drive the Plan 01 alert
+# rules end-to-end:
+#
+#   1. neksur-graph (the application's /metrics on :9100) — emits the
+#      cypher_duration_ms / cypher_errors_total / cypher_nodes_visited /
+#      cypher_edges_traversed histograms that drive
+#      `CypherP99LatencyBreach`.
+#   2. otel-collector (:8889) — the OTel collector's Prometheus exporter,
+#      where any metrics emitted via the OTel SDK (not the prometheus_client
+#      registry) land. Currently the application uses prometheus_client
+#      directly so this is mostly for collector self-metrics.
+#   3. chrony-exporter (:9123) — emits chrony_tracking_last_offset_seconds
+#      which drives `ClockSkewWarn` (>0.1s) and `ClockSkewPage` (>0.5s).
+#
+# rule_files loads the two Plan 01 alert YAMLs verbatim — they were
+# committed in Wave 0 specifically so this scrape config could reference
+# them without rewriting (per threat T-0-W0-ALERT-WIRE).
+#
+# alerting.alertmanagers points to the AlertManager service defined in
+# the same docker-compose.observability.yml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: neksur-core
+    env: dev
+
+# Alert rule files — both authored in Plan 01 (cypher-latency.yaml +
+# clock-skew.yaml). Mounted into the Prometheus container at
+# /etc/prometheus/alerts/ via docker-compose.observability.yml.
+rule_files:
+  - /etc/prometheus/alerts/cypher-latency.yaml
+  - /etc/prometheus/alerts/clock-skew.yaml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # The neksur-server application's Prometheus client_golang /metrics
+  # endpoint. In the integration-test docker-compose, `app` resolves
+  # to the host running the test binary (via host.docker.internal
+  # mapping); in production it's a service name in the deployment.
+  - job_name: neksur-graph
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - app:9100
+        labels:
+          component: graph-client
+
+  # OTel collector self-metrics + the OTel pipeline output. The
+  # collector exposes its Prometheus exporter on :8889 (see
+  # infra/otel/otel-collector-config.yaml).
+  - job_name: otel-collector
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - otel-collector:8889
+        labels:
+          component: otel-collector
+
+  # chrony exporter on every Postgres host. The single-host
+  # docker-compose self-test runs one exporter; the production
+  # deployment overrides this with the discovery mechanism
+  # (typically file_sd_config keyed off the Patroni inventory).
+  - job_name: chrony
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - chrony-exporter:9123
+        labels:
+          component: clock
+
+  # Postgres exporter — Phase 1 work. Commented out for Phase 0; the
+  # job name is reserved so Phase 1 doesn't need to renumber other
+  # jobs.
+  #
+  # - job_name: postgres
+  #   scrape_interval: 15s
+  #   static_configs:
+  #     - targets:
+  #         - postgres-exporter:9187

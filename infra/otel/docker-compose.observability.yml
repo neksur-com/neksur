@@ -1,0 +1,109 @@
+# Observability stack — Plan 00-05 Wave 4 / D-001.14 + C-TECH-10.
+#
+# Brings up the four services that the Plan 00-05 integration tests
+# (tests/integration/alerts_test.go::TestP99BreachPages, the clock-skew
+# tests, and the operator quickstart in runbooks/cypher-latency-breach.md)
+# need to exercise the end-to-end alert wiring:
+#
+#   otel-collector   — receives OTLP traces+metrics from neksur-server,
+#                      exposes Prometheus scrape target on :8889.
+#   prometheus       — scrapes the collector + neksur-graph + chrony,
+#                      loads the Plan 01 rule files cypher-latency.yaml
+#                      and clock-skew.yaml from ops/prometheus/alerts/.
+#   alertmanager     — receives firing alerts from Prometheus, routes
+#                      severity=page → pagerduty / severity=warn → slack
+#                      per infra/prometheus/alertmanager.yml.
+#   chrony-exporter  — Prometheus exporter for chrony control-socket
+#                      metrics (chrony_tracking_last_offset_seconds is
+#                      what the clock-skew.yaml alert rule consumes).
+#
+# RAM budget: ~500 MB total (otel-collector ~200 MB, prometheus ~150 MB,
+# alertmanager ~50 MB, chrony-exporter ~30 MB). Comfortable on the
+# typical 7-8 GB Docker Desktop default.
+#
+# Invocation:
+#   docker compose -f infra/otel/docker-compose.observability.yml up -d
+# Then point neksur-server at it:
+#   NEKSUR_OBSERVABILITY=1 OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 \
+#     go run ./cmd/neksur-server
+# Verify Prometheus is up:
+#   curl http://localhost:9090/-/healthy
+# Verify AlertManager sees the rules:
+#   curl http://localhost:9093/api/v2/alerts
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.110.0
+    container_name: neksur-otel-collector
+    command: ["--config=/etc/otel/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (from neksur-server)
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter — scraped by `prometheus` below
+    networks:
+      - observability
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: neksur-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Plan 01 rule files. They are mounted under the path
+      # /etc/prometheus/alerts/ which matches the rule_files glob in
+      # prometheus.yml.
+      - ../../ops/prometheus/alerts/cypher-latency.yaml:/etc/prometheus/alerts/cypher-latency.yaml:ro
+      - ../../ops/prometheus/alerts/clock-skew.yaml:/etc/prometheus/alerts/clock-skew.yaml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+    depends_on:
+      - otel-collector
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: neksur-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ../prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    networks:
+      - observability
+
+  chrony-exporter:
+    image: superq/chrony-exporter:v0.12.0
+    container_name: neksur-chrony-exporter
+    # In production each Postgres host runs its own chronyd alongside the
+    # exporter — the exporter talks to chronyd over the local control
+    # socket. For the docker-compose self-test we point it at a
+    # well-known public NTP-host's chronyd via the CHRONY_HOST env, but
+    # the typical deployment overrides this to localhost via a host-net
+    # mount. See infra/chrony/chrony.conf for the chronyd config that
+    # exposes the control socket.
+    environment:
+      # `chronyc.address` is the chrony control-socket address. In
+      # docker-compose self-test mode we let the exporter default to
+      # localhost which the container does NOT have a chronyd in — so
+      # the exporter will report unhealthy, which is FINE: the alert
+      # tests in tests/integration/clock_skew_test.go inject metrics
+      # via a mock exporter (httptest), not this real one.
+      - CHRONY_HOST=127.0.0.1
+    ports:
+      - "9123:9123"
+    networks:
+      - observability
+
+networks:
+  observability:
+    driver: bridge

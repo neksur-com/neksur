@@ -1,0 +1,75 @@
+# chrony-exporter deployment contract — Plan 00-05 Wave 4 / C-TECH-10.
+#
+# This is documentation, not a runnable config — the exporter image
+# (superq/chrony-exporter:v0.12.0) is parameterised entirely via
+# environment variables and CLI flags. The actual runtime configuration
+# lives in infra/otel/docker-compose.observability.yml; this file
+# documents the contract so operators and Phase-1 deployment authors
+# know which knobs matter.
+#
+# ============================================================
+# Connection contract
+# ============================================================
+#
+# The exporter speaks the chrony command protocol over the local
+# cmdsocket configured in infra/chrony/chrony.conf
+# (`bindcmdaddress 0.0.0.0`, `cmdallow 127.0.0.1`).
+#
+# Required env vars:
+#   CHRONY_HOST   — host running chronyd (default 127.0.0.1).
+#                   In single-host deployments this is the localhost
+#                   address; in multi-Postgres-host deployments each
+#                   chronyd has its own exporter sidecar.
+#
+# CLI flags worth knowing:
+#   --web.listen-address=:9123     — Prometheus scrape endpoint
+#                                    (matches infra/prometheus/
+#                                    prometheus.yml `chrony` job).
+#   --collector.tracking           — enables the metrics that the
+#                                    Plan 01 alert rules consume
+#                                    (last_offset_seconds,
+#                                    rms_offset_seconds, etc.).
+#   --collector.sources            — enables NTP source health metrics
+#                                    (used by triage in
+#                                    runbooks/clock-skew-alert.md).
+#
+# ============================================================
+# Metrics contract (consumed by Plan 01 alert rules)
+# ============================================================
+#
+# The C-TECH-10 alert tier in ops/prometheus/alerts/clock-skew.yaml
+# consumes:
+#
+#   chrony_tracking_last_offset_seconds   — instantaneous offset between
+#                                            the system clock and the
+#                                            NTP source's idea of true
+#                                            time. ALERT METRIC.
+#                                            ClockSkewWarn:  abs > 0.1
+#                                            ClockSkewPage:  abs > 0.5
+#
+#   chrony_tracking_rms_offset_seconds    — long-running RMS of offset.
+#                                            Useful for triage —
+#                                            persistent skew vs spike.
+#
+#   chrony_tracking_root_dispersion_seconds
+#                                          — uncertainty of the source.
+#                                            Diagnostic only; no alert.
+#
+# Reference:
+#   https://github.com/SuperQ/chrony_exporter#metrics
+#
+# ============================================================
+# Operator runbook
+# ============================================================
+#
+# When ClockSkewWarn or ClockSkewPage fires:
+#   1. SSH into the affected Postgres host.
+#   2. `chronyc tracking`     — single-line summary; "Last offset" is
+#                                the canonical fact.
+#   3. `chronyc sources -v`   — per-source state. A poll-failed source
+#                                often explains a sustained drift.
+#   4. `systemctl status chrony` — daemon health.
+#   5. `journalctl -u chrony --since=-1h` — recent logs.
+#
+# See runbooks/clock-skew-alert.md for the full triage / mitigation
+# sequence.

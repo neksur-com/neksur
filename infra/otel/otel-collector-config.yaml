@@ -1,0 +1,88 @@
+# OpenTelemetry Collector configuration — Plan 00-05 Wave 4 / D-001.14.
+#
+# The collector sits between the neksur-server binary (which emits OTLP
+# gRPC traces via go.opentelemetry.io/otel/exporters/otlp/otlptrace/
+# otlptracegrpc) and the operator-chosen tracing backend. It also
+# scrapes its OWN internal metrics so the Prometheus server in this
+# stack can observe collector health (drops, batch sizes, etc.).
+#
+# Architecture (from 00-RESEARCH.md §System Architecture Diagram):
+#
+#   neksur-server (internal/graph) --OTLP gRPC 4317--> otel-collector --+
+#                                                                       |
+#                          +-- traces (otlp exporter, configurable) <---+
+#                          |
+#                          +-- metrics (prometheus exporter :8889) <----+
+#
+# The Prometheus exporter on :8889 is what infra/prometheus/prometheus.yml's
+# `otel-collector` scrape job consumes. The traces exporter is intentionally
+# left as a stub (logging exporter) so this docker-compose stack runs
+# self-contained for the Plan 00-05 integration tests; operators wire a
+# real Tempo / Jaeger / vendor backend at deploy time.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  # Self-scrape: the collector's own runtime metrics (queue depth, drops,
+  # batch latency) flow through the same pipeline. Useful for diagnosing
+  # observability-stack health when an alert that SHOULD have fired didn't.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-self
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['0.0.0.0:8888']
+
+processors:
+  # memory_limiter MUST come first per the OTel docs: if memory pressure
+  # is high, this drops data BEFORE the batcher commits it, preventing
+  # OOM at the cost of telemetry gaps (which the on-call sees in the
+  # CypherP99LatencyBreach alert behaviour).
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # Operator wires the real backend here. The placeholder targets the
+  # ot-collector's own logging output so docker-compose self-tests do
+  # not need an external service to be reachable.
+  debug:
+    verbosity: basic
+  # Prometheus exporter on :8889 — scraped by infra/prometheus/prometheus.yml's
+  # `otel-collector` scrape job. This is the bridge between the OTel metrics
+  # pipeline and the Prometheus alerting pipeline.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    send_timestamps: true
+    metric_expiration: 5m
+  # Optional OTLP exporter to a tracing backend (Tempo / Jaeger /
+  # Honeycomb / vendor). Commented out by default — uncomment and set
+  # the endpoint at deploy time to ship spans off-collector.
+  # otlp/backend:
+  #   endpoint: tempo:4317
+  #   tls:
+  #     insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      # Operator swaps `debug` for `otlp/backend` when ready.
+      exporters: [debug]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+  telemetry:
+    metrics:
+      level: detailed

@@ -1,0 +1,74 @@
+# AlertManager configuration — Plan 00-05 Wave 4.
+#
+# Routes alerts by `severity` label per the Plan 01 alert rule files:
+#
+#   severity=page  → pagerduty receiver (CypherP99LatencyBreach,
+#                                        ClockSkewPage)
+#   severity=warn  → slack receiver     (ClockSkewWarn)
+#
+# IMPORTANT — secrets management (threat T-0-OBS-SECRETS):
+# The integration_key (PagerDuty) and api_url (Slack) MUST be injected
+# at deploy time via environment variables. AlertManager natively
+# substitutes ${env:VAR} placeholders in receiver configs since v0.27,
+# and we use that mechanism here. The placeholder values committed
+# below are sentinel strings; real keys NEVER land in git.
+#
+# Operator action at deploy time:
+#   export PAGERDUTY_INTEGRATION_KEY=<real-key>
+#   export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+#   docker compose -f infra/otel/docker-compose.observability.yml up -d
+# (See runbooks/cypher-latency-breach.md §Triage Setup.)
+
+global:
+  resolve_timeout: 5m
+
+route:
+  # Default receiver is the page channel — fail-safe: if for any reason
+  # the severity-label routing tree doesn't match, the alert escalates
+  # rather than getting swallowed.
+  receiver: pagerduty
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # PAGE tier — wakes on-call. Both CypherP99LatencyBreach (D-001.14)
+    # and ClockSkewPage (C-TECH-10) carry severity=page.
+    - matchers:
+        - severity = "page"
+      receiver: pagerduty
+      continue: false
+
+    # WARN tier — Slack only, no on-call wake. ClockSkewWarn carries
+    # this label.
+    - matchers:
+        - severity = "warn"
+      receiver: slack
+      continue: false
+
+receivers:
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_INTEGRATION_KEY}'
+        # Description carries the Prometheus alertname + summary so the
+        # PagerDuty incident page is self-contained for the on-call
+        # who clicks through.
+        description: '{{ .GroupLabels.alertname }} — {{ .CommonAnnotations.summary }}'
+        details:
+          contract: '{{ .CommonLabels.contract }}'
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+          firing_count: '{{ .Alerts.Firing | len }}'
+
+  - name: slack
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#oncall-warn'
+        send_resolved: true
+        title: '{{ .GroupLabels.alertname }}'
+        text: |
+          *{{ .CommonAnnotations.summary }}*
+          Contract: `{{ .CommonLabels.contract }}`
+          {{ range .Alerts.Firing -}}
+          • {{ .Annotations.description }}
+          {{- end }}
