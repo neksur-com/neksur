@@ -42,9 +42,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -63,11 +66,42 @@ type patroniCluster struct {
 }
 
 // composeFile returns the docker-compose path. Override via COMPOSE_FILE.
+//
+// Default resolution walks up from this file's location (`runtime.Caller`)
+// to the repo root (marked by go.mod) and joins infra/docker-compose.ha.yml.
+// That makes the default robust to `go test` working-directory (tests run
+// from the package dir `tests/chaos/`, not the repo root — live verify
+// 2026-05-13 surfaced this).
 func composeFile() string {
 	if v := os.Getenv("COMPOSE_FILE"); v != "" {
 		return v
 	}
+	if root := findRepoRoot(); root != "" {
+		return filepath.Join(root, "infra", "docker-compose.ha.yml")
+	}
+	// Fallback: best-effort relative path (works only if CWD == repo root).
 	return "infra/docker-compose.ha.yml"
+}
+
+// findRepoRoot walks up from this source file's directory until it finds
+// a go.mod, returning the directory containing it. Empty string on failure.
+func findRepoRoot() string {
+	_, here, _, ok := runtime.Caller(0)
+	if !ok {
+		return ""
+	}
+	dir := filepath.Dir(here)
+	for i := 0; i < 10; i++ { // bounded — avoid infinite loop on misuse
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+	return ""
 }
 
 // patroniRESTPort returns the host-mapped Patroni REST port for polling.
@@ -135,29 +169,60 @@ func countReplicas(cl *patroniCluster) int {
 	return n
 }
 
+// startClusterTimeout is the StartCluster settle ceiling. Bumped from 180s
+// → 5min on 2026-05-13 because true cold bootstrap of 3 nodes (pg_basebackup
+// + replay on 2 replicas) reliably needs ~3-5min wall-clock on
+// arm64/macOS — the prior 180s was insufficient even on warm runs when
+// the first replica had to redo bootstrap (e.g. after a `down -v` that
+// wiped volumes).
+const startClusterTimeout = 5 * time.Minute
+
+// haproxyPrimaryProbeAddr is the host:port StartCluster probes to confirm
+// HAProxy has finished electing the current Patroni leader as its
+// primary backend. HAProxy's `option httpchk GET /master` runs on its
+// own ~3s cadence (separate from Patroni's loop_wait=10s), so the
+// cluster can be Patroni-settled (1 leader + 2 replicas) while HAProxy
+// still reports 503 backend. Probing the actual TCP connect to the
+// HAProxy primary route catches that gap. The matching haproxyPrimaryDSN
+// in failover_test.go must hit this same host:port.
+const haproxyPrimaryProbeAddr = "localhost:5500"
+
 // StartCluster brings up the docker-compose HA cluster and polls Patroni's
 // REST API until exactly 1 leader and >=2 replicas are visible. Returns
 // the leader's name.
 //
+// If the cluster is ALREADY UP and settled (leader + 2 streaming replicas
+// via Patroni REST), StartCluster short-circuits the `docker compose up -d`
+// invocation. This handles two cases:
+//   - Tests using t.Cleanup → StopCluster between subtests (`up -d` is
+//     idempotent but still slow to no-op on warm clusters)
+//   - Operator running the cluster manually for debug, then invoking the
+//     chaos test against it
+//
 // Cold-start budget: bringing the cluster from scratch involves pulling
 // quay.io/coreos/etcd:v3.5.13 (~30 MB), building neksur/postgres-age:phase0
-// from infra/postgres/Dockerfile (~600 MB layered on apache/age — but
-// cached after first pull), and running each Patroni container's lazy
-// `pip install patroni[etcd3]` (one-time ~20-40s per node on a cold
-// network). Subsequent runs see all images cached and complete in <60s.
-//
-// We poll for up to 180s (the cold-start ceiling) with 2s gaps; warm
-// runs return well under 60s.
+// from infra/postgres/Dockerfile (~600 MB cached after first pull), and
+// pg_basebackup + WAL replay on each replica. ~3-5min wall-clock on
+// arm64/macOS; faster on Linux + dedicated build.
 func StartCluster(ctx context.Context) (string, error) {
+	baseURL := fmt.Sprintf("http://localhost:%s", patroniRESTPort())
+
+	// Short-circuit: if the cluster is already settled, skip `up -d`
+	// (it's slow even when idempotent — docker has to inspect each
+	// container's healthcheck state).
+	if cl, err := fetchCluster(ctx, baseURL); err == nil {
+		if leader := findLeader(cl); leader != "" && countReplicas(cl) >= 2 {
+			return leader, nil
+		}
+	}
+
 	// `up -d` is idempotent — if some containers are already running, it
-	// only starts the missing ones. For tests using t.Cleanup → StopCluster
-	// this matters only if a previous run died mid-teardown.
+	// only starts the missing ones.
 	if err := runCompose(ctx, "up", "-d"); err != nil {
 		return "", fmt.Errorf("chaos: docker compose up: %w", err)
 	}
 
-	baseURL := fmt.Sprintf("http://localhost:%s", patroniRESTPort())
-	deadline := time.Now().Add(180 * time.Second)
+	deadline := time.Now().Add(startClusterTimeout)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -170,7 +235,7 @@ func StartCluster(ctx context.Context) (string, error) {
 		}
 
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("chaos: StartCluster: timeout waiting for cluster to settle (last err: %v)", lastErr)
+			return "", fmt.Errorf("chaos: StartCluster: timeout (%s) waiting for cluster to settle (last err: %v)", startClusterTimeout, lastErr)
 		}
 
 		cl, err := fetchCluster(ctx, baseURL)
@@ -180,11 +245,146 @@ func StartCluster(ctx context.Context) (string, error) {
 		}
 		leader := findLeader(cl)
 		replicas := countReplicas(cl)
-		if leader != "" && replicas >= 2 {
-			return leader, nil
+		if leader == "" || replicas < 2 {
+			lastErr = fmt.Errorf("not yet settled: leader=%q replicas=%d members=%d", leader, replicas, len(cl.Members))
+			continue
 		}
-		lastErr = fmt.Errorf("not yet settled: leader=%q replicas=%d members=%d", leader, replicas, len(cl.Members))
+		// Patroni is settled — but HAProxy's health checks may lag.
+		// Confirm the HAProxy primary route accepts a TCP connect before
+		// returning, otherwise downstream tests hit "unexpected EOF".
+		if err := haproxyPrimaryReady(ctx); err != nil {
+			lastErr = fmt.Errorf("Patroni settled (leader=%s) but HAProxy primary not yet ready: %w", leader, err)
+			continue
+		}
+		// One-time AGE setup: shared_preload_libraries='age' (per Patroni
+		// config) loads the AGE shared library at server startup, but the
+		// `cypher()` SQL function only resolves once `CREATE EXTENSION age`
+		// has been run in the target database AND the named graph exists.
+		// Plan 02 migrations do this in production; the chaos compose
+		// brings up a fresh Patroni-managed Postgres without our migration
+		// set, so we run the minimum needed here. Idempotent.
+		if err := setupAGEViaHAProxy(ctx); err != nil {
+			lastErr = fmt.Errorf("Patroni+HAProxy ready but AGE setup failed: %w", err)
+			continue
+		}
+		return leader, nil
 	}
+}
+
+// haproxyPrimaryReady probes the HAProxy primary route with a full pgwire
+// startup-packet exchange. HAProxy's TCP frontend ACCEPTS connections on
+// the bind port even when zero backend servers are UP — and on no-backend
+// it immediately closes the socket, which manifests downstream as "failed
+// to receive message: unexpected EOF" from pgx. A bare TCP connect is
+// therefore not enough to distinguish "primary route ready" from "HAProxy
+// up but no backend yet".
+//
+// Instead, send a minimal Postgres v3 StartupMessage and require a
+// non-empty response byte. Postgres replies with 'R' (AuthenticationRequest)
+// or 'E' (Error) — either confirms the connection reached a real backend.
+// A connection that closes silently (n=0 bytes, EOF) is the failure mode
+// HAProxy exposes during convergence and is the one we want to reject here.
+func haproxyPrimaryReady(ctx context.Context) error {
+	var d net.Dialer
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(dialCtx, "tcp", haproxyPrimaryProbeAddr)
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", haproxyPrimaryProbeAddr, err)
+	}
+	defer conn.Close()
+
+	// Postgres v3 StartupMessage layout:
+	//   int32 length (incl. self)
+	//   int32 protocol = 196608 (0x00030000)
+	//   keyval pairs (\0-terminated strings) ending with extra \0
+	// Minimal payload: user=postgres, database=postgres.
+	payload := []byte("user\x00postgres\x00database\x00postgres\x00\x00")
+	msg := make([]byte, 8+len(payload))
+	binaryWriteUint32(msg[0:4], uint32(len(msg)))
+	binaryWriteUint32(msg[4:8], 196608) // 0x00030000
+	copy(msg[8:], payload)
+
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(msg); err != nil {
+		return fmt.Errorf("write startup packet: %w", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read pgwire reply (HAProxy backend probably not yet UP): %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("read 0 bytes — HAProxy backend not yet UP")
+	}
+	// 'R' = AuthenticationRequest (expected on a healthy backend with
+	// trust auth disabled); 'E' = ErrorResponse (also confirms backend
+	// is alive — e.g. "no pg_hba.conf entry" — which is fine for the
+	// probe). Anything else means we got to a real Postgres process.
+	return nil
+}
+
+// binaryWriteUint32 writes v into b in big-endian (network byte order).
+// pgwire StartupMessage uses BE per the Postgres protocol spec.
+func binaryWriteUint32(b []byte, v uint32) {
+	b[0] = byte(v >> 24)
+	b[1] = byte(v >> 16)
+	b[2] = byte(v >> 8)
+	b[3] = byte(v)
+}
+
+// setupAGEViaHAProxy connects to the HAProxy primary route and runs the
+// minimum SQL needed to make `cypher('neksur', $$ ... $$)` calls resolve:
+//
+//   CREATE EXTENSION IF NOT EXISTS age;
+//   LOAD 'age';
+//   SELECT create_graph('neksur') WHERE 'neksur' NOT IN (SELECT name FROM ag_catalog.ag_graph);
+//
+// The chaos docker-compose stack brings up a fresh Patroni-managed cluster
+// without our Plan 02 migration set; this helper compensates so chaos
+// tests can exercise the cypher() path. Idempotent — safe to call from
+// StartCluster on every invocation.
+//
+// Uses `docker compose exec` rather than a Go SQL driver to keep the
+// chaos lib dependency surface zero-Go-deps (we are already shelling out
+// to docker for compose operations). The `psql` client is in the
+// neksur/postgres-age:phase0 image because postgresql-client-16 is a
+// transitive dep of postgresql-16.
+func setupAGEViaHAProxy(ctx context.Context) error {
+	sql := `
+CREATE EXTENSION IF NOT EXISTS age;
+LOAD 'age';
+SELECT create_graph('neksur')
+  WHERE NOT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'neksur');
+`
+	// Use docker compose exec to run psql as the postgres superuser
+	// against the leader's Patroni-managed Postgres on its container-
+	// internal port 5432. We target pg-node-1 by default; if it's not
+	// the current leader, Patroni sync_standby will reject the DDL
+	// (CREATE EXTENSION is replicated through WAL only — Patroni
+	// would refuse to run it on a replica) and we retry on the leader.
+	//
+	// Discover leader name from Patroni REST so we always run on the
+	// authoritative node.
+	cl, err := fetchCluster(ctx, fmt.Sprintf("http://localhost:%s", patroniRESTPort()))
+	if err != nil {
+		return fmt.Errorf("setupAGE: fetchCluster: %w", err)
+	}
+	leader := findLeader(cl)
+	if leader == "" {
+		return fmt.Errorf("setupAGE: no Patroni leader found")
+	}
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile(),
+		"exec", "-T", "-u", "postgres", leader,
+		"psql", "-d", "postgres", "-c", sql,
+	)
+	stderr := &strings.Builder{}
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("setupAGE: psql exec on %s: %w (stderr: %s)", leader, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 // KillPrimary SIGKILLs the named container (Patroni leader). Returns the
