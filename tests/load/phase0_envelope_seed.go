@@ -125,13 +125,24 @@ var ErrNotImplemented = errors.New("seed not implemented (legacy sentinel; Seed 
 // the index *contents* are correct. This pre-check exists to catch
 // the common operator error of running the seed against a schema
 // that hasn't reached V0025 yet (Pitfall 2 mitigation).
+//
+// Note: index names are LOWERCASED because Postgres folds unquoted
+// identifiers to lowercase at CREATE INDEX time. V0025's migration
+// uses unquoted `idx_<Label>_tenant` literals; pg_indexes returns
+// `idx_<label>_tenant` (e.g. `idx_catalog_tenant`, not
+// `idx_Catalog_tenant`). Earlier versions of this function
+// PascalCased the labels and the pre-check failed against a
+// correctly-migrated schema (live verify 2026-05-13 surfaced this).
 func expectedIndexes() []string {
 	out := make([]string, 0, 19*2+11+3+2)
 	// 19 tenant btree + 19 GIN from V0025
 	for _, vlabel := range graph.NodeLabels {
-		out = append(out, "idx_"+vlabel+"_tenant", "idx_"+vlabel+"_props_gin")
+		lower := strings.ToLower(vlabel)
+		out = append(out, "idx_"+lower+"_tenant", "idx_"+lower+"_props_gin")
 	}
 	// 11 property indexes from V0020 (deterministic names from the polyfill)
+	// — these KEEP PascalCase because V0020 quotes the identifiers; V0025 in
+	// contrast uses unquoted identifiers and Postgres lowercases them.
 	property := []struct{ label, prop string }{
 		{"Table", "uri"}, {"Table", "catalog_id"},
 		{"Column", "uri"}, {"Column", "parent_table_uri"},
