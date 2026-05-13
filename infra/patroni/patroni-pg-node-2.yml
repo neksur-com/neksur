@@ -21,6 +21,7 @@ bootstrap:
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
     synchronous_mode: true
+    synchronous_mode_strict: false
     synchronous_node_count: 1
     postgresql:
       use_pg_rewind: true
@@ -30,7 +31,7 @@ bootstrap:
         archive_mode: 'on'
         archive_command: '/bin/true'
         archive_timeout: '60'
-        max_wal_senders: '10'
+        max_wal_senders: '20'
         max_replication_slots: '5'
         wal_level: 'replica'
         hot_standby: 'on'
