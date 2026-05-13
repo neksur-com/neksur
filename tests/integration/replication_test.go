@@ -203,7 +203,7 @@ func runReplWriteWorker(ctx context.Context, t *testing.T, workerID int, interva
 		cctx, ccancel := context.WithTimeout(ctx, 1*time.Second)
 		stmt := fmt.Sprintf("CREATE (n:Tag {id: 'repl-w%d-%d-%d'})", workerID, time.Now().UnixNano(), idx)
 		err := gc.ExecuteInTenant(cctx, "repl-tenant", func(c context.Context, tx pgx.Tx) error {
-			_, qerr := tx.Exec(c, fmt.Sprintf("SELECT * FROM cypher('neksur', $$ %s $$) AS (r ag_catalog.agtype)", stmt))
+			_, qerr := tx.Exec(c, fmt.Sprintf("SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (r ag_catalog.agtype)", stmt))
 			return qerr
 		})
 		ccancel()

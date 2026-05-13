@@ -306,7 +306,7 @@ func runWriteLoad(ctx context.Context, t *testing.T, inserts, errCount *atomic.I
 		// is intentionally small.
 		stmt := fmt.Sprintf("CREATE (n:Tag {id: 'chaos-%d-%d'})", time.Now().UnixNano(), idx)
 		err := gc.ExecuteInTenant(cctx, "chaos-tenant", func(c context.Context, tx pgx.Tx) error {
-			_, qerr := tx.Exec(c, fmt.Sprintf("SELECT * FROM cypher('neksur', $$ %s $$) AS (r ag_catalog.agtype)", stmt))
+			_, qerr := tx.Exec(c, fmt.Sprintf("SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (r ag_catalog.agtype)", stmt))
 			return qerr
 		})
 		ccancel()

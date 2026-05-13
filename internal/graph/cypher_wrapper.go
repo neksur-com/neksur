@@ -204,8 +204,11 @@ func explainAndParse(
 	// We deliberately re-quote the graph name and re-wrap the cypher
 	// statement here so the EXPLAIN target matches the original call
 	// shape exactly. The pgx positional binding handles args.
+	// Qualify cypher as ag_catalog.cypher — see client.go::Cypher for
+	// the bug #20 rationale (DISCARD ALL clears search_path between
+	// ExecuteInTenant calls, defeating the AfterConnect SET).
 	wrapped := fmt.Sprintf(
-		"EXPLAIN (FORMAT JSON, ANALYZE) SELECT * FROM cypher(%s, $$ %s $$) AS (result ag_catalog.agtype)",
+		"EXPLAIN (FORMAT JSON, ANALYZE) SELECT * FROM ag_catalog.cypher(%s, $$ %s $$) AS (result ag_catalog.agtype)",
 		quoteSQLString(graph), stmt,
 	)
 	row := client.pool.QueryRow(ctx, wrapped, args...)

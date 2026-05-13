@@ -129,7 +129,11 @@ func (g *GraphClient) Pool() *pgxpool.Pool {
 //  1. ValidateTraversalDepth(stmt) — pre-parser depth cap (D-001.08).
 //     Returns ErrUnboundedTraversal on bare `*`, `*N..`, `*..`.
 //  2. Wrap the statement in the AGE call shape:
-//     SELECT * FROM cypher('<graph>', $$ <stmt> $$) AS (result agtype)
+//     SELECT * FROM ag_catalog.cypher('<graph>', $$ <stmt> $$) AS (result ag_catalog.agtype)
+//     Both cypher and agtype are schema-qualified so the call does
+//     not depend on ag_catalog being in the session's search_path —
+//     defends against DISCARD ALL clearing the AfterConnect-set
+//     search_path between pool reuses (bug #20).
 //     Note: the graph name is interpolated as a SQL string literal here
 //     (it is never caller-supplied; it's the application's hard-coded
 //     graph name, typically "neksur"). The Cypher statement itself is
@@ -161,8 +165,17 @@ func (g *GraphClient) Cypher(
 	// block (which is what AGE expects as the second argument to
 	// cypher()). Pgx's positional binding handles the actual VALUES
 	// in args.
+	// Qualify cypher as ag_catalog.cypher (the function lives in the AGE
+	// extension's schema). Without the qualifier the call depends on
+	// ag_catalog being in the session's search_path. AfterConnect sets
+	// it when a physical connection is first opened, but ExecuteInTenant
+	// runs DISCARD ALL on pool release (Pitfall 5 defence) which clears
+	// per-session SETs. Re-using a pool connection after DISCARD ALL
+	// would otherwise fail with "function cypher does not exist" (bug
+	// #20 — surfaced empirically by Tier 2 replication test: 297K
+	// errors / 1 success in 5 min).
 	q := fmt.Sprintf(
-		"SELECT * FROM cypher(%s, $$ %s $$) AS (result ag_catalog.agtype)",
+		"SELECT * FROM ag_catalog.cypher(%s, $$ %s $$) AS (result ag_catalog.agtype)",
 		quoteSQLString(graph), stmt,
 	)
 	return g.pool.Query(ctx, q, args...)
