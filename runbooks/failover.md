@@ -15,7 +15,9 @@ Trigger this runbook when ANY of the following occur:
 - **Alert fires:** `patroni_master_change_total` increments unexpectedly
   (a leader change without an operator-issued `patronictl switchover`).
 - **Application reports:** "connection lost" / "could not connect" errors
-  on writes against the HAProxy primary endpoint (`postgres://...:5000/...`).
+  on writes against the HAProxy primary endpoint (`postgres://...:5000/...`
+  in-cluster, or `localhost:5500` from macOS dev host — port 5500 dodges
+  AirPlay; live verify 2026-05-13).
 - **Application reports:** Cypher queries returning
   `function cypher(unknown, unknown) does not exist` post-leader-change —
   this is the **A1 failure mode** (jump to §4).
@@ -133,15 +135,18 @@ The `--candidate` argument MUST be a node that:
 ### 3.c Verify AGE works post-promotion (the load-bearing check)
 
 After a new Leader is elected (automatically or manually), connect via
-HAProxy port 5000 and run a Cypher round-trip. THIS IS THE STEP THAT
-VALIDATES THE A1 GUARANTEE — if it fails with the A1 failure mode, jump
-to §4.
+HAProxy port 5000 (in-cluster) or `localhost:5500` (macOS dev host —
+port shift dodges AirPlay) and run a Cypher round-trip. THIS IS THE
+STEP THAT VALIDATES THE A1 GUARANTEE — if it fails with the A1 failure
+mode, jump to §4.
 
 ```bash
 # Connect to HAProxy primary route — HAProxy's /master health check
 # should already be routing to the new Leader by now (3-9s detection).
 psql "postgres://neksur_app@haproxy:5000/neksur" -c \
     "SELECT * FROM cypher('neksur', \$\$ MATCH (n) RETURN count(n) \$\$) AS (c agtype);"
+# macOS dev host equivalent (host port 5500 → container port 5000):
+# psql "postgres://neksur_app@localhost:5500/neksur" -c "..."
 ```
 
 Expected output:

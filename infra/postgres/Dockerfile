@@ -20,17 +20,34 @@
 
 FROM apache/age:release_PG16_1.6.0
 
-# Install pgaudit and pg_stat_statements for Postgres 16. The apache/age
-# image is Debian-based with Postgres 16 from the PGDG apt repo, so we
-# install the matching extension packages from the same source.
+# Install pgaudit and pg_stat_statements for Postgres 16, plus python3 +
+# patroni for HA orchestration (Plan 00-03 Wave 2). The apache/age image
+# is Debian-based with Postgres 16 from the PGDG apt repo, so we install
+# the matching extension packages from the same source.
 USER root
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         postgresql-16-pgaudit \
-        postgresql-contrib-16; \
+        postgresql-contrib-16 \
+        python3 \
+        python3-pip \
+        python3-venv; \
     rm -rf /var/lib/apt/lists/*
+
+# Bake Patroni into the image so the HA compose can `exec patroni` directly
+# without a runtime install (live verify 2026-05-13 surfaced exit-127 from
+# the runtime pip3 pattern; this commit moves the install up-front).
+# Use a venv to avoid PEP 668 "externally-managed-environment" rejection
+# from the apt-managed Python on Debian trixie.
+RUN set -eux; \
+    python3 -m venv /opt/patroni-venv; \
+    /opt/patroni-venv/bin/pip install --no-cache-dir \
+        'patroni[etcd3]>=4.1' \
+        'psycopg[binary]>=3.1'; \
+    ln -s /opt/patroni-venv/bin/patroni /usr/local/bin/patroni; \
+    ln -s /opt/patroni-venv/bin/patronictl /usr/local/bin/patronictl
 
 # Drop back to the postgres user (the upstream image expects this).
 USER postgres

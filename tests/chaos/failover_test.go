@@ -44,10 +44,13 @@ import (
 	"github.com/neksur-com/neksur/internal/graph"
 )
 
-// haproxyPrimaryDSN is the application-facing DSN. HAProxy on port 5000
-// routes to the current Patroni leader via `option httpchk GET /master`.
-// docker-compose.ha.yml exposes haproxy:5000 → host:5000.
-const haproxyPrimaryDSN = "postgres://postgres:postgres@localhost:5000/postgres?sslmode=disable"
+// haproxyPrimaryDSN is the application-facing DSN. HAProxy listens on 5000
+// inside the container (primary route via `option httpchk GET /master`),
+// but the docker-compose host-port mapping remaps to host:5500 to dodge
+// the macOS AirPlay Receiver conflict on port 5000 (live verify
+// 2026-05-13 surfaced the conflict). Linux hosts unaffected by the host
+// port choice.
+const haproxyPrimaryDSN = "postgres://postgres:postgres@localhost:5500/postgres?sslmode=disable"
 
 // failoverContractBudget is D-001.15: kill-to-new-leader-elected must be
 // strictly less than 30 seconds. Captured as a var so the test diagnostic

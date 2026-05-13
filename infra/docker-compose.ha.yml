@@ -5,7 +5,10 @@
 #
 #   etcd-1, etcd-2, etcd-3       — 3-node DCS quorum
 #   pg-node-1, pg-node-2, pg-node-3 — Patroni-managed Postgres+AGE
-#   haproxy                       — front door (5000 = primary, 5001 = replicas, 7000 = stats)
+#   haproxy                       — front door (host 5500 → container 5000 = primary,
+#                                                host 5501 → container 5001 = replicas,
+#                                                host 7500 → container 7000 = stats UI;
+#                                                host port shift dodges macOS AirPlay on 5000)
 #
 # Resource budget: ~4-5 GB RAM, ~2 vCPU. Validated against Docker Desktop
 # 7.65 GB allocation. CI must declare matching resources.
@@ -177,18 +180,16 @@ services:
     environment:
       - PATRONI_NAME=pg-node-1
       - PATRONI_LOG_LEVEL=INFO
-    user: postgres
-    # Lazy patroni install — keeps the Dockerfile minimal (production image
-    # bakes patroni in via a separate layer; this compose is for chaos
-    # testing only).
+    user: "0:0"   # root — needed to chown the mounted data volume on first boot;
+                  # the chown step in command: drops perms back to postgres before
+                  # exec patroni so postmaster runs as the postgres user.
     command:
       - bash
       - -lc
       - >
-        if ! command -v patroni >/dev/null 2>&1; then
-          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
-        fi;
-        exec patroni /etc/patroni/patroni.yml
+        chown -R postgres:postgres /var/lib/postgresql/16/main &&
+        chmod 0700 /var/lib/postgresql/16/main &&
+        exec su postgres -c "patroni /etc/patroni/patroni.yml"
 
   pg-node-2:
     image: neksur/postgres-age:phase0
@@ -217,15 +218,14 @@ services:
     environment:
       - PATRONI_NAME=pg-node-2
       - PATRONI_LOG_LEVEL=INFO
-    user: postgres
+    user: "0:0"   # root — see pg-node-1 comment for rationale.
     command:
       - bash
       - -lc
       - >
-        if ! command -v patroni >/dev/null 2>&1; then
-          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
-        fi;
-        exec patroni /etc/patroni/patroni.yml
+        chown -R postgres:postgres /var/lib/postgresql/16/main &&
+        chmod 0700 /var/lib/postgresql/16/main &&
+        exec su postgres -c "patroni /etc/patroni/patroni.yml"
 
   pg-node-3:
     image: neksur/postgres-age:phase0
@@ -254,18 +254,20 @@ services:
     environment:
       - PATRONI_NAME=pg-node-3
       - PATRONI_LOG_LEVEL=INFO
-    user: postgres
+    user: "0:0"   # root — see pg-node-1 comment for rationale.
     command:
       - bash
       - -lc
       - >
-        if ! command -v patroni >/dev/null 2>&1; then
-          pip3 install --quiet --no-warn-script-location 'patroni[etcd3]>=4.1';
-        fi;
-        exec patroni /etc/patroni/patroni.yml
+        chown -R postgres:postgres /var/lib/postgresql/16/main &&
+        chmod 0700 /var/lib/postgresql/16/main &&
+        exec su postgres -c "patroni /etc/patroni/patroni.yml"
 
   # ===========================================================================
-  # HAProxy — front door. Routes 5000 → primary, 5001 → replicas, 7000 → stats.
+  # HAProxy — front door. Inside the container HAProxy listens on 5000 →
+  # primary, 5001 → replicas, 7000 → stats. Host ports are remapped to
+  # 5500 / 5501 / 7500 to avoid the well-known macOS AirPlay Receiver
+  # conflict on port 5000 (live verify 2026-05-13 surfaced this).
   # ===========================================================================
   haproxy:
     image: haproxy:2.9-alpine
@@ -281,6 +283,6 @@ services:
     volumes:
       - ./haproxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "5000:5000"   # primary route
-      - "5001:5001"   # replica route
-      - "7000:7000"   # stats UI
+      - "5500:5000"   # primary route   (host:container — host 5500 to dodge macOS AirPlay)
+      - "5501:5001"   # replica route   (host:container)
+      - "7500:7000"   # stats UI         (host:container)
