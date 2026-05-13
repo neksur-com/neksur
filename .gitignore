@@ -45,6 +45,10 @@ pgdata/
 # Test artifacts
 junit.xml
 .testcontainers/
+# DR test artifacts (Plan 00-04 / Wave 3)
+/dr-writer
+tests/dr/_*.csv
+tests/dr/_*.json
 
 # Frontend (web/) build output — Phase 1+; pre-emptively listed
 web/node_modules/
