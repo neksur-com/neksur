@@ -76,10 +76,12 @@
 package load
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -595,6 +597,16 @@ func Seed(ctx context.Context, conn *pgx.Conn, opts SeedOpts) (SeedResult, error
 // closure that synthesises rows on demand — this is the idiomatic Go
 // equivalent of the Python io.Pipe / encoding/csv scaffolding the plan
 // describes. It avoids materialising the whole batch in memory.
+//
+// Wire format: TEXT COPY (NOT binary). pgx's high-level CopyFrom uses
+// binary format by default, which is faster but requires per-type
+// binary serializers. The `properties` column is `ag_catalog.agtype` —
+// AGE's custom type — and its binary input function reads the first
+// byte as a version marker. JSON bytes start with `{` (= 123) which
+// agtype rejects as "unsupported agtype version number 123". TEXT
+// format invokes the agtype text input function instead, which parses
+// JSON-shaped text directly. Slightly slower than binary but
+// agtype-compatible. (Live verify 2026-05-13 surfaced this trap.)
 func copyNodes(
 	ctx context.Context,
 	conn *pgx.Conn,
@@ -605,69 +617,108 @@ func copyNodes(
 	tenants int,
 	makeProp func(string, int64) map[string]any,
 ) (int64, int64, error) {
-	var bytes int64
-	idx := int64(0)
-	src := &copyNodeSource{
-		count:      count,
-		entryStart: entryStart,
-		labelID:    labelID,
-		tenants:    tenants,
-		makeProp:   makeProp,
-		idx:        &idx,
-		bytes:      &bytes,
-	}
-	tableIdent := pgx.Identifier{"neksur", label}
-	written, err := conn.CopyFrom(ctx, tableIdent, []string{"id", "properties"}, src)
+	stmt := fmt.Sprintf(`COPY neksur.%q (id, properties) FROM STDIN WITH (FORMAT text)`, label)
+	r, w := io.Pipe()
+	var bytesWritten int64
+
+	// Writer goroutine — synthesises rows on demand and pipes COPY-text
+	// to the connection. Errors propagate via pipe close-with-error so
+	// PgConn.CopyFrom sees them.
+	go func() {
+		bw := bufio.NewWriterSize(w, 64<<10)
+		var pipeErr error
+		defer func() {
+			if pipeErr != nil {
+				_ = w.CloseWithError(pipeErr)
+			} else {
+				if err := bw.Flush(); err != nil {
+					_ = w.CloseWithError(err)
+				} else {
+					_ = w.Close()
+				}
+			}
+		}()
+		for n := int64(0); n < count; n++ {
+			tenantID := fmt.Sprintf("tenant-%d", n%int64(tenants))
+			props := makeProp(tenantID, n)
+			propJSON, err := json.Marshal(props)
+			if err != nil {
+				pipeErr = fmt.Errorf("json marshal node %d: %w", n, err)
+				return
+			}
+			gid := makeGraphID(labelID, entryStart+n)
+			nb, err := fmt.Fprintf(bw, "%d\t%s\n", gid, escapeCopyText(string(propJSON)))
+			if err != nil {
+				pipeErr = fmt.Errorf("write row %d: %w", n, err)
+				return
+			}
+			bytesWritten += int64(nb)
+		}
+	}()
+
+	tag, err := conn.PgConn().CopyFrom(ctx, r, stmt)
 	if err != nil {
+		_ = r.CloseWithError(err)
 		return 0, 0, err
 	}
+	written := tag.RowsAffected()
+
 	// Yield to pgBackRest WAL drain after every label-batch (T-0-LOAD-WAL-OVERFLOW)
 	if count >= 1_000_000 {
 		select {
 		case <-ctx.Done():
-			return written, bytes, ctx.Err()
+			return written, bytesWritten, ctx.Err()
 		case <-time.After(1 * time.Second):
 		}
 	}
-	return written, bytes, nil
+	return written, bytesWritten, nil
 }
 
-type copyNodeSource struct {
-	count      int64
-	entryStart int64
-	labelID    int32
-	tenants    int
-	makeProp   func(string, int64) map[string]any
-	idx        *int64
-	bytes      *int64
-	current    [2]any
-}
-
-func (s *copyNodeSource) Next() bool {
-	if *s.idx >= s.count {
-		return false
+// escapeCopyText escapes a string for inclusion as a COPY TEXT column
+// value. Per the Postgres docs (COPY format): special chars to escape
+// are backslash, tab, newline, carriage return, plus form-feed, backspace,
+// vertical-tab for completeness. JSON strings can contain backslash
+// (`\"` for quotes within strings) which collides with COPY's own
+// backslash semantics, so this is non-optional. The seed's deterministic
+// synthetic JSON rarely emits any of these (URIs and small string
+// constants), but we apply the escape unconditionally to guard against
+// regressions in the makeProp shape.
+func escapeCopyText(s string) string {
+	// Fast path — most rows contain none of the special chars
+	if !strings.ContainsAny(s, "\\\t\n\r\b\f\v") {
+		return s
 	}
-	n := *s.idx
-	tenantID := fmt.Sprintf("tenant-%d", n%int64(s.tenants))
-	props := s.makeProp(tenantID, n)
-	propJSON, _ := json.Marshal(props)
-	s.current[0] = makeGraphID(s.labelID, s.entryStart+n)
-	s.current[1] = string(propJSON)
-	*s.bytes += int64(len(propJSON)) + 16
-	*s.idx++
-	return true
+	var b strings.Builder
+	b.Grow(len(s) + len(s)/8)
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\v':
+			b.WriteString(`\v`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
-
-func (s *copyNodeSource) Values() ([]any, error) {
-	return []any{s.current[0], s.current[1]}, nil
-}
-
-func (s *copyNodeSource) Err() error { return nil }
 
 // copyEdges is the analogous bulk-COPY for edge tables. AGE edge tables
 // have the schema (id graphid, start_id graphid, end_id graphid,
 // properties agtype). We pick start_id / end_id from the seeded vertex
-// entry-ID range to guarantee referential validity.
+// entry-ID range to guarantee referential validity. Uses the same
+// TEXT-format COPY pathway as copyNodes — see that function's wire-format
+// comment for the agtype rationale.
 func copyEdges(
 	ctx context.Context,
 	conn *pgx.Conn,
@@ -680,72 +731,63 @@ func copyEdges(
 	tenants int,
 	makeProp func(string, int64) map[string]any,
 ) (int64, int64, error) {
-	var bytes int64
-	idx := int64(0)
-	src := &copyEdgeSource{
-		count: count, entryStart: entryStart, labelID: labelID,
-		fromLabelID: fromLabelID, fromStart: fromStart, fromEnd: fromEnd,
-		toLabelID: toLabelID, toStart: toStart, toEnd: toEnd,
-		tenants: tenants, makeProp: makeProp,
-		idx: &idx, bytes: &bytes,
-	}
-	tableIdent := pgx.Identifier{"neksur", label}
-	written, err := conn.CopyFrom(ctx, tableIdent,
-		[]string{"id", "start_id", "end_id", "properties"}, src)
+	stmt := fmt.Sprintf(`COPY neksur.%q (id, start_id, end_id, properties) FROM STDIN WITH (FORMAT text)`, label)
+	r, w := io.Pipe()
+	var bytesWritten int64
+	fromCount := fromEnd - fromStart
+	toCount := toEnd - toStart
+
+	go func() {
+		bw := bufio.NewWriterSize(w, 64<<10)
+		var pipeErr error
+		defer func() {
+			if pipeErr != nil {
+				_ = w.CloseWithError(pipeErr)
+			} else {
+				if err := bw.Flush(); err != nil {
+					_ = w.CloseWithError(err)
+				} else {
+					_ = w.Close()
+				}
+			}
+		}()
+		for n := int64(0); n < count; n++ {
+			// Deterministic pick (no randomness — keeps the seed reproducible)
+			fromN := fromStart + (n % fromCount)
+			toN := toStart + ((n * 2654435761) % toCount)
+			tenantID := fmt.Sprintf("tenant-%d", n%int64(tenants))
+			props := makeProp(tenantID, n)
+			propJSON, err := json.Marshal(props)
+			if err != nil {
+				pipeErr = fmt.Errorf("json marshal edge %d: %w", n, err)
+				return
+			}
+			gid := makeGraphID(labelID, entryStart+n)
+			fromGid := makeGraphID(fromLabelID, fromN)
+			toGid := makeGraphID(toLabelID, toN)
+			nb, err := fmt.Fprintf(bw, "%d\t%d\t%d\t%s\n",
+				gid, fromGid, toGid, escapeCopyText(string(propJSON)))
+			if err != nil {
+				pipeErr = fmt.Errorf("write edge %d: %w", n, err)
+				return
+			}
+			bytesWritten += int64(nb)
+		}
+	}()
+
+	tag, err := conn.PgConn().CopyFrom(ctx, r, stmt)
 	if err != nil {
+		_ = r.CloseWithError(err)
 		return 0, 0, err
 	}
+	written := tag.RowsAffected()
+
 	if count >= 1_000_000 {
 		select {
 		case <-ctx.Done():
-			return written, bytes, ctx.Err()
+			return written, bytesWritten, ctx.Err()
 		case <-time.After(1 * time.Second):
 		}
 	}
-	return written, bytes, nil
+	return written, bytesWritten, nil
 }
-
-type copyEdgeSource struct {
-	count       int64
-	entryStart  int64
-	labelID     int32
-	fromLabelID int32
-	fromStart   int64
-	fromEnd     int64
-	toLabelID   int32
-	toStart     int64
-	toEnd       int64
-	tenants     int
-	makeProp    func(string, int64) map[string]any
-	idx         *int64
-	bytes       *int64
-	current     [4]any
-}
-
-func (s *copyEdgeSource) Next() bool {
-	if *s.idx >= s.count {
-		return false
-	}
-	n := *s.idx
-	fromCount := s.fromEnd - s.fromStart
-	toCount := s.toEnd - s.toStart
-	// Deterministic pick (no randomness — keeps the seed reproducible)
-	fromN := s.fromStart + (n % fromCount)
-	toN := s.toStart + ((n * 2654435761) % toCount)
-	tenantID := fmt.Sprintf("tenant-%d", n%int64(s.tenants))
-	props := s.makeProp(tenantID, n)
-	propJSON, _ := json.Marshal(props)
-	s.current[0] = makeGraphID(s.labelID, s.entryStart+n)
-	s.current[1] = makeGraphID(s.fromLabelID, fromN)
-	s.current[2] = makeGraphID(s.toLabelID, toN)
-	s.current[3] = string(propJSON)
-	*s.bytes += int64(len(propJSON)) + 32
-	*s.idx++
-	return true
-}
-
-func (s *copyEdgeSource) Values() ([]any, error) {
-	return []any{s.current[0], s.current[1], s.current[2], s.current[3]}, nil
-}
-
-func (s *copyEdgeSource) Err() error { return nil }
