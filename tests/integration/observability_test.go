@@ -169,28 +169,34 @@ func TestErrorsCounted(t *testing.T) {
 }
 
 // TestTraversalMetricsEmitted exercises the sampling path of
-// ExecuteCypher: a synthetic slow query (wraps pg_sleep) is GUARANTEED
-// to cross the slow-query threshold (>500ms), so its
-// cypher_nodes_visited / cypher_edges_traversed observation MUST land
-// in the registry by the time we scrape.
+// ExecuteCypher: graph.WithForceSample(ctx) deterministically triggers
+// the EXPLAIN ANALYZE follow-up, so cypher_nodes_visited /
+// cypher_edges_traversed observations MUST land in the registry by
+// the time we scrape — regardless of how fast the underlying Cypher
+// runs and regardless of the 1% random sampler.
 //
-// We use the pg_sleep wrapper rather than RETURN 1 because the 1%
-// random sampler is non-deterministic; the slow-query path is
-// deterministic.
+// Earlier iterations tried `RETURN n, pg_sleep(0.6)` to drive the
+// duration-threshold path, but AGE Cypher's expression evaluator does
+// not pass arbitrary SQL functions through (`function pg_sleep does
+// not exist` from the Cypher parser). The force-sample context hook
+// is the cleaner production signal for this use-case anyway: it lets
+// operators ad-hoc-probe a specific query for traversal counts
+// without waiting for the 1% sampler to fire.
 //
 // Maps to D-001.14 parts 3+4 (sampled traversal metrics).
 func TestTraversalMetricsEmitted(t *testing.T) {
 	baseURL := startMetricsServerForTest(t)
 	gc := graphClientForTest(t)
 
-	// pg_sleep(0.6) — guaranteed slow path. We wrap it in a Cypher
-	// MATCH that DOES touch graph storage so EXPLAIN's relation tree
-	// has at least one classifiable node. AGE handles arbitrary
-	// pg_* calls inside RETURN expressions.
-	slow := `MATCH (n) RETURN n, pg_sleep(0.6) LIMIT 1`
-	rows, err := graph.ExecuteCypher(fix.ctx, gc, "neksur", slow)
+	// Force-sample context guarantees the EXPLAIN path is exercised.
+	// The Cypher itself can be trivially fast; the empty-graph MATCH
+	// still gives EXPLAIN a relation tree to walk so the parser has
+	// something to count.
+	ctx := graph.WithForceSample(fix.ctx)
+	stmt := `MATCH (n) RETURN n LIMIT 1`
+	rows, err := graph.ExecuteCypher(ctx, gc, "neksur", stmt)
 	if err != nil {
-		t.Fatalf("ExecuteCypher slow: %v", err)
+		t.Fatalf("ExecuteCypher (force-sample): %v", err)
 	}
 	drainRows(t, rows)
 

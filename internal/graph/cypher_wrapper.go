@@ -88,6 +88,30 @@ func sampleNow() bool {
 // in 00-RESEARCH.md §Pattern 3.
 const slowQueryThresholdMs = 500.0
 
+// forceSampleKey is a context key that, when set, forces the EXPLAIN
+// ANALYZE follow-up regardless of duration / sampler. This exists for
+// two reasons: (1) deterministic testing of the sampled metrics
+// emission path (see TestTraversalMetricsEmitted), and (2) operator
+// debugging of a specific in-flight query without waiting for the 1%
+// sampler to fire. Production callers MUST NOT set this in a hot path
+// — it doubles per-call cost (the SQL round-trip plus the EXPLAIN
+// ANALYZE re-execution).
+type forceSampleKey struct{}
+
+// WithForceSample returns ctx annotated such that the next
+// ExecuteCypher call on it will run an EXPLAIN ANALYZE follow-up and
+// emit the cypher_nodes_visited / cypher_edges_traversed observations
+// regardless of duration or the random sampler.
+func WithForceSample(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceSampleKey{}, true)
+}
+
+// shouldForceSample returns true if WithForceSample was applied to ctx.
+func shouldForceSample(ctx context.Context) bool {
+	v, _ := ctx.Value(forceSampleKey{}).(bool)
+	return v
+}
+
 // ExecuteCypher is the telemetry-instrumented wrapper around
 // GraphClient.Cypher. See package-level docs for the full execution
 // path. The caller closes the returned pgx.Rows; on the error path
@@ -130,11 +154,13 @@ func ExecuteCypher(
 	}
 
 	// Sampling decision: slow queries (>500ms) ALWAYS get EXPLAIN
-	// ANALYZE follow-up; otherwise the 1% random sampler. We tolerate
+	// ANALYZE follow-up; otherwise the 1% random sampler. A
+	// `WithForceSample(ctx)` caller short-circuits both branches (used
+	// by integration tests + on-demand operator probes). We tolerate
 	// the EXPLAIN call failing — observability MUST NOT fail the
 	// caller's query — and only emit nodes/edges histograms on
 	// successful parse.
-	if durationMs > slowQueryThresholdMs || sampleNow() {
+	if shouldForceSample(ctx) || durationMs > slowQueryThresholdMs || sampleNow() {
 		if nodes, edges, perr := explainAndParse(ctx, client, graph, stmt, args...); perr == nil {
 			CypherNodesVisited.WithLabelValues(graph).Observe(float64(nodes))
 			CypherEdgesTraversed.WithLabelValues(graph).Observe(float64(edges))
