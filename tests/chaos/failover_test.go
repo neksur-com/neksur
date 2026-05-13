@@ -33,6 +33,7 @@ package chaos
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,42 @@ import (
 
 	"github.com/neksur-com/neksur/internal/graph"
 )
+
+// TestMain brings the HA cluster up once for the entire chaos package and
+// tears it down after all tests finish. Sharing the cluster across subtests
+// avoids the cold-bootstrap-between-subtests race (live verify 2026-05-13:
+// `down -v` + `up -d` between Test1 and Test2 reliably deadlocked at 1-of-3
+// replicas even with the max_wal_senders=20 fix in 9969c90 — full cold
+// bootstrap on Docker Desktop + macOS is racy enough that running it twice
+// back-to-back is unreliable).
+//
+// Override: set CHAOS_KEEP_CLUSTER=1 to skip the post-suite StopCluster (the
+// cluster stays up for manual inspection — re-runs short-circuit via the
+// "already settled" branch in StartCluster).
+//
+// Each subtest is still responsible for restoring the cluster to a usable
+// state when it kills the primary — TimeFailover handles the
+// leader-election wait so the next subtest can connect to whoever's promoted.
+func TestMain(m *testing.M) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	if _, err := StartCluster(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: StartCluster: %v\n", err)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	if os.Getenv("CHAOS_KEEP_CLUSTER") == "" {
+		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer dcancel()
+		if err := StopCluster(dctx); err != nil {
+			fmt.Fprintf(os.Stderr, "TestMain: StopCluster: %v\n", err)
+		}
+	}
+	os.Exit(code)
+}
 
 // haproxyPrimaryDSN is the application-facing DSN. HAProxy listens on 5000
 // inside the container (primary route via `option httpchk GET /master`),
@@ -75,16 +112,10 @@ func TestKillPrimaryFailoverUnder30s(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	t.Cleanup(func() {
-		// Use a fresh ctx for teardown so a t.Failed parent ctx doesn't
-		// abort the StopCluster mid-down.
-		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer dcancel()
-		if err := StopCluster(dctx); err != nil {
-			t.Logf("StopCluster: %v", err)
-		}
-	})
-
+	// Cluster lifecycle is owned by TestMain (one bootstrap per package
+	// run). StartCluster here short-circuits via the "already settled"
+	// branch — confirms the cluster is still healthy after any prior
+	// subtest, and returns the current leader.
 	leader, err := StartCluster(ctx)
 	if err != nil {
 		t.Fatalf("StartCluster: %v", err)
@@ -158,14 +189,8 @@ func TestPostFailoverCypherWorks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	t.Cleanup(func() {
-		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer dcancel()
-		if err := StopCluster(dctx); err != nil {
-			t.Logf("StopCluster: %v", err)
-		}
-	})
-
+	// Cluster lifecycle is owned by TestMain. StartCluster short-circuits
+	// if the cluster is already settled, returning the current leader.
 	leader, err := StartCluster(ctx)
 	if err != nil {
 		t.Fatalf("StartCluster: %v", err)
