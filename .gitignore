@@ -49,6 +49,11 @@ junit.xml
 /dr-writer
 tests/dr/_*.csv
 tests/dr/_*.json
+# Load-test scratch artifacts (Plan 00-06 / Wave 5) — footprint baseline JSON
+# is the A3 evidence trail but is regenerated on every run; per-query
+# failure CSVs are triage artifacts that rotate with every FAIL.
+tests/load/_*.csv
+tests/load/_*.json
 
 # Frontend (web/) build output — Phase 1+; pre-emptively listed
 web/node_modules/
