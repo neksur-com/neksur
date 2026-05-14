@@ -1,7 +1,10 @@
-h1:hSpJkgJXSC/RhgfNo4un8E1xpDfx1HhyCJvNcZ6r0XY=
+h1:wn+VEkDWjbNos9bJTSk+bruZ0Q2gSBnAm5qOM50/H7Y=
 V0001__enable_extensions.sql h1:vLn0FGCx878mDASxeCB9MHwKEcgBtlZ/dlRw090GUJI=
 V0030__rls_policies.sql h1:O44Noa3LnZB0HrZqQevcQ6TG321MmXBojnAxtepbrcA=
 V0041__public_tenants.sql h1:qfAsr2JISeClAQyXPdVZckMryOlkj1j709njt3UI/M4=
 V0042__public_rls.sql h1:woFANbpNKm0ovUDJheSeExIMnlOM5LSjABDuq7Pw/1I=
 V0043__public_audit_log.sql h1:ZViLEDuOwG3EEM1gloz2zJ7N89yJWYwJJHrlOptSg/M=
 V0044__public_tenant_lookup_fn.sql h1:1gejF1RVt1SCl/6P+b9/5FSBCVN0mLotKvyUjdUpB9E=
+V0050__tenant_audit_log.sql h1:YR7fHHz/1ZqT0BTWz9Lqilv3iW2syUwpp0iHoAQNLms=
+V0051__tenant_query_history.sql h1:v/P1MzUlha9eX3S8ZA0aiUHvb/B6XrwxXa8wqT2CKpE=
+V0052__tenant_policies.sql h1:qrRUUwH5Atzs7tXcVtJ8MwvpHXcpeH4OPf4BMLxyod8=
