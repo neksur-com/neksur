@@ -165,11 +165,14 @@ func (f *SaasFixture) ProvisionTenant(t *testing.T, tenantUUID string) string {
 	// Step (c) — GRANTs per RESEARCH §Pattern 1 lines 464–500.
 	// Tenant role gets USAGE on the tenant schema + CRUD on tables;
 	// USAGE on ag_catalog so it can run cypher() + agtype operators.
+	// `GRANT <tenant_role> TO neksur_app` enables `SET ROLE` from the
+	// app role (Plan 04 Layer 2 isolation test path).
 	grants := []string{
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA %s TO %s`, quoteIdent(schema), quoteIdent(roleName)),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA ag_catalog TO %s`, quoteIdent(roleName)),
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s`, quoteIdent(schema), quoteIdent(roleName)),
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s`, quoteIdent(schema), quoteIdent(roleName)),
+		fmt.Sprintf(`GRANT %s TO neksur_app`, quoteIdent(roleName)),
 	}
 	for _, s := range grants {
 		if _, err := conn.Exec(f.ctx, s); err != nil {
@@ -181,6 +184,22 @@ func (f *SaasFixture) ProvisionTenant(t *testing.T, tenantUUID string) string {
 	// schema with revisions written to public.atlas_schema_revisions.
 	if err := migrate.RunForTenant(f.ctx, f.Container.SuperuserDSN, schema); err != nil {
 		t.Fatalf("ProvisionTenant: migrate.RunForTenant(%s): %v", schema, err)
+	}
+
+	// Step (e) — Plan 04 T-0.5-audit-tamper post-migration REVOKE.
+	// Atlas creates audit_log via V0050 with the role-set default
+	// privileges (SELECT, INSERT, UPDATE). For Plan 04 compliance we
+	// REVOKE UPDATE, DELETE on audit_log so the tenant role can
+	// INSERT-only. Idempotent.
+	auditTbl := quoteIdent(schema) + ".audit_log"
+	revokes := []string{
+		fmt.Sprintf(`REVOKE UPDATE, DELETE ON %s FROM %s`, auditTbl, quoteIdent(roleName)),
+		fmt.Sprintf(`REVOKE TRUNCATE ON %s FROM %s`, auditTbl, quoteIdent(roleName)),
+	}
+	for _, s := range revokes {
+		if _, err := conn.Exec(f.ctx, s); err != nil {
+			t.Fatalf("ProvisionTenant: %s: %v", s, err)
+		}
 	}
 
 	return schema
