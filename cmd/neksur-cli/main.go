@@ -63,6 +63,8 @@ func dispatchTenant(ctx context.Context) int {
 		return runTenantCreate(ctx, subArgs)
 	case "migrate":
 		return runTenantMigrate(ctx, subArgs)
+	case "migrate-to-pool-b":
+		return runTenantMigrateToPoolB(ctx, subArgs)
 	case "peer":
 		return runTenantPeer(ctx, subArgs)
 	case "smoke":
@@ -83,11 +85,12 @@ Usage:
   neksur-cli tenant <verb> [flags]
 
 Tenant verbs:
-  create        Create public.tenants row + AGE create_graph + per-tenant role
-  migrate       Apply Atlas tenant-loop migrations (V0050+V0051+V0052)
-  peer          Initiate / poll / print VPC peering for the customer side
-  smoke         Run the post-provisioning smoke tests
-  cert-issue    Issue per-customer mTLS client cert via AWS Private CA
+  create             Create public.tenants row + AGE create_graph + per-tenant role
+  migrate            Apply Atlas tenant-loop migrations (V0050+V0051+V0052)
+  migrate-to-pool-b  Pool A → Pool B migration via pg_dump/pg_restore + row-count validation
+  peer               Initiate / poll / print VPC peering for the customer side
+  smoke              Run the post-provisioning smoke tests
+  cert-issue         Issue per-customer mTLS client cert via AWS Private CA
 
 Environment:
   DATABASE_URL         Admin pool DSN (required)
@@ -101,7 +104,7 @@ func tenantUsage() {
   neksur-cli tenant <verb> [flags]
 
 Verbs:
-  create | migrate | peer | smoke | cert-issue
+  create | migrate | migrate-to-pool-b | peer | smoke | cert-issue
 `)
 }
 
