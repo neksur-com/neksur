@@ -125,8 +125,10 @@ func schemaExists(t *testing.T, fx *SaasFixture, schema string) bool {
 }
 
 // dropSchemaCascade tears down the tenant schema + any owned objects.
-// We also drop the tenant role so the next ProvisionTenant pass can
-// re-create it idempotently.
+// For AGE-managed schemas, the canonical path is `drop_graph(<name>, true)`
+// which cleans both the schema and the ag_graph catalog row in one go.
+// A bare DROP SCHEMA CASCADE fails because AGE protects label tables
+// (SQLSTATE 2BP01).
 func dropSchemaCascade(t *testing.T, fx *SaasFixture, schema string) {
 	t.Helper()
 	conn, err := pgx.Connect(fx.ctx, fx.Container.SuperuserDSN)
@@ -135,20 +137,23 @@ func dropSchemaCascade(t *testing.T, fx *SaasFixture, schema string) {
 	}
 	defer conn.Close(fx.ctx)
 
-	// AGE bookkeeping: drop_graph also cleans the ag_graph row for the
-	// schema. The CASCADE handles dependent labels.
-	if _, err := conn.Exec(fx.ctx,
-		fmt.Sprintf(`SELECT drop_graph(%s, true) FROM ag_catalog.ag_graph WHERE name = %s`,
-			quoteLiteral(schema), quoteLiteral(schema))); err != nil {
-		// drop_graph may fail if the row already gone; fall through to DROP SCHEMA.
-		if !strings.Contains(err.Error(), "does not exist") {
-			t.Logf("dropSchemaCascade: drop_graph soft-fail: %v", err)
-		}
+	// LOAD 'age' is required so drop_graph resolves.
+	if _, err := conn.Exec(fx.ctx, "LOAD 'age'"); err != nil {
+		t.Fatalf("dropSchemaCascade: LOAD 'age': %v", err)
+	}
+	if _, err := conn.Exec(fx.ctx, `SET search_path = ag_catalog, "$user", public`); err != nil {
+		t.Fatalf("dropSchemaCascade: SET search_path: %v", err)
 	}
 
+	// drop_graph(<name>, cascade => true) — AGE removes the schema +
+	// the ag_graph entry transactionally. Returns NULL on success.
 	if _, err := conn.Exec(fx.ctx,
-		fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, quoteIdent(schema))); err != nil {
-		t.Fatalf("dropSchemaCascade: DROP SCHEMA: %v", err)
+		fmt.Sprintf(`SELECT drop_graph(%s, true)`, quoteLiteral(schema))); err != nil {
+		if strings.Contains(err.Error(), "does not exist") {
+			// Already gone; nothing to do.
+			return
+		}
+		t.Fatalf("dropSchemaCascade: drop_graph(%s): %v", schema, err)
 	}
 
 	// The tenant role isn't dropped — ProvisionTenant's IF NOT EXISTS

@@ -18,9 +18,11 @@
 --
 -- Layer 3 RLS predicates land in V0042 (separate file so the table DDL
 -- in V0041 can be verified independently before policy attachment).
+--
+-- Atlas runs each migration file in its own transaction (default
+-- `tx-mode = file`), so we do NOT include an explicit BEGIN/COMMIT —
+-- doing so triggers `pq: unexpected transaction status idle`.
 -- =====================================================================
-
-BEGIN;
 
 -- ----- public.tenants ------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.tenants (
@@ -171,5 +173,3 @@ BEGIN
     RAISE NOTICE 'V0041 OK — 4 public-tier tables + 2 base roles ready.';
 END
 $$ LANGUAGE plpgsql;
-
-COMMIT;

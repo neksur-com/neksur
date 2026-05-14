@@ -22,19 +22,31 @@
 // even if Atlas's exclude list somehow misses a tenant schema, the diff
 // will refuse to emit DROP statements against it.
 
+// `variable "url"` declares an input the env blocks consume; callers
+// override via --url on the CLI (cmd/migrate + Make targets do this).
+variable "url" {
+  type    = string
+  default = ""
+}
+
 env "public" {
-  // The actual production/test URL is injected via --url on the CLI
-  // by cmd/migrate; this block is kept for `atlas migrate status`
-  // and ad-hoc developer use.
-  url = getenv("DATABASE_URL_PUBLIC")
+  // The URL is injected via --url on the CLI (Atlas's --url flag
+  // overrides the env block's url). The empty default allows
+  // `atlas migrate validate` to run without a live target.
+  url = var.url
 
   // `docker://postgres/16/dev` spins a throwaway Postgres 16 container
   // Atlas uses to validate migration HCL — it does NOT touch the real
   // DB. AGE is not required here because we exclude ag_catalog.* below.
   dev = "docker://postgres/16/dev"
 
+  // Phase 0 files use the Flyway naming convention V<seq>__<slug>.sql
+  // (D-0.5.18 preserves this for continuity); Atlas needs the URL
+  // form `file://path?format=flyway` because the migration{} block in
+  // atlas.hcl does NOT have a `format` field — format is encoded as a
+  // URL query parameter on the dir URL itself (Atlas v1.2.1 convention).
   migration {
-    dir     = "file://migrations/postgres"
+    dir     = "file://migrations/postgres?format=flyway"
     exclude = ["ag_catalog.*", "tenant_*"]
   }
 
@@ -52,14 +64,12 @@ env "public" {
 
 env "tenant" {
   // cmd/migrate overrides --url to inject the per-tenant search_path.
-  // The DATABASE_URL_TENANT env var here is a placeholder for ad-hoc
-  // developer use against a known tenant schema.
-  url = getenv("DATABASE_URL_TENANT")
+  url = var.url
 
   dev = "docker://postgres/16/dev"
 
   migration {
-    dir     = "file://migrations/postgres"
+    dir     = "file://migrations/postgres?format=flyway"
     exclude = ["ag_catalog.*", "tenant_*"]
   }
 

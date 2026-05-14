@@ -78,19 +78,19 @@ migrate-baseline:
 	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required, e.g. VERSION=0030" && exit 1)
 	atlas migrate apply \
 		--url "$$DATABASE_URL" \
-		--dir file://migrations/postgres \
-		--exclude 'ag_catalog.*' \
+		--dir 'file://migrations/postgres?format=flyway' \
 		--revisions-schema public \
 		--baseline $(VERSION)
 
 # Apply the public-tier migrations only (skips per-tenant rollout).
 # Useful in CI/dev where no tenant_<uuid> schemas exist yet.
+# (--exclude is enforced via the env block in migrations/atlas.hcl;
+# `atlas migrate apply` v1.2.1 does not accept --exclude on the CLI.)
 migrate-apply:
 	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
 	atlas migrate apply \
 		--url "$$DATABASE_URL" \
-		--dir file://migrations/postgres \
-		--exclude 'ag_catalog.*' \
+		--dir 'file://migrations/postgres?format=flyway' \
 		--revisions-schema public
 
 # Show pending migrations and the current revision against DATABASE_URL.
@@ -98,7 +98,7 @@ migrate-status:
 	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
 	atlas migrate status \
 		--url "$$DATABASE_URL" \
-		--dir file://migrations/postgres \
+		--dir 'file://migrations/postgres?format=flyway' \
 		--revisions-schema public
 
 # Apply migrations to a single tenant schema. Usage:

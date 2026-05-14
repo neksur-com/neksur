@@ -221,10 +221,11 @@ func (f *SaasFixture) AppDSN() string { return f.Container.AppDSN }
 func atlasBaseline(ctx context.Context, dsn, version string) error {
 	bin := migrate.AtlasBinary
 	args := []string{
+		"--config", migrate.ResolveConfigURL(),
+		"--env", "public",
 		"migrate", "apply",
 		"--url", dsn,
-		"--dir", migrate.DirURL,
-		"--exclude", migrate.ExcludeAGECatalog,
+		"--dir", migrate.ResolveDirURL(),
 		"--revisions-schema", migrate.RevisionsSchema,
 		"--baseline", version,
 	}

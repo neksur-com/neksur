@@ -12,9 +12,10 @@
 -- RLS is NOT enabled on system_audit_log: it's an admin-only table for
 -- cross-tenant ops visibility. tenant_id-scoped audit lives in per-tenant
 -- audit_log tables (Plan 04 V0050).
+--
+-- Atlas wraps each migration file in its own transaction (default
+-- `tx-mode = file`); we omit the explicit BEGIN/COMMIT here.
 -- =====================================================================
-
-BEGIN;
 
 CREATE TABLE IF NOT EXISTS public.system_audit_log (
     id                   bigserial    PRIMARY KEY,
@@ -89,5 +90,3 @@ BEGIN
     RAISE NOTICE 'V0043 OK — system_audit_log INSERT-only for neksur_app, full DML for admin_role.';
 END
 $$ LANGUAGE plpgsql;
-
-COMMIT;

@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -46,7 +47,67 @@ var AtlasBinary = func() string {
 
 // DirURL is the migration-directory URL passed to `--dir`. Relative to
 // the working directory the binary is invoked from.
+//
+// Callers that run from a non-repo-root cwd (e.g., `go test` from
+// tests/integration/) should resolve an absolute path via
+// ResolveDirURL() and pass it directly to ApplyPublic / ApplyTenant
+// via the WithDirURL functional option (TODO: not yet wired — the
+// public API takes the DirURL constant). The current consumers are
+// either cmd/migrate (run from repo root via `go run ./cmd/migrate`)
+// or the saas_fixtures.go test fixture, which uses ResolveDirURL()
+// + a thin wrapper around exec.Command.
 const DirURL = "file://migrations/postgres"
+
+// ResolveDirURL walks up from the current working directory until it
+// finds a `migrations/postgres/V0001__enable_extensions.sql` marker
+// file, then returns the absolute `file://...` URL pointing at the
+// directory. Includes `?format=flyway` so Atlas parses the Phase 0
+// V<seq>__<slug>.sql naming convention (D-0.5.18). Returns DirURL +
+// `?format=flyway` unchanged on marker-walk failure (so the relative
+// form is the fallback for cwd=<repo-root> invocations).
+//
+// Mirrors testfixture.migrationsDir() — the marker-file walk is the
+// canonical Neksur pattern for "find the repo root from anywhere".
+func ResolveDirURL() string {
+	root, ok := findRepoRoot()
+	if !ok {
+		return DirURL + "?format=flyway"
+	}
+	return "file://" + filepath.Join(root, "migrations", "postgres") + "?format=flyway"
+}
+
+// ResolveConfigURL returns the absolute `file://<abs>/migrations/atlas.hcl`
+// URL for the Atlas config file in the repo. Falls back to the relative
+// form if the marker walk fails.
+func ResolveConfigURL() string {
+	root, ok := findRepoRoot()
+	if !ok {
+		return "file://migrations/atlas.hcl"
+	}
+	return "file://" + filepath.Join(root, "migrations", "atlas.hcl")
+}
+
+// findRepoRoot walks the cwd upwards until it finds the canonical Phase 0
+// marker file. Returns ("", false) on failure (e.g., test binary running
+// in a temp dir).
+func findRepoRoot() (string, bool) {
+	cur, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	for i := 0; i < 6; i++ {
+		marker := filepath.Join(cur, "migrations", "postgres", "V0001__enable_extensions.sql")
+		if _, err := os.Stat(marker); err == nil {
+			return cur, true
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return "", false
+}
 
 // RevisionsSchema is the schema in which atlas writes its
 // atlas_schema_revisions table. Shared across ALL tenants per
@@ -54,9 +115,12 @@ const DirURL = "file://migrations/postgres"
 const RevisionsSchema = "public"
 
 // ExcludeAGECatalog is the canonical AGE-catalog exclusion. Phase 0.5
-// migrations must NEVER touch ag_catalog.* (Pitfall 3); cmd/migrate
-// passes this on the CLI as belt-and-suspenders alongside the atlas.hcl
-// `exclude` block.
+// migrations must NEVER touch ag_catalog.* (Pitfall 3). The exclude is
+// enforced solely via the `exclude` block in `migrations/atlas.hcl`:
+// `atlas migrate apply` in v1.2.1 does NOT accept `--exclude` on the
+// CLI (only `atlas schema inspect/diff` does). Kept as a constant so
+// other call sites (e.g., future declarative-mode runners) reference
+// one canonical value.
 const ExcludeAGECatalog = "ag_catalog.*"
 
 // maxDeadlockAttempts is the retry budget for SQLSTATE 40P01
@@ -71,11 +135,15 @@ const maxDeadlockAttempts = 3
 // Returns nil on success; a non-nil error wrapping the atlas CLI exit
 // status + stderr on failure.
 func ApplyPublic(ctx context.Context, dsn string) error {
+	// Use --config + --env so atlas.hcl's `format = flyway` (and the
+	// exclude block) take effect; --url overrides the env block's URL
+	// so we don't need DATABASE_URL_PUBLIC set.
 	args := []string{
+		"--config", ResolveConfigURL(),
+		"--env", "public",
 		"migrate", "apply",
 		"--url", dsn,
-		"--dir", DirURL,
-		"--exclude", ExcludeAGECatalog,
+		"--dir", ResolveDirURL(),
 		"--revisions-schema", RevisionsSchema,
 	}
 	return retryOnDeadlock(func() error {
@@ -101,10 +169,11 @@ func ApplyTenant(ctx context.Context, baseDSN, schema string) error {
 		return fmt.Errorf("ApplyTenant: compose DSN: %w", err)
 	}
 	args := []string{
+		"--config", ResolveConfigURL(),
+		"--env", "tenant",
 		"migrate", "apply",
 		"--url", dsn,
-		"--dir", DirURL,
-		"--exclude", ExcludeAGECatalog,
+		"--dir", ResolveDirURL(),
 		"--revisions-schema", RevisionsSchema,
 	}
 	return retryOnDeadlock(func() error {

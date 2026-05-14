@@ -26,9 +26,10 @@
 -- T-0.5-rls-bypass-missing-guc: the function does not depend on
 -- app.current_tenant, so it works correctly when called from middleware
 -- before the GUC is set.
+--
+-- Atlas wraps each migration file in its own transaction (default
+-- `tx-mode = file`); we omit the explicit BEGIN/COMMIT here.
 -- =====================================================================
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION public.tenant_by_workos_org(p_org text)
     RETURNS uuid
@@ -91,5 +92,3 @@ BEGIN
     RAISE NOTICE 'V0044 OK — tenant_by_workos_org is SECURITY DEFINER STABLE; neksur_app has EXECUTE.';
 END
 $$ LANGUAGE plpgsql;
-
-COMMIT;

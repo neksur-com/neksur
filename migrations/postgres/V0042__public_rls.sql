@@ -31,9 +31,10 @@
 -- `current_setting('app.current_tenant', true)` — the `true` arg makes
 -- the function return NULL (not error) when the GUC is unset; NULL = NULL
 -- evaluates to NULL → false → 0 rows. RESEARCH §Security Domain line 1635.
+--
+-- Atlas wraps each migration file in its own transaction (default
+-- `tx-mode = file`); we omit the explicit BEGIN/COMMIT here.
 -- =====================================================================
-
-BEGIN;
 
 -- ----- public.tenants ------------------------------------------------
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
@@ -87,5 +88,3 @@ BEGIN
     RAISE NOTICE 'V0042 OK — 3 public-tier tables under FORCE RLS, 2 select policies installed.';
 END
 $$ LANGUAGE plpgsql;
-
-COMMIT;
