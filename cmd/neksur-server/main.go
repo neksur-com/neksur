@@ -16,6 +16,13 @@
 // endpoint that verifies signatures BEFORE checking SCIM_ENABLED. Both
 // feature flags default OFF so the Phase 0 dev workflow (no WorkOS keys,
 // no Postgres) keeps building & running cleanly.
+//
+// Plan 00.5-05 addition: under NEKSUR_SAAS_AUTH=1 the SaaS path also
+// mounts:
+//   - /webhooks/stripe → billing.WebhookHandler (verifies signature
+//     BEFORE BILLING_ENABLED check; D-0.5.21 T-0.5-stripe-spoof).
+//   - /admin/*         → admin handlers gated on WorkOS internal_admin
+//     org membership (T-0.5-admin-org-bypass).
 package main
 
 import (
@@ -35,9 +42,24 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	workosauth "github.com/neksur-com/neksur/internal/auth/workos"
+	"github.com/neksur-com/neksur/internal/admin"
+	"github.com/neksur-com/neksur/internal/billing"
 	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/tenant"
 )
+
+// workosAdminGate adapts *workosauth.Client into the admin.AdminGate
+// interface so admin.AdminOrgGate can ask "what org is this session?"
+// without admin/ taking a dependency on workos/.
+type workosAdminGate struct{ c *workosauth.Client }
+
+func (g workosAdminGate) LoadSessionOrgID(r *http.Request) (string, error) {
+	s, err := g.c.LoadSession(r)
+	if err != nil {
+		return "", err
+	}
+	return s.OrganizationID, nil
+}
 
 func main() {
 	fmt.Println("Neksur Server (placeholder — Phase 0 stub; M1 will wire up REST API, MCP server, SQL proxy).")
@@ -208,6 +230,33 @@ func runWithSaasAuth(ctx context.Context) error {
 
 	// /webhooks/workos — sig verified BEFORE SCIM_ENABLED check.
 	mux.HandleFunc("/webhooks/workos", workosClient.HandleWebhook(webhookSecret))
+
+	// /webhooks/stripe (Plan 00.5-05) — sig verified BEFORE BILLING_ENABLED
+	// check (D-0.5.21 T-0.5-stripe-spoof). The webhook secret MUST be set
+	// even when BILLING_ENABLED=false; noopBilling still verifies sigs.
+	stripeWebhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	billingCfg := billing.Config{
+		Enabled:       os.Getenv("BILLING_ENABLED") == "true",
+		APIKey:        os.Getenv("STRIPE_API_KEY"),
+		WebhookSecret: stripeWebhookSecret,
+	}
+	billingInstance := billing.NewBilling(billingCfg)
+	mux.HandleFunc("/webhooks/stripe", billing.WebhookHandler(billingInstance, billingCfg.WebhookSecret))
+
+	// /admin/* (Plan 00.5-05) — admin UI gated on WorkOS internal_admin
+	// org membership (T-0.5-admin-org-bypass). The internal_admin org id
+	// comes from WORKOS_INTERNAL_ADMIN_ORG_ID env var (operator-provisioned
+	// WorkOS Org for Neksur staff).
+	internalAdminOrgID := os.Getenv("WORKOS_INTERNAL_ADMIN_ORG_ID")
+	pagerdutyServiceID := os.Getenv("PAGERDUTY_SERVICE_ID")
+	if pagerdutyServiceID == "" {
+		pagerdutyServiceID = "P000000"
+	}
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/admin/tenants", admin.ListTenants(pool))
+	adminMux.HandleFunc("/admin/tenants/audit", admin.ViewTenantAuditLog(pool))
+	adminMux.HandleFunc("/admin/incidents", admin.EmbedPagerDutyIncidents(pagerdutyServiceID))
+	mux.Handle("/admin/", admin.AdminOrgGate(workosAdminGate{c: workosClient}, internalAdminOrgID)(adminMux))
 
 	addr := os.Getenv("NEKSUR_LISTEN_ADDR")
 	if addr == "" {
