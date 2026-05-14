@@ -1,0 +1,15 @@
+{
+  "measured_at": "2026-05-14T00:00:00Z",
+  "scenario": "pool_a_capacity_50tenant_100mb",
+  "tenants_provisioned": 50,
+  "total_bytes": 0,
+  "total_gb": 0,
+  "p50_latency_ms": 0,
+  "p95_latency_ms": 0,
+  "p99_latency_ms": 0,
+  "assert_under_gb": 50,
+  "assert_p99_under_ms": 400,
+  "status": "INITIAL",
+  "phase0_baseline_ref": "tests/load/_footprint-baseline.json",
+  "_note": "This is the initial committed baseline. The test TestPoolACapacity50x100MB overwrites this file on every run regardless of PASS/FAIL — the json captures the latest measurement as A3 evidence per PATTERNS.md Group F. The committed values record the envelope shape (assert_under_gb + assert_p99_under_ms); the dynamic measurements get refreshed on the next run."
+}

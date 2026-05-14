@@ -35,6 +35,83 @@ The drill validates four things at once:
    any deviation is captured in the drill report and fed back into
    `runbooks/restore-pitr.md` and this file.
 
+## M3 First Drill (Phase 0.5 — D-0.5.16)
+
+This M3 First Drill subsection documents the FIRST scheduled execution
+of this drill against Phase 0.5 Pool A — gating before any paying
+customer. Per D-0.5.16 the team executes the M3 First Drill in M3 of
+Phase 0.5 (target 2026-08-14 OR first paying tenant onboarding,
+whichever earlier).
+
+### Why M3
+
+D-0.5.16 forces the team to actually exercise the restore path before
+any paying customer is on the system. Without an M3 drill, REQ-saas-observability's
+"quarterly DR drill executes against Pool A and verifies RPO ≤5min /
+RTO ≤1h" criterion stays "Pending" and Plan 07's pen-test sign-off
+gate cannot complete.
+
+### M3 first-drill checklist
+
+1. **Provision a SANDBOX Pool A** (not production!) via
+   `terraform apply` against the sandbox AWS account.
+2. **Provision two test tenants** via `./scripts/provision-tenant.sh`
+   (Plan 04). Wait at least 15 minutes after provisioning so PITR has
+   WAL coverage for the new tenants.
+3. **Deliberately corrupt one of the test tenant schemas** —
+   `psql -d $POOL_A_DSN -c "TRUNCATE tenant_<uuid_underscored>.audit_log"`.
+4. **Trigger PITR restore** for the timestamp ~5 min BEFORE the
+   corruption per `runbooks/restore-pitr.md` §3 (use the sandbox
+   restored instance — NOT promote into the live cluster).
+5. **Smoke tests against the restored cluster:**
+   - Connect via psql, run `SELECT count(*) FROM tenant_<corrupted_uuid>.audit_log`
+     — assert non-empty (the truncate is undone).
+   - 3-layer isolation tests still pass against the restored cluster
+     (re-run `tests/integration/tenant_isolation_test.go` against the
+     sandbox).
+   - WorkOS auth handshake still works against the restored cluster.
+6. **Record wall-clock** in the drill report
+   (`runbooks/dr-drill-m3-attestation.md`). Assert
+   `wall_clock_seconds < 3600` (RTO 1h per D-0.5.16).
+7. **Verify RPO independently:** confirm restored data is from ≤5 min
+   before corruption (D-0.5.16 RPO target).
+8. **Tear down the test restored instance** to avoid stranded cost
+   (`aws rds delete-db-instance --db-instance-identifier
+   neksur-pool-a-pitr-test --skip-final-snapshot`). On Postgres-on-EC2
+   V3 the equivalent is `terraform destroy -target=` the sandbox
+   instance OR manually terminating the EC2 instances.
+9. **Document any rough edges** — append back to
+   `runbooks/dr-drill.md` and `runbooks/restore-pitr.md` so the next
+   drill operator has a smoother path.
+
+### Success criteria
+
+- **RTO**: full Pool A restore from yesterday's PITR snapshot
+  completes in < 1h (3600s) per D-0.5.16.
+- **RPO**: data loss ≤ 5 min (300s) from the corruption timestamp.
+- **Smoke**: all four post-restore checks PASS.
+- **Wall-clock recorded** to CloudWatch custom metric
+  `Neksur/dr_drill_wallclock_seconds` (via the automated cron driver
+  `scripts/ci/dr-drill.sh`).
+
+### Cadence (post-M3)
+
+After the M3 drill, drill cadence shifts to **quarterly** per
+D-0.5.16. The `scripts/ci/dr-drill.sh` cron driver runs every quarter
+(currently scheduled in `.github/workflows/dr-drill-quarterly.yml`;
+Phase 1 hardening — Phase 0.5 ships the script + the runbook + the
+attestation template only).
+
+### Attestation file
+
+The M3 drill outcome is captured in
+`runbooks/dr-drill-m3-attestation.md` (a template until the actual
+drill runs in M3). The attestation file is REFERENCED by Plan 07's
+pen-test sign-off gate — Plan 07 cannot complete without an attestation
+on file (PASS or documented FAIL with follow-up ticket).
+
+
+
 ---
 
 ## 2. Who runs it, when, where

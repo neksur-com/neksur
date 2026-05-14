@@ -247,3 +247,141 @@ go test -tags dr -timeout 90m -run TestRTO_RestorePIT -v ./tests/dr/...
 
 This brings up the local 3-node HA cluster, runs the restore drill,
 and asserts the RTO contract. Without `DR_LIVE=1` the test SKIPs.
+
+---
+
+## 8. Pool A specifics (Phase 0.5)
+
+This section covers Pool A specifics for the Phase 0.5 multi-tenant SaaS
+deployment. Pool A is now the SHARED Postgres-on-EC2 cluster that hosts
+all Team + Business tier tenants (D-0.5.01). The Phase 0 runbook above
+applies as-is for the cluster-wide restore path; this section adds
+Phase 0.5-specific guidance on Pool A specifics — per-tenant restore,
+shared pgBackRest stanza, 35-day PITR window.
+
+### 8.a Stanza + bucket
+
+- **pgBackRest stanza:** `neksur` (shared across all Pool A tenants —
+  one cluster, one stanza).
+- **S3 backup bucket:** `neksur-pool-a-backups-${account_id}` (per the
+  Pool A Terraform module `modules/rds-pool-a/main.tf`).
+- **PITR window:** **35 days** (D-0.5.15 baseline; `var.backup_retention_archive_days`).
+- **Full backup retention:** 7 days (`var.backup_retention_full_days`).
+
+### 8.b Per-tenant restore
+
+When a customer asks "what did tenant X look like at 14:00 yesterday",
+the full-cluster PITR restore from §3 is overkill — it restores every
+tenant. Per-tenant restore procedure:
+
+1. Restore the entire Pool A cluster to a SANDBOX host via the §3
+   procedure with `--target-time` set to the customer's desired
+   timestamp.
+2. From the restored host, dump JUST the customer's schema:
+   ```bash
+   pg_dump --schema=tenant_<uuid_underscored> \
+     -d "postgres://postgres@<restored-host>:5432/postgres" \
+     -f /tmp/tenant_<uuid>_at_<timestamp>.dump
+   ```
+3. Either return the dump to the customer for inspection, OR
+   `pg_restore` it back onto the LIVE Pool A under a different schema
+   name (`tenant_<uuid>_restored_<timestamp>`) so the customer can
+   diff. **Never `pg_restore` over the live tenant schema** — that
+   would overwrite current state.
+4. Tear down the sandbox restored host once the customer is satisfied.
+
+### 8.c Cross-references
+
+- `modules/rds-pool-a/main.tf` — Terraform module; outputs
+  `pgbackrest_bucket_name` for use in `--repo1-path`.
+- `runbooks/dr-drill.md` §M3 First Drill — first scheduled execution
+  of this restore path against sandbox Pool A.
+- `tests/load/pool_a_capacity_test.go` — capacity benchmark that
+  validates the 50-tenant ceiling at which this restore path remains
+  operationally viable.
+
+---
+
+## 9. Pool B specifics (Phase 0.5)
+
+This section covers Pool B specifics — per-Enterprise-customer dedicated
+Postgres-on-EC2 (D-0.5.02). Each Pool B has its own pgBackRest stanza,
+its own S3 backup bucket, and its own KMS key — restore for one Pool B
+customer NEVER touches another customer. The Pool B specifics that
+differ from Pool A: per-customer stanza, per-customer S3 bucket,
+configurable PITR window up to 365 days.
+
+### 9.a Per-customer stanza + bucket
+
+- **pgBackRest stanza:** `neksur-${customer_uuid}` (per-customer; see
+  `modules/rds-pool-b/main.tf` `local.pgbackrest_stanza`).
+- **S3 backup bucket:** `neksur-pool-b-${customer_uuid}-backups-${account_id}`.
+- **PITR window:** configurable per customer up to **365 days** (D-0.5.15
+  footnote — Enterprise add-on). Default 35 days matches Pool A.
+- **Full backup retention:** configurable per customer up to 365 days.
+- **KMS key:** per-customer CMK (`var.kms_key_arn` distinct per customer).
+  Restore from a customer's Pool B backup requires `kms:Decrypt` on
+  THAT customer's key — the Pool A IAM role does NOT have access to
+  Pool B keys.
+
+### 9.b Per-customer restore command
+
+The §3 restore command applies WITH per-customer substitutions:
+
+```bash
+bash tests/dr/restore_pit.sh \
+    --target-time '2026-05-12 14:00:00+00' \
+    --assert-rto-under 3600 \
+    --stanza neksur-<customer_uuid> \
+    --repo /var/lib/pgbackrest/pool-b/<customer_uuid> \
+    --pg-data /var/lib/postgresql/16/main \
+    --pg-bin /usr/lib/postgresql/16/bin
+```
+
+The `--stanza` and `--repo` flags name the per-customer pgBackRest
+setup. The script itself is unchanged from Pool A; only the args differ.
+
+### 9.c Customer notification template
+
+When invoking a Pool B restore (not a drill — actual customer-impacting
+restore), notify the customer BEFORE step 3 wipe:
+
+> Subject: **[NEKSUR] Recovery initiated — service window N minutes**
+>
+> Hello <customer-contact>,
+>
+> We are initiating a point-in-time recovery for your dedicated Neksur
+> database to restore service to <state>. Your database will be
+> read-only for approximately N minutes; we will notify you when the
+> restore completes and writes resume.
+>
+> Target timestamp for the restore: `<target_time>`.
+> Expected completion: `<target_time + 1h>` per our RTO contract.
+> Data committed between the target time and now (~<delta> minutes)
+> will be lost from this restore — please re-submit if affected.
+>
+> — Neksur Ops
+
+### 9.d KMS key rotation considerations
+
+If the customer rotates their KMS key DURING the PITR window:
+1. Old backups are still decryptable as long as the old key version
+   exists in KMS (rotated keys keep historical versions).
+2. New backups are encrypted under the new key version.
+3. Restore from old backup works seamlessly because KMS handles
+   version lookup transparently.
+
+If the customer DELETES (not rotates) the KMS key, backups become
+unrecoverable. This is documented in the Pool B onboarding kit as a
+contractual gotcha — customer-managed key delete is irreversible.
+
+### 9.e Cross-references
+
+- `modules/rds-pool-b/main.tf` — per-customer Terraform module
+  (variables `customer_uuid`, `kms_key_arn`, `backup_retention_*`).
+- `runbooks/pool-b-provisioning.md` — bring up a new Pool B customer.
+- `runbooks/pool-b-migration.md` — move a tenant from Pool A → Pool B
+  (the reverse direction of the per-tenant restore in §8.b).
+- `runbooks/dr-drill-m3-attestation.md` — Pool A drill attestation
+  template for M3; a per-Pool-B drill attestation template will be
+  added when the first Enterprise candidate signs.

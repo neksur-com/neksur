@@ -49,11 +49,17 @@ junit.xml
 /dr-writer
 tests/dr/_*.csv
 tests/dr/_*.json
-# Load-test scratch artifacts (Plan 00-06 / Wave 5) — footprint baseline JSON
-# is the A3 evidence trail but is regenerated on every run; per-query
-# failure CSVs are triage artifacts that rotate with every FAIL.
+# Load-test scratch artifacts (Plan 00-06 / Wave 5) — failure CSVs are
+# triage artifacts that rotate with every FAIL. Baseline JSONs are the
+# A3 evidence trail and are committed (carved out below).
 tests/load/_*.csv
 tests/load/_*.json
+# Explicit baseline-JSON allow-list — committed regression gates
+# referenced by 00.5-VALIDATION.md (Phase 0.5 Plan 06 capacity benchmark).
+# The Phase 0 _footprint-baseline.json is intentionally NOT allow-listed
+# here: it is regenerated per Plan 00-06 run and historically remained
+# untracked; the existing untracked file on dev machines is normal.
+!tests/load/_pool-a-capacity-baseline.json
 
 # Frontend (web/) build output — Phase 1+; pre-emptively listed
 web/node_modules/
