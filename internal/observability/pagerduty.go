@@ -13,13 +13,20 @@ import (
 // from Secrets Manager and a per-service tag used in dedup keys.
 //
 // Threading: PagerDuty itself is safe for concurrent use; the embedded
-// *http.Client created by the go-pagerduty SDK is goroutine-safe.
+// *pagerduty.Client created by the go-pagerduty SDK is goroutine-safe.
+//
+// Test endpoint override: NewPagerDutyWithEndpoint accepts a custom
+// V2 Events API endpoint (defaults to PagerDuty production). The
+// integration test (tests/integration/pagerduty_alarm_test.go) uses an
+// httptest.NewServer to capture and assert the POST body.
 type PagerDuty struct {
 	routingKey string
 	serviceTag string
+	client     *pagerduty.Client
 }
 
-// NewPagerDuty constructs a PagerDuty client.
+// NewPagerDuty constructs a PagerDuty client against the production
+// Events API endpoint (https://events.pagerduty.com).
 //
 // routingKey is the PagerDuty Events API v2 integration key
 // (`PAGERDUTY_ROUTING_KEY` from Secrets Manager). serviceTag is the
@@ -27,7 +34,27 @@ type PagerDuty struct {
 // it appears as the `Source` in the V2Event payload and as the leading
 // segment of the dedup key.
 func NewPagerDuty(routingKey, serviceTag string) *PagerDuty {
-	return &PagerDuty{routingKey: routingKey, serviceTag: serviceTag}
+	return NewPagerDutyWithEndpoint(routingKey, serviceTag, "")
+}
+
+// NewPagerDutyWithEndpoint constructs a PagerDuty client and (if
+// endpoint is non-empty) directs Events-API-v2 calls at the override URL.
+// Production callers should pass "" for endpoint; integration tests pass
+// httptest.NewServer.URL.
+func NewPagerDutyWithEndpoint(routingKey, serviceTag, endpoint string) *PagerDuty {
+	// The routing key is sent inside the V2Event JSON body, not as a
+	// Bearer header — so we can safely construct a Client with an empty
+	// authToken. The Client gives us access to the per-instance
+	// v2EventsAPIEndpoint setter that the test needs.
+	var opts []pagerduty.ClientOptions
+	if endpoint != "" {
+		opts = append(opts, pagerduty.WithV2EventsAPIEndpoint(endpoint))
+	}
+	return &PagerDuty{
+		routingKey: routingKey,
+		serviceTag: serviceTag,
+		client:     pagerduty.NewClient("", opts...),
+	}
 }
 
 // DedupKey returns the canonical PagerDuty dedup key per D-0.5.13:
@@ -76,7 +103,7 @@ func (p *PagerDuty) triggerOrResolve(ctx context.Context, action, severity, summ
 		d[k] = v
 	}
 
-	event := pagerduty.V2Event{
+	event := &pagerduty.V2Event{
 		RoutingKey: p.routingKey,
 		Action:     action,
 		DedupKey:   dedup,
@@ -89,7 +116,7 @@ func (p *PagerDuty) triggerOrResolve(ctx context.Context, action, severity, summ
 		},
 	}
 
-	_, err := pagerduty.ManageEventWithContext(ctx, event)
+	_, err := p.client.ManageEventWithContext(ctx, event)
 	if err != nil {
 		return fmt.Errorf("observability: pagerduty %s: %w", action, err)
 	}
