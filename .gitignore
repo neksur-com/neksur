@@ -11,6 +11,8 @@ dist/
 *.exe
 *.test
 *.out
+# Locally-built CLI (root-level go build ./cmd/neksur-cli produces ./neksur-cli)
+/neksur-cli
 coverage.out
 coverage.html
 profile.out

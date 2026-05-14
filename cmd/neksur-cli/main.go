@@ -71,6 +71,13 @@ func dispatchTenant(ctx context.Context) int {
 		return runTenantSmoke(ctx, subArgs)
 	case "cert-issue":
 		return runTenantCertIssue(ctx, subArgs)
+	case "suspend":
+		return runTenantSuspend(ctx, subArgs)
+	// Accept both "wind-down" (preferred) and the legacy "windown" alias.
+	case "wind-down", "windown":
+		return runTenantWindDown(ctx, subArgs)
+	case "delete":
+		return runTenantDelete(ctx, subArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown tenant verb: %q\n", verb)
 		tenantUsage()
@@ -91,6 +98,9 @@ Tenant verbs:
   peer               Initiate / poll / print VPC peering for the customer side
   smoke              Run the post-provisioning smoke tests
   cert-issue         Issue per-customer mTLS client cert via AWS Private CA
+  suspend            Transition active → suspended (D-0.5.20 lifecycle; gateway returns 503 on writes)
+  wind-down          Transition active|suspended → wind_down (30-day post-cancellation read-only window)
+  delete             IRREVERSIBLE — drop schema + destroy peering + audit (requires --yes)
 
 Environment:
   DATABASE_URL         Admin pool DSN (required)
@@ -104,7 +114,7 @@ func tenantUsage() {
   neksur-cli tenant <verb> [flags]
 
 Verbs:
-  create | migrate | migrate-to-pool-b | peer | smoke | cert-issue
+  create | migrate | migrate-to-pool-b | peer | smoke | cert-issue | suspend | wind-down | delete
 `)
 }
 
