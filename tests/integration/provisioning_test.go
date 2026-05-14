@@ -50,9 +50,19 @@ func TestProvisioningIdempotent(t *testing.T) {
 	id := uuid.MustParse(tenantUUID)
 
 	// Build the admin pool + GraphClient mirroring the CLI wiring.
-	pool, err := pgxpool.New(ctx, fx.SuperDSN())
+	// Override QueryExecMode to DescribeExec — DISCARD ALL inside
+	// GraphClient.ExecuteInTenant invalidates pgx's prepared-statement
+	// cache. The DescribeExec mode bypasses the cache so the second
+	// CreateGraph call doesn't try to reuse a stale prepared handle.
+	// (Same pattern as session_bleed_test.go line 79.)
+	poolCfg, err := pgxpool.ParseConfig(fx.SuperDSN())
 	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
+		t.Fatalf("pgxpool.ParseConfig: %v", err)
+	}
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		t.Fatalf("pgxpool.NewWithConfig: %v", err)
 	}
 	defer pool.Close()
 
@@ -126,11 +136,13 @@ func TestProvisioningIdempotent(t *testing.T) {
 		t.Fatalf("expected exactly 1 audit_log in %s, got %d", tenantSchema, auditCount)
 	}
 
-	// Assert 2: V0050/V0051/V0052 in public.atlas_schema_revisions.
-	// Atlas records each applied version exactly once even if the
-	// migration was re-run.
+	// Assert 2: V0050/V0051/V0052 in <tenant_schema>.atlas_schema_revisions.
+	// Plan 04 update: tenant-tier migrations are tracked in a per-tenant
+	// revisions table (not public.atlas_schema_revisions) so subsequent
+	// tenants don't skip V0050+ silently. Atlas records each applied
+	// version exactly once even if the migration was re-run.
 	rows, err := probe.Query(ctx, `
-		SELECT version FROM public.atlas_schema_revisions
+		SELECT version FROM `+quoteIdent(tenantSchema)+`.atlas_schema_revisions
 		 WHERE version IN ('0050', '0051', '0052') ORDER BY version
 	`)
 	if err != nil {

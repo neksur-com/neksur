@@ -127,10 +127,28 @@ const ExcludeAGECatalog = "ag_catalog.*"
 // (deadlock_detected). Per the plan: 3 attempts with linear backoff.
 const maxDeadlockAttempts = 3
 
-// ApplyPublic applies all pending migrations to the `public` schema of
-// the database addressed by `dsn`. It is idempotent — Atlas's revision
-// tracker means a second invocation against an up-to-date target is a
-// no-op exit-0.
+// PublicMaxVersion is the highest version number that ApplyPublic
+// applies to the `public` schema. Plan 04 introduced V0050+ as
+// per-tenant migrations; they are applied via ApplyTenant against
+// each tenant_<uuid> schema, NOT against public.
+//
+// Without this stop-marker, Atlas would apply V0050 (CREATE TABLE
+// audit_log without schema qualification) to the `public` schema as
+// part of ApplyPublic — wrong schema, wrong revision tracking.
+const PublicMaxVersion = "0044"
+
+// ApplyPublic applies pending public-tier migrations (V0041..V0044) to
+// the `public` schema of the database addressed by `dsn`. Uses
+// `--to-version` to stop at PublicMaxVersion so per-tenant migrations
+// (V0050+) are not applied here.
+//
+// Idempotent — Atlas's revision tracker means a second invocation
+// against an up-to-date target is a no-op exit-0. There is one quirk:
+// when ALL public-tier migrations are already applied AND --to-version
+// is set, Atlas errors with `sql/migrate: to-version "0044" not found
+// in pending migration files` (because there are no pending migrations
+// and the to-version is not in the pending set). We treat that specific
+// error as success — it means the public tier is current.
 //
 // Returns nil on success; a non-nil error wrapping the atlas CLI exit
 // status + stderr on failure.
@@ -145,20 +163,58 @@ func ApplyPublic(ctx context.Context, dsn string) error {
 		"--url", dsn,
 		"--dir", ResolveDirURL(),
 		"--revisions-schema", RevisionsSchema,
+		"--to-version", PublicMaxVersion,
 	}
-	return retryOnDeadlock(func() error {
+	err := retryOnDeadlock(func() error {
 		return runAtlas(ctx, args, os.Stdout, os.Stderr)
 	}, maxDeadlockAttempts)
+	if err == nil {
+		return nil
+	}
+	// Tolerate the no-op idempotency error.
+	var aerr *atlasError
+	if errors.As(err, &aerr) && strings.Contains(aerr.stderr,
+		"to-version \""+PublicMaxVersion+"\" not found in pending migration files") {
+		return nil
+	}
+	return err
 }
 
-// ApplyTenant applies all pending migrations to the given tenant schema.
-// It composes a search_path-scoped DSN of the form
+// TenantBaselineVersion is the baseline Atlas treats as "already applied"
+// when running per-tenant. Set to PublicMaxVersion so that on first
+// per-tenant apply, Atlas starts from V0050 (the first tenant-tier
+// migration) — V0001..V0044 are NOT re-run against the tenant schema.
+//
+// Atlas semantics (--baseline N): "the first time the revisions table
+// is created, record N as the high-water mark; on subsequent apply
+// calls, apply only versions > N that aren't already recorded".
+const TenantBaselineVersion = PublicMaxVersion
+
+// ApplyTenant applies all pending tenant-tier migrations to the given
+// tenant schema. Composes a search_path-scoped DSN of the form
 //
 //	<baseDSN>?search_path=<schema>,public
 //
 // (or appends `&search_path=...` if the base DSN already has a query
-// string). The result is passed to `atlas migrate apply` with the same
-// flags as ApplyPublic.
+// string). The result is passed to `atlas migrate apply`.
+//
+// Plan 04 details:
+//   - `--revisions-schema <schema>` — the per-tenant revisions table
+//     lives in the tenant schema itself, not in public. Without this,
+//     V0050+ are recorded in public.atlas_schema_revisions on the
+//     first tenant's apply and silently skipped for every subsequent
+//     tenant (Pitfall 9 bites the tenant-tier as well).
+//   - `--baseline 0044` — on first per-tenant apply, Atlas treats
+//     V0001..V0044 as "already applied" (they ARE — to the public
+//     schema, not the tenant schema, but they don't need to re-run
+//     here). Without this, Atlas would try to apply V0001 (extensions),
+//     V0030 (RLS), V0041..V0044 (public tier) against the tenant
+//     schema — all of which would fail because they touch public.*.
+//
+// Cross-tenant audit (which version is each tenant on?) becomes a
+// UNION-ALL across `tenant_*.atlas_schema_revisions` — acceptable
+// trade-off for correct per-tenant tracking. The Plan 04 SUMMARY
+// notes this as a follow-up consideration.
 //
 // `RunForTenant` is the name the plan referenced for this function; we
 // keep ApplyTenant as the idiomatic name and provide RunForTenant as an
@@ -174,7 +230,8 @@ func ApplyTenant(ctx context.Context, baseDSN, schema string) error {
 		"migrate", "apply",
 		"--url", dsn,
 		"--dir", ResolveDirURL(),
-		"--revisions-schema", RevisionsSchema,
+		"--revisions-schema", schema,
+		"--baseline", TenantBaselineVersion,
 	}
 	return retryOnDeadlock(func() error {
 		return runAtlas(ctx, args, os.Stdout, os.Stderr)
@@ -187,10 +244,24 @@ func RunForTenant(ctx context.Context, baseDSN, schema string) error {
 	return ApplyTenant(ctx, baseDSN, schema)
 }
 
-// composeTenantDSN appends `search_path=<schema>,public` to the base DSN
-// query string. Postgres URI parsing is forgiving enough that we can do
-// this with a simple substring check rather than pulling in net/url for
-// what is otherwise a tightly-scoped helper.
+// composeTenantDSN appends `search_path=<schema>` to the base DSN
+// query string. Atlas's URL parser interprets the search_path value as
+// the target schema name; a comma-separated list (`<schema>,public`)
+// is interpreted as a SINGLE schema literally named `<schema>,public`
+// — Atlas does NOT split on commas — so we pass only the tenant
+// schema. Migration files that reference public.* objects (e.g.,
+// public.atlas_schema_revisions cross-references) are unaffected
+// because Postgres always resolves fully-qualified names regardless
+// of search_path.
+//
+// Plan 04 deviation #N — RESEARCH §Pattern 3 line 657 suggested
+// `search_path=tenant_<uuid>,public` for the DSN; this is correct at
+// the Postgres session level but ambiguous at the Atlas URL-parsing
+// level. We resolve the ambiguity by leaving public out of the URL.
+//
+// Postgres URI parsing is forgiving enough that we can do this with a
+// simple substring check rather than pulling in net/url for what is
+// otherwise a tightly-scoped helper.
 func composeTenantDSN(baseDSN, schema string) (string, error) {
 	if schema == "" {
 		return "", errors.New("composeTenantDSN: schema must be non-empty")
@@ -199,7 +270,7 @@ func composeTenantDSN(baseDSN, schema string) (string, error) {
 	if strings.Contains(baseDSN, "?") {
 		sep = "&"
 	}
-	return fmt.Sprintf("%s%ssearch_path=%s,public", baseDSN, sep, schema), nil
+	return fmt.Sprintf("%s%ssearch_path=%s", baseDSN, sep, schema), nil
 }
 
 // runAtlas exec's the atlas binary with the given args. stdout/stderr

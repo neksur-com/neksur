@@ -236,7 +236,13 @@ func (f *SaasFixture) AppDSN() string { return f.Container.AppDSN }
 // Atlas adoption). After baseline, Atlas will start applying from the
 // next-higher version (here, V0041).
 //
-// Equivalent to: atlas migrate apply --baseline 0030 --url <dsn> --dir ...
+// Plan 04 update: --to-version=PublicMaxVersion stops the apply at
+// V0044 so the tenant-tier migrations (V0050+V0051+V0052) are NOT
+// applied to the public schema. Per-tenant apply via migrate.ApplyTenant
+// handles those against each tenant's schema (with --baseline 0044 +
+// per-tenant revisions schema).
+//
+// Equivalent to: atlas migrate apply --baseline 0030 --to-version 0044 --url <dsn> --dir ...
 func atlasBaseline(ctx context.Context, dsn, version string) error {
 	bin := migrate.AtlasBinary
 	args := []string{
@@ -247,6 +253,7 @@ func atlasBaseline(ctx context.Context, dsn, version string) error {
 		"--dir", migrate.ResolveDirURL(),
 		"--revisions-schema", migrate.RevisionsSchema,
 		"--baseline", version,
+		"--to-version", migrate.PublicMaxVersion,
 	}
 	return runExternal(ctx, bin, args...)
 }

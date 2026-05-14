@@ -98,11 +98,23 @@ func NewProvisioner(
 }
 
 // CreateGraph is step (c) of D-0.5.19. Issues `SELECT create_graph(<schema>)`
-// via the Phase 0 graph.GraphClient — which has `LOAD 'age'` wired into
-// its AfterConnect hook, so no separate pool/connection lifecycle is
-// needed (RESEARCH §Pitfall 2: "do NOT construct a fresh pgx pool for
-// create_graph — reuse the GraphClient or the AGE extension won't be
-// loaded on that physical connection").
+// using the admin pool. The admin pool's AfterConnect hook (production
+// wiring in cmd/neksur-cli/tenant_create.go) runs `LOAD 'age'` so AGE
+// functions resolve. We do NOT route through Phase 0's
+// graph.GraphClient.ExecuteInTenant here because that path runs
+// DISCARD ALL on connection release, which invalidates pgx's
+// prepared-statement cache and causes a second-call failure (Plan 04
+// deviation: idempotency requires re-running CreateGraph, which is
+// incompatible with the per-call DISCARD ALL discipline that Phase 0
+// uses for the read-side Cypher path).
+//
+// The Provisioner is constructed WITH a *graph.GraphClient reference
+// (NewProvisioner first arg) so callers that need the GraphClient's
+// other surfaces (e.g., RunSmoke uses GatewayCommitAuditEdge which
+// uses graph-aware paths) can share one. The CreateGraph step here
+// uses the admin pool's connection directly with LOAD 'age' applied
+// per-acquisition (the pool's AfterConnect for cmd/neksur-cli is
+// configured by graph.NewGraphClient).
 //
 // Idempotent: skips when the graph already exists in `ag_catalog.ag_graph`.
 // Returns nil on success or no-op; wraps with %w on failure.
@@ -111,39 +123,56 @@ func NewProvisioner(
 // caller-controlled string interpolation (T-0.5-prov-injection).
 func (p *Provisioner) CreateGraph(ctx context.Context, id uuid.UUID) error {
 	const op = "CreateGraph"
-	if p.graph == nil {
-		return fmt.Errorf("tenant: %s: GraphClient is nil", op)
+	if p.pool == nil {
+		return fmt.Errorf("tenant: %s: pool is nil", op)
 	}
+	// Sanity reference to graph.GraphClient — the Provisioner holds
+	// it (NewProvisioner first arg) for RunSmoke / future surfaces.
+	// graph.ExecuteInTenant is the path-independent AGE executor that
+	// the Phase 0 read-side uses; Plan 04 CreateGraph uses a simpler
+	// path because we can't tolerate per-call DISCARD ALL here.
+	_ = p.graph // keep field referenced; see plan note above
+
 	schemaName := SchemaName(id)
 
-	// Phase 0's ExecuteInTenant runs LOAD 'age' + sets search_path on
-	// the connection's first acquire (AfterConnect). The `tenantID`
-	// argument is used by SetTenantContext (V0030 RLS) — we pass the
-	// uuid here because the function expects a string; the actual
-	// create_graph call below ignores it.
-	return p.graph.ExecuteInTenant(ctx, id.String(), func(ctx context.Context, tx pgx.Tx) error {
-		// First, check whether the graph already exists. AGE stores
-		// graph metadata in `ag_catalog.ag_graph`; a row named after
-		// the schema indicates the graph has been created.
-		var exists bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1)`,
-			schemaName,
-		).Scan(&exists); err != nil {
-			return fmt.Errorf("tenant: %s: probe ag_graph: %w", op, err)
-		}
-		if exists {
-			return nil // idempotent no-op
-		}
-		// create_graph takes the schema name as a plain string literal.
-		// pgx's positional binding passes the value safely; the schema
-		// name itself was derived from a parsed uuid.UUID so it cannot
-		// carry SQL meta-characters.
-		if _, err := tx.Exec(ctx, `SELECT create_graph($1)`, schemaName); err != nil {
-			return fmt.Errorf("tenant: %s: create_graph(%s): %w", op, schemaName, err)
-		}
+	conn, err := p.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("tenant: %s: acquire: %w", op, err)
+	}
+	defer conn.Release()
+
+	// LOAD 'age' must run before create_graph resolves. The admin
+	// pool may already have it via AfterConnect (the CLI wires
+	// graph.NewGraphClient-style); we run it idempotently here
+	// because it's a session-state init that's cheap to repeat.
+	if _, err := conn.Exec(ctx, "LOAD 'age'"); err != nil {
+		return fmt.Errorf("tenant: %s: LOAD 'age': %w", op, err)
+	}
+	// search_path so create_graph + ag_catalog.* resolve unqualified.
+	if _, err := conn.Exec(ctx, `SET search_path = ag_catalog, "$user", public`); err != nil {
+		return fmt.Errorf("tenant: %s: SET search_path: %w", op, err)
+	}
+
+	// Idempotency probe: skip if graph already exists.
+	var exists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1)`,
+		schemaName,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("tenant: %s: probe ag_graph: %w", op, err)
+	}
+	if exists {
 		return nil
-	})
+	}
+
+	// create_graph takes the schema name as a plain string literal.
+	// pgx's positional binding passes the value safely; the schema
+	// name itself was derived from a parsed uuid.UUID so it cannot
+	// carry SQL meta-characters.
+	if _, err := conn.Exec(ctx, `SELECT create_graph($1)`, schemaName); err != nil {
+		return fmt.Errorf("tenant: %s: create_graph(%s): %w", op, schemaName, err)
+	}
+	return nil
 }
 
 // CreateRole is step (d) of D-0.5.19. Creates the per-tenant Postgres
