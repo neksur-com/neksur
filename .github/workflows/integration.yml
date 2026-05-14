@@ -37,10 +37,26 @@ jobs:
         # the per-test-package implicit pull race.
         run: docker pull apache/age:release_PG16_1.6.0
 
+      - name: Install Atlas CLI
+        # Phase 0.5 — D-0.5.17 — Atlas is the migration runner. The
+        # tenant-loop integration test (TestAtlasLoopApplyRollbackApply)
+        # shells out to the atlas binary; it must be on PATH before
+        # `go test ./tests/integration/...` runs. The atlasgo.sh install
+        # script writes to /usr/local/bin by default; pin the version
+        # via the ATLAS_VERSION env var if we need reproducible builds
+        # later (RESEARCH §Standard Stack line 174 + VALIDATION.md L89).
+        run: |
+          curl -sSf https://atlasgo.sh | sh
+          atlas version
+
       - name: Run integration + security tests
+        # Phase 0.5: the integration tier now spans both the Phase 0
+        # tests (RLS smoke) and the new -tags integration suite
+        # (TestAtlasLoopApplyRollbackApply + ProvisionTenant). The build
+        # tag is set so saas_fixtures.go compiles into the test binary.
         env:
           # testcontainers-go uses Docker socket; defaults work on
           # ubuntu-latest. The reaper container ("ryuk") is enabled by
           # default — keeps stale containers cleaned up.
           TESTCONTAINERS_RYUK_DISABLED: "false"
-        run: go test ./tests/integration/... ./tests/security/... -race -count=1 -timeout=20m
+        run: go test -tags integration ./tests/integration/... ./tests/security/... -race -count=1 -timeout=20m

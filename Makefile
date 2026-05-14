@@ -4,7 +4,7 @@
 # invocation; complex orchestration lives in the workflow / docker-compose
 # layer, not here.
 
-.PHONY: build test test-unit test-integration test-security lint tidy run-server run-worker run-cli migrate clean
+.PHONY: build test test-unit test-integration test-security lint tidy run-server run-worker run-cli migrate migrate-baseline migrate-apply migrate-status migrate-tenant clean
 
 # Default — what `make` with no args does.
 all: build test
@@ -51,13 +51,62 @@ run-worker: build
 run-cli: build
 	./bin/neksur-cli
 
-# Apply migrations against a Postgres+AGE 1.6.0 instance.
-# The script handles both sqitch (production / CI) and psql-direct fallback
-# (developer laptop) — see infra/migrations/run-migrations.sh.
-# Usage: make migrate DB_URL=postgresql://user:pass@host:5432/dbname
+# --- Migrations (Phase 0.5+) ------------------------------------------
+# Atlas (versioned mode) is the migration runner — D-0.5.17 + D-0.5.18.
+# The Go wrapper at cmd/migrate enumerates tenant_<uuid> schemas and
+# applies migrations into each, with public.atlas_schema_revisions as
+# the shared audit table (RESEARCH §Pitfall 9).
+#
+# Phase 0 historical migrations (V0001 + V0030) are baseline-imported
+# the first time Atlas runs against an existing database; subsequent
+# applies skip them via the atlas.sum checksum manifest.
+#
+# DATABASE_URL must be set, e.g.:
+#   export DATABASE_URL=postgres://neksur_app:neksur_app@localhost:5432/postgres?sslmode=disable
+#
+# `make migrate` is the headline entry point: applies public-tier
+# migrations then iterates discovered tenant schemas.
 migrate:
-	@test -n "$(DB_URL)" || (echo "ERROR: DB_URL is required. Example: make migrate DB_URL=postgresql://user:pass@host:5432/db" && exit 1)
-	bash infra/migrations/run-migrations.sh --db-url "$(DB_URL)"
+	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required. Example: export DATABASE_URL=postgres://user:pass@host:5432/db" && exit 1)
+	go run ./cmd/migrate
+
+# One-shot baseline import for an existing database where V0001 + V0030
+# have already been applied via the Phase 0 raw-psql / sqitch pipeline.
+# Pass VERSION=0030 (the Phase 0 high-water mark).
+migrate-baseline:
+	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
+	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required, e.g. VERSION=0030" && exit 1)
+	atlas migrate apply \
+		--url "$$DATABASE_URL" \
+		--dir file://migrations/postgres \
+		--exclude 'ag_catalog.*' \
+		--revisions-schema public \
+		--baseline $(VERSION)
+
+# Apply the public-tier migrations only (skips per-tenant rollout).
+# Useful in CI/dev where no tenant_<uuid> schemas exist yet.
+migrate-apply:
+	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
+	atlas migrate apply \
+		--url "$$DATABASE_URL" \
+		--dir file://migrations/postgres \
+		--exclude 'ag_catalog.*' \
+		--revisions-schema public
+
+# Show pending migrations and the current revision against DATABASE_URL.
+migrate-status:
+	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
+	atlas migrate status \
+		--url "$$DATABASE_URL" \
+		--dir file://migrations/postgres \
+		--revisions-schema public
+
+# Apply migrations to a single tenant schema. Usage:
+#   make migrate-tenant TENANT=tenant_aaaaaaaa_aaaa_4aaa_aaaa_aaaaaaaaaaaa
+migrate-tenant:
+	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
+	@test -n "$(TENANT)" || (echo "ERROR: TENANT is required, e.g. TENANT=tenant_<uuid_underscored>" && exit 1)
+	go run ./cmd/migrate --tenant $(TENANT)
 
 # Wipe build artifacts.
 clean:
