@@ -35,6 +35,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
@@ -43,8 +45,10 @@ import (
 
 	workosauth "github.com/neksur-com/neksur/internal/auth/workos"
 	"github.com/neksur-com/neksur/internal/admin"
+	"github.com/neksur-com/neksur/internal/alerts"
 	"github.com/neksur-com/neksur/internal/billing"
 	"github.com/neksur-com/neksur/internal/catalog"
+	"github.com/neksur-com/neksur/internal/detect/dispatch"
 	iceberggw "github.com/neksur-com/neksur/internal/gateway/iceberg"
 	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/ingest"
@@ -252,6 +256,44 @@ func runWithSaasAuth(ctx context.Context) error {
 	// same TenantMiddleware enforcement as the gateway endpoints.
 	mux.Handle("POST /v1/lineage",
 		workosauth.TenantMiddleware(workosClient, tenantRepo)(lineagehttp.Handler(pool, gatewayDeps.IngestSvc)))
+
+	// Phase 1 L3 detection (Plan 01-07) — goroutine pool + 3 trigger
+	// sources (30s poller / Polaris webhook / S3 ObjectCreated SNS+SQS).
+	// All sources push Hit{} to ONE channel; the pool's sync.Map dedup
+	// ensures one scan per metadata_location per replica; cross-replica
+	// dedup is the V0062 detection_runs.snapshot_metadata_location
+	// UNIQUE constraint (Pitfall 10).
+	slackClient := alerts.NewSlack(os.Getenv("NEKSUR_SLACK_WEBHOOK_URL"), "neksur-server")
+	scanner := newRegexScanner(pool, graphClient, gatewayDeps.CredStore, slackClient)
+	dispatchChan := make(chan dispatch.Hit, 256)
+	dispatchPool := dispatch.NewPool(dispatchChan, scanner)
+	go dispatchPool.Run(ctx)
+	go dispatch.RunPoller(ctx, pool, graphClient, dispatchChan, dispatch.DefaultPollerInterval)
+
+	// Polaris webhook handler — mounted OUTSIDE TenantMiddleware (HMAC
+	// signature verification IS the auth check; per-tenant secret in
+	// catalog_credentials.config_json[webhook_secret]).
+	mux.Handle("POST /v1/webhooks/polaris", dispatch.WebhookHandler(pool, dispatchChan))
+
+	// S3 ObjectCreated event consumer — OPTIONAL via env. When
+	// NEKSUR_S3_EVENTS_QUEUE_URL is unset the consumer goroutine is
+	// not started; the poller + webhook still cover the gateway-mediated
+	// path. Phase 1 simplification: one queue per tenant, tenant ID
+	// supplied via NEKSUR_S3_EVENTS_TENANT_ID env.
+	if queueURL := os.Getenv("NEKSUR_S3_EVENTS_QUEUE_URL"); queueURL != "" {
+		s3TenantID := os.Getenv("NEKSUR_S3_EVENTS_TENANT_ID")
+		if s3TenantID == "" {
+			fmt.Fprintln(os.Stderr,
+				"NEKSUR_S3_EVENTS_QUEUE_URL is set but NEKSUR_S3_EVENTS_TENANT_ID is not — S3 event consumer not started")
+		} else {
+			awsCfg, err := config.LoadDefaultConfig(ctx)
+			if err != nil {
+				return fmt.Errorf("aws config: %w", err)
+			}
+			sqsClient := awssqs.NewFromConfig(awsCfg)
+			go dispatch.RunS3EventConsumer(ctx, sqsClient, queueURL, s3TenantID, dispatchChan)
+		}
+	}
 
 	// /callback — OAuth code → session cookie. Cookie attrs per
 	// D-0.5.21 T-0.5-session-hijack: HttpOnly + Secure + SameSite=Lax

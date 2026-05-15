@@ -40,6 +40,8 @@ func main() {
 	switch os.Args[1] {
 	case "tenant":
 		os.Exit(dispatchTenant(ctx))
+	case "polaris":
+		os.Exit(dispatchPolaris(ctx))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -48,6 +50,34 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// dispatchPolaris routes `polaris <verb>` subcommands. Plan 01-07
+// adds the first verb: `webhook-register`.
+func dispatchPolaris(ctx context.Context) int {
+	if len(os.Args) < 3 {
+		polarisUsage()
+		return 2
+	}
+	verb := os.Args[2]
+	subArgs := os.Args[3:]
+	switch verb {
+	case "webhook-register":
+		return runPolarisWebhookRegister(ctx, subArgs)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown polaris verb: %q\n", verb)
+		polarisUsage()
+		return 2
+	}
+}
+
+func polarisUsage() {
+	fmt.Fprint(os.Stderr, `Usage:
+  neksur-cli polaris <verb> [flags]
+
+Verbs:
+  webhook-register  Register Neksur as a Polaris webhook subscriber (Plan 01-07)
+`)
 }
 
 func dispatchTenant(ctx context.Context) int {
@@ -90,6 +120,7 @@ func usage() {
 
 Usage:
   neksur-cli tenant <verb> [flags]
+  neksur-cli polaris <verb> [flags]
 
 Tenant verbs:
   create             Create public.tenants row + AGE create_graph + per-tenant role
@@ -101,6 +132,9 @@ Tenant verbs:
   suspend            Transition active → suspended (D-0.5.20 lifecycle; gateway returns 503 on writes)
   wind-down          Transition active|suspended → wind_down (30-day post-cancellation read-only window)
   delete             IRREVERSIBLE — drop schema + destroy peering + audit (requires --yes)
+
+Polaris verbs:
+  webhook-register   Register Neksur as a Polaris webhook subscriber (Plan 01-07)
 
 Environment:
   DATABASE_URL         Admin pool DSN (required)
