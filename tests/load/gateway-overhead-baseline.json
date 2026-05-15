@@ -1,0 +1,11 @@
+{
+  "measured_at": "0001-01-01T00:00:00Z",
+  "baseline_p95_ms": 0,
+  "gateway_p95_ms": 0,
+  "overhead_ratio": 0,
+  "assert_under": 0.05,
+  "status": "PENDING_FIRST_RUN",
+  "commits": 1000,
+  "concurrent_clients": 1,
+  "warmup": 100
+}
