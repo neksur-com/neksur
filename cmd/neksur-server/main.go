@@ -44,7 +44,13 @@ import (
 	workosauth "github.com/neksur-com/neksur/internal/auth/workos"
 	"github.com/neksur-com/neksur/internal/admin"
 	"github.com/neksur-com/neksur/internal/billing"
+	"github.com/neksur-com/neksur/internal/catalog"
+	iceberggw "github.com/neksur-com/neksur/internal/gateway/iceberg"
 	"github.com/neksur-com/neksur/internal/graph"
+	"github.com/neksur-com/neksur/internal/ingest"
+	lineagehttp "github.com/neksur-com/neksur/internal/lineage/http"
+	celpolicy "github.com/neksur-com/neksur/internal/policy/cel"
+	policystore "github.com/neksur-com/neksur/internal/policy/store"
 	"github.com/neksur-com/neksur/internal/tenant"
 )
 
@@ -184,6 +190,36 @@ func runWithSaasAuth(ctx context.Context) error {
 	}
 	tenantRepo := tenant.NewRepo(pool)
 
+	// Phase 1 L1 Catalog Gateway dependencies (Plan 01-06).
+	// Build the AGE-aware graph client + the policy + ingest substrate
+	// ONCE at startup; every gateway handler shares the references.
+	// All components reuse the existing pool — DO NOT introduce a
+	// second pool here (Phase 0.5 must_have: BeforeAcquire DISCARD ALL
+	// is the ONLY enforcement of session-bleed prevention).
+	graphClient, err := graph.NewGraphClient(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("graph.NewGraphClient: %w", err)
+	}
+	defer graphClient.Close()
+
+	celEnv, err := celpolicy.NewEnv()
+	if err != nil {
+		return fmt.Errorf("cel.NewEnv: %w", err)
+	}
+	celCompiler, err := celpolicy.NewCompiler(celEnv, 0) // 0 → defaultCacheSize 4096
+	if err != nil {
+		return fmt.Errorf("cel.NewCompiler: %w", err)
+	}
+
+	gatewayDeps := iceberggw.Deps{
+		Pool:        pool,
+		Graph:       graphClient,
+		CredStore:   catalog.NewRepo(pool),
+		PolicyStore: policystore.NewAGEStore(graphClient),
+		Evaluator:   celpolicy.NewEvaluator(celCompiler),
+		IngestSvc:   ingest.NewService(graphClient),
+	}
+
 	// HTTP router.
 	mux := http.NewServeMux()
 
@@ -200,6 +236,22 @@ func runWithSaasAuth(ctx context.Context) error {
 		fmt.Fprintf(w, "ok tenant=%s", tid)
 	})
 	mux.Handle("/api/", workosauth.TenantMiddleware(workosClient, tenantRepo)(apiHandler))
+
+	// Phase 1 L1 Catalog Gateway (Plan 01-06) — three new routes all
+	// behind workosauth.TenantMiddleware (CC1 enforcement; the gateway
+	// handler asserts tenant.IDFromContext as a defence-in-depth check).
+	// Body cap is enforced inside each handler (http.MaxBytesReader 16MB).
+	// AGE access goes through gateway.Deps.Graph (the same GraphClient
+	// constructed above) so RLS + DISCARD ALL hold across the
+	// per-request transaction lifecycle.
+	mux.Handle("POST /v1/iceberg/{prefix}/namespaces/{namespace}/tables/{table}",
+		workosauth.TenantMiddleware(workosClient, tenantRepo)(iceberggw.CommitHandler(gatewayDeps)))
+	mux.Handle("POST /v1/iceberg/{prefix}/transactions/commit",
+		workosauth.TenantMiddleware(workosClient, tenantRepo)(iceberggw.MultiTableCommitHandler(gatewayDeps)))
+	// Plan 01-04 OpenLineage v2 receiver — wired here so it shares the
+	// same TenantMiddleware enforcement as the gateway endpoints.
+	mux.Handle("POST /v1/lineage",
+		workosauth.TenantMiddleware(workosClient, tenantRepo)(lineagehttp.Handler(pool, gatewayDeps.IngestSvc)))
 
 	// /callback — OAuth code → session cookie. Cookie attrs per
 	// D-0.5.21 T-0.5-session-hijack: HttpOnly + Secure + SameSite=Lax
