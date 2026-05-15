@@ -190,6 +190,20 @@ func ApplyPublic(ctx context.Context, dsn string) error {
 // calls, apply only versions > N that aren't already recorded".
 const TenantBaselineVersion = PublicMaxVersion
 
+// Phase1MaxVersion is the highest expected version number for Phase 1
+// per-tenant relational migrations (V0060–V0066 added in Plan 01-01).
+// Used by tests and the cmd/migrate tenant-loop high-water-mark
+// assertion to confirm a successful tenant apply lands every Phase 1
+// table — see tests/integration/phase1_migrations_applied_per_tenant_test.go.
+const Phase1MaxVersion = "0066"
+
+// GraphPhase1MaxVersion is the highest expected version number for the
+// per-tenant AGE graph migrations after Plan 01-01 (V0030–V0032). The
+// graph-migration runner ApplyTenantGraph (graph.go) walks
+// migrations/graph/V*.sql lexicographically; this constant lets tests
+// assert that the runner reached the end of the Phase 1 graph schema.
+const GraphPhase1MaxVersion = "0032"
+
 // ApplyTenant applies all pending tenant-tier migrations to the given
 // tenant schema. Composes a search_path-scoped DSN of the form
 //

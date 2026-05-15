@@ -50,6 +50,7 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/neksur-com/neksur/internal/migrate"
 )
@@ -76,6 +77,18 @@ func main() {
 		if err := migrate.RunForTenant(ctx, dsn, tenantFlag); err != nil {
 			exitf(1, "tenant %s: %v", tenantFlag, err)
 		}
+		// Phase 1 (Plan 01-01): graph migrations land per-tenant via
+		// ApplyTenantGraph, called immediately after Atlas applies the
+		// relational tier. Resolves Open Question 1.
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			exitf(1, "tenant %s: graph pool: %v", tenantFlag, err)
+		}
+		if err := migrate.ApplyTenantGraph(ctx, pool, tenantFlag); err != nil {
+			pool.Close()
+			exitf(1, "tenant %s: graph: %v", tenantFlag, err)
+		}
+		pool.Close()
 		fmt.Fprintf(os.Stdout, "OK tenant %s\n", tenantFlag)
 		return
 	}
@@ -102,11 +115,27 @@ func main() {
 	// Step 3 — apply per tenant. Errors are logged but do not halt the
 	// loop (RESEARCH line 1240 — partial rollout is recoverable; the
 	// shared public.atlas_schema_revisions tracks who succeeded).
+	//
+	// Phase 1 (Plan 01-01): each tenant gets BOTH the relational tier
+	// (via Atlas) AND the graph tier (via internal/migrate.ApplyTenantGraph)
+	// in the same iteration. The pgxpool is opened once and reused
+	// across all tenants in this run; closing happens after the loop.
+	graphPool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		exitf(2, "graph pool: %v", err)
+	}
+	defer graphPool.Close()
+
 	var failures []string
 	for _, t := range tenants {
 		fmt.Fprintf(os.Stderr, "migrate: applying tenant %s…\n", t)
 		if err := migrate.RunForTenant(ctx, dsn, t); err != nil {
-			fmt.Fprintf(os.Stderr, "FAILED tenant %s: %v\n", t, err)
+			fmt.Fprintf(os.Stderr, "FAILED tenant %s (atlas): %v\n", t, err)
+			failures = append(failures, t)
+			continue
+		}
+		if err := migrate.ApplyTenantGraph(ctx, graphPool, t); err != nil {
+			fmt.Fprintf(os.Stderr, "FAILED tenant %s (graph): %v\n", t, err)
 			failures = append(failures, t)
 			continue
 		}
