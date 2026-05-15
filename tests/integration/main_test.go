@@ -8,6 +8,15 @@
 //
 // Originally Python's tests/integration/* under the Wave 1 plan, now Go
 // per the 2026-05-13 D-PHASE0-stack correction.
+//
+// Phase 0.5 (SaaS) tests use StartSaasFixture (saas_fixtures.go) which
+// adds public-tier Atlas migrations on top of the Phase 0 schema.
+//
+// Phase 1 tests use StartPhase1Fixture (phase1_fixtures.go) which
+// composes SaasFixture with Polaris + Nessie + LocalStack testcontainers
+// and per-tenant graph migrations via internal/migrate.ApplyTenantGraph.
+// Both extensions are opt-in per-test; this TestMain only initialises
+// the Phase 0 superuser pool for the Phase 0 RLS tests in this package.
 package integration
 
 import (
