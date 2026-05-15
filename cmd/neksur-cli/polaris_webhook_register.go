@@ -42,8 +42,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/neksur-com/neksur/internal/tenant"
 )
 
 // runPolarisWebhookRegister implements `neksur-cli polaris webhook-register`.
@@ -131,11 +134,15 @@ func generateWebhookSecret() (string, error) {
 
 // storeWebhookSecret UPDATEs the polaris row in tenant_<uuid>.catalog_credentials,
 // merging `webhook_secret` into the existing config_json.
+//
+// CR-06 (REVIEW.md): use canonical uuid.Parse() + tenant.SchemaName
+// rather than the hand-rolled isValidTenantUUIDForCLI.
 func storeWebhookSecret(ctx context.Context, pool *pgxpool.Pool, tenantID, secret string) error {
-	if !isValidTenantUUIDForCLI(tenantID) {
-		return fmt.Errorf("invalid tenant UUID format: %q", tenantID)
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("invalid tenant UUID format %q: %w", tenantID, err)
 	}
-	schema := "tenant_" + strings.ReplaceAll(tenantID, "-", "_")
+	schema := tenant.SchemaName(tenantUUID)
 	qSchema := pgx.Identifier{schema}.Sanitize()
 
 	conn, err := pool.Acquire(ctx)
@@ -198,24 +205,3 @@ func registerWithPolaris(ctx context.Context, polarisEndpoint, neksurWebhookURL,
 	return nil
 }
 
-// isValidTenantUUIDForCLI mirrors dispatch/webhook.go::isValidTenantUUID
-// (duplicated to keep the CLI self-contained).
-func isValidTenantUUIDForCLI(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	for i, r := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if r != '-' {
-				return false
-			}
-		default:
-			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
-			if !isHex {
-				return false
-			}
-		}
-	}
-	return true
-}
