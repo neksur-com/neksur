@@ -51,15 +51,18 @@ import (
 )
 
 // nessieWarehouse is the default warehouse name passed to iceberg-go.
-// Nessie does not strictly require a warehouse property at the wire
-// layer (it derives storage location from per-table content metadata),
-// but iceberg-go's REST catalog defaults set the prop unconditionally
-// — empty warehouse causes a config-fetch validation error in some
-// iceberg-go code paths. "neksur-warehouse" is a stable placeholder
-// that Nessie ignores. Production deployments may override this via
-// a future Config.Warehouse field if a Nessie deployment ever needs
-// per-warehouse routing.
-const nessieWarehouse = "neksur-warehouse"
+// Nessie 0.100 requires a non-empty warehouse declared in its
+// `nessie.catalog.warehouses.<name>.location` server config; the
+// adapter forwards the same name as the `warehouse` Iceberg REST
+// property so Nessie's `/iceberg/v1/config?warehouse=<name>` lookup
+// succeeds at adapter construction time.
+//
+// "warehouse" is Nessie's documented default name (matching the
+// testcontainer fixture's env-var convention
+// `nessie.catalog.default-warehouse=warehouse`). Production
+// deployments override this via a future Config.Warehouse field if
+// a Nessie deployment ever needs per-warehouse routing.
+const nessieWarehouse = "warehouse"
 
 // nessieAdapter wraps iceberg-go's *rest.Catalog and translates
 // between the Phase 1 IcebergCatalogClient surface and iceberg-go's
@@ -98,25 +101,40 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 	// documented Iceberg REST + Nessie surface:
 	//
 	//   - uri                — iceberg-go's REST catalog base URI.
-	//   - warehouse          — stable placeholder (Nessie ignores).
-	//   - nessie-commit-ref  — branch selection key (Pitfall 2). This
-	//     prop key is the canonical iceberg-go mechanism for binding
-	//     a Nessie REST catalog client to a specific branch (literal
-	//     wire string is `nessie.commit.ref`; see the Properties map
-	//     literal below).
+	//   - warehouse          — Nessie warehouse name; iceberg-go
+	//     forwards as `?warehouse=<name>` on the /v1/config probe.
+	//   - nessie-commit-ref  — branch selection key (Pitfall 2,
+	//     auditable in code review). The literal wire string
+	//     `nessie.commit.ref` (see the Properties map below) is
+	//     the documented Nessie key per
+	//     [projectnessie.org/docs/develop/spec]; it survives across
+	//     iceberg-go releases that may add native Nessie-prop
+	//     routing.
+	//   - prefix             — Iceberg REST `prefix` property; this
+	//     is what iceberg-go v0.5.0 actually consumes to route
+	//     subsequent calls to /v1/<prefix>/namespaces/... — Nessie
+	//     interprets `<prefix>` as the branch reference. Setting
+	//     `prefix` to the configured branch is what makes the
+	//     adapter's operations land on the correct branch.
+	//     (Live-probe-confirmed during Plan 01-03 Task 1: a
+	//     namespace created with prefix=neksur-test does NOT show
+	//     up under prefix=main and vice versa — the Nessie branch
+	//     model is fully isolated through this knob.)
 	//   - token              — bearer token, when AuthMode=bearer.
 	//
 	// We pass props via WithAdditionalProps so the same wire shape
 	// works whether the caller is on iceberg-go v0.5.x (current
-	// pin) or a future v0.6+. Polaris adapter uses both the typed
-	// options (WithCredential / WithAuthURI / etc.) AND the
-	// WithAdditionalProps map; Nessie has no OAuth flow on the
-	// untyped path so the typed-options redundancy isn't useful
-	// here — props alone is enough.
+	// pin) or a future v0.6+. The redundant rest.WithPrefix call
+	// belt-and-suspenders the same routing — iceberg-go accepts
+	// both the typed option and the props-map form, and the
+	// grep-detectable map literal makes the branch routing
+	// auditable in code review (Pitfall 2 mitigation: branch
+	// selection is in source, not buried in test setup).
 	props := icebergGo.Properties{
 		"uri":               cfg.Endpoint,
 		"warehouse":         nessieWarehouse,
 		"nessie.commit.ref": cfg.DefaultBranch,
+		"prefix":            cfg.DefaultBranch,
 	}
 	if cfg.AuthMode == AuthModeBearer {
 		props["token"] = cfg.BearerToken
@@ -124,6 +142,7 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 
 	cat, err := rest.NewCatalog(ctx, "nessie", cfg.Endpoint,
 		rest.WithWarehouseLocation(nessieWarehouse),
+		rest.WithPrefix(cfg.DefaultBranch),
 		rest.WithAdditionalProps(props),
 	)
 	if err != nil {

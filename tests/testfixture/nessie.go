@@ -43,12 +43,32 @@ const nessieHTTPPort = "19120/tcp"
 // to avoid Pitfall 2 (parallel writes to `main`).
 const DefaultNessieBranch = "neksur-test"
 
+// DefaultNessieWarehouse is the warehouse name configured on the
+// Nessie testcontainer's catalog REST endpoint. Nessie 0.100 requires
+// a non-empty warehouse declared via
+// `nessie.catalog.warehouses.<name>.location`; otherwise
+// `/iceberg/v1/config` returns 500 "No default-warehouse configured".
+// "warehouse" matches Nessie's documented default name and the value
+// the nessie adapter (Plan 01-03) forwards as the Iceberg REST
+// `warehouse` property.
+const DefaultNessieWarehouse = "warehouse"
+
 // NessieContainer wraps a running Nessie instance with branch helpers
 // for the Plan 01-03 adapter tests.
 type NessieContainer struct {
 	Container testcontainers.Container
-	Endpoint  string // e.g., "http://127.0.0.1:53251" — base for /api/v2/...
-	Branch    string // default "neksur-test"
+	Endpoint  string // e.g., "http://127.0.0.1:53251" — base for /api/v2/... (native Nessie REST)
+	// IcebergEndpoint is the Iceberg REST URL the nessie adapter
+	// (Plan 01-03) consumes — Nessie 0.100 mounts the Iceberg REST
+	// API at `<base>/iceberg`. iceberg-go appends `/v1/...` to this.
+	IcebergEndpoint string
+	Branch          string // default "neksur-test"
+	// Warehouse is the Nessie warehouse name configured on the
+	// container; pass through to nessie.Config.Warehouse (or the
+	// adapter's hardcoded `nessieWarehouse` constant if the field
+	// hasn't been added yet — Plan 01-03 currently uses the
+	// constant).
+	Warehouse string
 }
 
 // StartNessie spins up a Nessie container, waits for /api/v2/config to
@@ -61,6 +81,23 @@ func StartNessie(ctx context.Context) (*NessieContainer, error) {
 		ExposedPorts: []string{nessieHTTPPort},
 		// Nessie defaults to in-memory storage out of the box, which is
 		// what Phase 1 tests want (per-container clean slate).
+		//
+		// Configure a default warehouse so the Iceberg REST endpoint
+		// (`/iceberg/v1/config`) returns 200 instead of 500
+		// "No default-warehouse configured". This is required by
+		// the Plan 01-03 nessie adapter live test (TestNessieAdapterLoadTable);
+		// previously this fixture only exercised the native Nessie
+		// REST API (`/api/v2/...`) which doesn't require a warehouse.
+		// Plan 01-03 deviation note (Rule 3 — blocking): the Iceberg
+		// REST endpoint requires server-side warehouse config; the
+		// Nessie 0.100 default container ships without any.
+		// "file:///tmp/warehouse" is an in-container POSIX path —
+		// Nessie writes table metadata there. The path lives only
+		// inside the container and is destroyed at Terminate.
+		Env: map[string]string{
+			"nessie.catalog.default-warehouse":             DefaultNessieWarehouse,
+			"nessie.catalog.warehouses.warehouse.location": "file:///tmp/warehouse",
+		},
 		WaitingFor: wait.ForHTTP("/api/v2/config").
 			WithPort(nessieHTTPPort).
 			WithStartupTimeout(120 * time.Second),
@@ -82,10 +119,13 @@ func StartNessie(ctx context.Context) (*NessieContainer, error) {
 		_ = c.Terminate(ctx)
 		return nil, fmt.Errorf("testfixture: nessie port: %w", err)
 	}
+	base := fmt.Sprintf("http://%s:%s", host, port.Port())
 	n := &NessieContainer{
-		Container: c,
-		Endpoint:  fmt.Sprintf("http://%s:%s", host, port.Port()),
-		Branch:    DefaultNessieBranch,
+		Container:       c,
+		Endpoint:        base,
+		IcebergEndpoint: base + "/iceberg",
+		Branch:          DefaultNessieBranch,
+		Warehouse:       DefaultNessieWarehouse,
 	}
 	if err := n.CreateBranch(ctx, DefaultNessieBranch); err != nil {
 		_ = c.Terminate(ctx)
@@ -111,9 +151,9 @@ func (n *NessieContainer) Terminate(ctx context.Context) error {
 // because the API splits the new-ref identity (query params) from the
 // source-ref identity (body):
 //
-//	1. GET /api/v2/trees/main          → extract main's current hash
-//	2. POST /api/v2/trees?type=BRANCH&name=<newname>
-//	   with body {"type":"BRANCH","name":"main","hash":"<mainHash>"}
+//  1. GET /api/v2/trees/main          → extract main's current hash
+//  2. POST /api/v2/trees?type=BRANCH&name=<newname>
+//     with body {"type":"BRANCH","name":"main","hash":"<mainHash>"}
 //
 // The body is the SOURCE reference (where the new branch forks from),
 // NOT the new branch's identity. This caught the Plan 01-01 BLOCKING
