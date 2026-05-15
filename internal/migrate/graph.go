@@ -200,29 +200,100 @@ func ApplyTenantGraph(ctx context.Context, pool *pgxpool.Pool, schemaName string
 	return nil
 }
 
-// stripWrappingTx removes any standalone `BEGIN;` or `COMMIT;` line
-// from a migration body so the file content can be Exec'd inside an
-// externally-managed transaction. The graph migration files (V0030,
-// V0032) wrap their bodies in BEGIN/COMMIT for direct-psql apply; the
-// runner owns the outer transaction and needs the inner markers removed
-// (nested BEGIN is a no-op SAVEPOINT in Postgres, but inner COMMIT
-// commits the outer tx and breaks the runner's atomicity contract).
+// stripWrappingTx removes any TOP-LEVEL standalone `BEGIN;` or
+// `COMMIT;` line from a migration body so the file content can be
+// Exec'd inside an externally-managed transaction. The graph
+// migration files (V0030, V0032) wrap their bodies in BEGIN/COMMIT
+// for direct-psql apply; the runner owns the outer transaction and
+// needs the inner markers removed (nested BEGIN is a no-op SAVEPOINT
+// in Postgres, but inner COMMIT commits the outer tx and breaks the
+// runner's atomicity contract).
 //
-// Only top-level standalone tx markers are stripped — embedded "BEGIN"
-// keywords inside DO-block plpgsql blocks are unaffected because they
-// share a line with `END` or appear after whitespace+keyword context
-// (e.g., `BEGIN ... END`).
+// REVIEW.md CR-04: the previous implementation compared every
+// trimmed line literal to "BEGIN;" / "COMMIT;" which would ALSO
+// match these strings inside a DO $$ ... $$ plpgsql block, breaking
+// the inner plpgsql body. Phase 1 migrations (V0030-V0032) don't
+// have such blocks today, but the contract is wrong and a future
+// migration would silently corrupt the schema.
+//
+// Fix: track dollar-quote-block depth (`$$ ... $$` AND tagged
+// `$tag$ ... $tag$`) before each line and only strip when depth is
+// zero (i.e., top-level). The depth tracker scans the line for
+// `$<optional-tag>$` opens and closes; an unmatched tag at end of
+// file is treated as depth > 0 (defensive — better to leave the
+// markers than risk corrupting a malformed body).
 func stripWrappingTx(s string) string {
 	var out strings.Builder
 	out.Grow(len(s))
+	depth := 0
+	openTag := "" // when depth > 0, the open tag we are awaiting
+
 	for _, line := range strings.Split(s, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "BEGIN;" || trim == "COMMIT;" {
-			out.WriteString("\n")
-			continue
+		// Update depth based on dollar-quote markers in THIS line
+		// BEFORE the strip decision is made. We update the depth as
+		// we walk the line. The post-line depth determines whether
+		// the NEXT line is inside a block. The decision to strip
+		// THIS line uses the PRE-line depth (which is the same as
+		// `depth` at the start of this iteration).
+		preDepth := depth
+		i := 0
+		for i < len(line) {
+			if line[i] != '$' {
+				i++
+				continue
+			}
+			// Scan for `$<optional-identifier-chars>$`. Identifier
+			// chars are [a-zA-Z0-9_] per Postgres docs.
+			j := i + 1
+			for j < len(line) && isDollarTagChar(line[j]) {
+				j++
+			}
+			if j < len(line) && line[j] == '$' {
+				// Found a `$<tag>$` at positions [i..j].
+				tag := line[i : j+1] // includes the wrapping $...$
+				if depth == 0 {
+					depth = 1
+					openTag = tag
+				} else if tag == openTag {
+					depth = 0
+					openTag = ""
+				}
+				// (We deliberately do NOT support nested heterogeneous
+				// tags — Postgres allows them but Phase 1 migrations
+				// don't use them; the simple single-level tracker
+				// covers the V0030-V0032 corpus and any future
+				// `DO $$ ... $$;` pattern.)
+				i = j + 1
+				continue
+			}
+			i++
+		}
+
+		// Strip ONLY if the line was top-level (preDepth == 0) AND
+		// is a standalone BEGIN;/COMMIT;. Lines inside a dollar-quoted
+		// block — even if their content matches "BEGIN;" / "COMMIT;"
+		// — are preserved as-is.
+		if preDepth == 0 {
+			trim := strings.TrimSpace(line)
+			if trim == "BEGIN;" || trim == "COMMIT;" {
+				out.WriteString("\n")
+				continue
+			}
 		}
 		out.WriteString(line)
 		out.WriteString("\n")
 	}
 	return out.String()
+}
+
+// isDollarTagChar reports whether a byte is allowed inside a
+// dollar-quote tag identifier (matches Postgres's parser rule:
+// letters, digits, and underscore; the leading char must be a
+// letter or underscore, but for the simple-match purposes here we
+// accept digits too — the wrapping `$` characters bound the tag).
+func isDollarTagChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_'
 }
