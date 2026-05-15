@@ -21,23 +21,17 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// cypherMergeLineageEdge is the canonical LINEAGE_OF MERGE template
-// (RESEARCH §Pattern 3 lines 741-752 verbatim). MATCH-by-iceberg_id
-// pairs the source and target nodes (which must already exist in the
-// graph — typically as Table or Snapshot vertices); MERGE creates the
-// edge if missing, updates `last_seen_at` on the matched-existing path.
-const cypherMergeLineageEdge = `
-MATCH (src),(tgt)
-WHERE src.iceberg_id = '%s' AND tgt.iceberg_id = '%s'
-MERGE (src)-[r:LINEAGE_OF]->(tgt)
-ON CREATE SET
-  r.created_at = '%s',
-  r.tenant_id  = '%s',
-  r.run_id     = '%s'
-ON MATCH SET
-  r.last_seen_at = '%s'
-RETURN id(r)
-`
+// cypherMergeLineageEdge is the Phase 1 LINEAGE_OF MERGE template
+// adapted for AGE 1.6 (Plan 01-04 deviation #1 — see snapshot.go
+// header for the AGE 1.6 ON CREATE SET workaround).
+//
+// Pattern: tenant_id MUST be in the inline edge property map (V0030
+// CHECK constraint LINEAGE_OF_tenant_id_required). created_at +
+// run_id are COALESCE'd via WITH+SET so the original-create values
+// are preserved on retry (Pitfall 5). last_seen_at is unconditionally
+// set to the current ts (heartbeat semantics — same shape as
+// committed_at vs last_seen_at on Snapshot).
+const cypherMergeLineageEdge = `MATCH (src),(tgt) WHERE src.iceberg_id = '%s' AND tgt.iceberg_id = '%s' MERGE (src)-[r:LINEAGE_OF {tenant_id: '%s'}]->(tgt) WITH r SET r.created_at = COALESCE(r.created_at, '%s'), r.run_id = COALESCE(r.run_id, '%s'), r.last_seen_at = '%s' RETURN id(r)`
 
 // MergeLineageEdge upserts a LINEAGE_OF edge from src → tgt. Performs
 // the bounded `*1..5` cycle pre-check + the advisory lock first, then
@@ -93,12 +87,14 @@ func (s *Service) MergeLineageEdge(ctx context.Context, tenantID, srcURI, tgtURI
 		// Step 2: the MERGE itself. Wrapped errors carry the operation
 		// name for triage; the typed LineageCycleError from step 1
 		// would already have early-returned above.
+		// Args order: src.iceberg_id, tgt.iceberg_id, tenant_id (inline),
+		// created_at (COALESCE'd), run_id (COALESCE'd), last_seen_at.
 		cypher := fmt.Sprintf(
 			cypherMergeLineageEdge,
 			escapeCypher(srcURI),
 			escapeCypher(tgtURI),
-			tsStr,
 			escapeCypher(tenantID),
+			tsStr,
 			escapeCypher(runID),
 			tsStr,
 		)

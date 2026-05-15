@@ -172,6 +172,15 @@ func (f *SaasFixture) ProvisionTenant(t *testing.T, tenantUUID string) string {
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA ag_catalog TO %s`, quoteIdent(roleName)),
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s`, quoteIdent(schema), quoteIdent(roleName)),
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s`, quoteIdent(schema), quoteIdent(roleName)),
+		// Sequence grants — required by V0063 lineage_inbox (bigserial
+		// id auto-creates a sequence the tenant role must USAGE-access).
+		// (Plan 01-04 deviation #4 [Rule 3]: surfaced by
+		// TestOpenLineageConsumerIdempotent — first place a tenant-role
+		// INSERT path uses a sequence-backed PK. Without these, the
+		// INSERT fails with `permission denied for sequence
+		// lineage_inbox_id_seq` (SQLSTATE 42501).)
+		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s`, quoteIdent(schema), quoteIdent(roleName)),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT USAGE, SELECT ON SEQUENCES TO %s`, quoteIdent(schema), quoteIdent(roleName)),
 		fmt.Sprintf(`GRANT %s TO neksur_app`, quoteIdent(roleName)),
 	}
 	for _, s := range grants {

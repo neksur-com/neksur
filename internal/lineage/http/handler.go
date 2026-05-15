@@ -104,7 +104,7 @@ func Handler(pool *pgxpool.Pool, ing *ingest.Service) http.HandlerFunc {
 		// FIRST with ON CONFLICT DO NOTHING. The UNIQUE (producer,
 		// run_id) constraint (V0063) swallows duplicates.
 		if err := persistInbox(r.Context(), pool, rawBody, event); err != nil {
-			http.Error(w, "lineage inbox persist failed", http.StatusServiceUnavailable)
+			http.Error(w, fmt.Sprintf("lineage inbox persist failed: %v", err), http.StatusServiceUnavailable)
 			return
 		}
 

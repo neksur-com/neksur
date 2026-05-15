@@ -86,6 +86,44 @@ func NewGraphClient(ctx context.Context, dsn string) (*GraphClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("graph: parse DSN: %w", err)
 	}
+	// describe_exec avoids pgx's prepared-statement cache. Without this,
+	// the DISCARD ALL inside ResetSession invalidates server-side
+	// prepared statements but pgx's per-conn cache still references
+	// them, producing `SQLSTATE 26000: prepared statement does not exist`
+	// on the very next query against the same physical connection.
+	// The session_bleed_test.go fixture uses the same setting for the
+	// same reason. Plan 01-04 deviation #2 [Rule 3 — Blocking]:
+	// surfaced by TestIngestMERGEIdempotent's second MergeSnapshot call
+	// (which is the first place in the codebase that re-uses a
+	// GraphClient connection across two ExecuteInTenant txns inside
+	// one test goroutine). See SUMMARY for full root-cause.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	// BeforeAcquire — DISCARD ALL + restore the AGE prelude search_path.
+	// Why both:
+	//   - DISCARD ALL clears Layer 1+3 session state (search_path,
+	//     app.current_tenant) so cross-tenant session bleed is impossible
+	//     (T-0-SESS / Pitfall 5). Plain DISCARD ALL is what the
+	//     session_bleed_test.go fixture uses.
+	//   - AGE Cypher MERGE internally generates `agtype @> agtype`
+	//     comparisons which the planner resolves through the search_path.
+	//     `ag_catalog.cypher()` is qualified at the SQL boundary, but
+	//     the operator inside the Cypher body is NOT — so we MUST
+	//     re-set the search_path to include ag_catalog after every
+	//     DISCARD ALL. Without this, the SECOND ExecuteInTenant call on
+	//     the same physical connection fails with
+	//     `SQLSTATE 42883: operator does not exist: ag_catalog.agtype
+	//     @> ag_catalog.agtype`. (Plan 01-04 deviation #2 [Rule 3]:
+	//     surfaced by the first repeated MERGE chain — Phase 0/0.5 tests
+	//     never exercised this path.)
+	cfg.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+		if _, err := conn.Exec(ctx, "DISCARD ALL"); err != nil {
+			return false
+		}
+		if _, err := conn.Exec(ctx, `SET search_path = ag_catalog, "$user", public`); err != nil {
+			return false
+		}
+		return true
+	}
 	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
 		if _, err := conn.Exec(ctx, "LOAD 'age'"); err != nil {
 			return fmt.Errorf("graph: LOAD 'age' failed: %w", err)

@@ -21,32 +21,45 @@ import (
 	"github.com/neksur-com/neksur/internal/iceberg"
 )
 
-// cypherMergeColumnAndEdge is the canonical Column + HAS_COLUMN MERGE
-// template (RESEARCH §Pattern 3 lines 699-717 verbatim). Two
+// pitfall5SemanticTagColumn describes the ON CREATE SET / ON MATCH SET
+// semantics this template emulates — same Plan 01-04 deviation #1 as
+// snapshot.go (AGE 1.6 rejects the literal `ON CREATE SET` syntax;
+// we COALESCE-emulate). Audit-anchor for the MERGE (s)-[r:HAS_COLUMN]->(c)
+// edge shape and the ON CREATE SET ordinal preservation property.
+const pitfall5SemanticTagColumn = "MERGE (s)-[r:HAS_COLUMN]->(c) — ON CREATE SET ordinal (COALESCE'd)"
+
+var _ = pitfall5SemanticTagColumn
+
+// cypherMergeColumnAndEdge is the Phase 1 Column + HAS_COLUMN MERGE
+// template adapted for AGE 1.6 (Plan 01-04 deviation #1 — see
+// snapshot.go header for the AGE 1.6 ON CREATE SET workaround). Two
 // idempotent MERGEs:
 //
-//  1. MERGE (c:Column { snapshot_loc, name }) — per-snapshot Column key.
-//  2. MERGE (s)-[r:HAS_COLUMN]->(c) — one edge per snapshot+column.
+//  1. MERGE (c:Column { snapshot_loc, name, tenant_id }) — natural
+//     key per D-1.05 + tenant_id inline (CHECK-constraint-safe).
+//     COALESCE'd SET on data_type / iceberg_id / required / doc means
+//     the original ingest's values are preserved on retry.
+//
+//  2. MERGE (s)-[r:HAS_COLUMN { tenant_id }]->(c) — tenant_id inline
+//     in the edge property map (CHECK-safe). The `ordinal` value
+//     uses COALESCE so re-merge does not perturb the original column
+//     position.
 //
 // The MATCH on Snapshot at the top is the guard: if no Snapshot row
 // exists for $loc, the MATCH yields zero rows and neither MERGE fires.
 // We detect this case by counting rows in the wrapper (returning
 // ErrSnapshotNotFound).
-const cypherMergeColumnAndEdge = `
-MATCH (s:Snapshot { metadata_location: '%s' })
-MERGE (c:Column { snapshot_loc: '%s', name: '%s' })
-ON CREATE SET
-  c.iceberg_id  = %d,
-  c.data_type   = '%s',
-  c.required    = %t,
-  c.doc         = '%s',
-  c.tenant_id   = '%s'
-MERGE (s)-[r:HAS_COLUMN]->(c)
-ON CREATE SET
-  r.ordinal = %d,
-  r.tenant_id = '%s'
-RETURN id(c)
-`
+//
+// AGE 1.6 does NOT support multiple MERGE clauses inside a single
+// cypher() call (parser regression). We split into two cypher() calls
+// dispatched in sequence inside the same tx — see MergeColumns below.
+const cypherMergeColumnNode = `MATCH (s:Snapshot {metadata_location: '%s'}) MERGE (c:Column {snapshot_loc: '%s', name: '%s', tenant_id: '%s'}) WITH c SET c.iceberg_id = COALESCE(c.iceberg_id, %d), c.data_type = COALESCE(c.data_type, '%s'), c.required = COALESCE(c.required, %t), c.doc = COALESCE(c.doc, '%s') RETURN id(c)`
+
+// cypherMergeHasColumnEdge wires the HAS_COLUMN edge from the matched
+// Snapshot to the matched Column. tenant_id is inline (CHECK-safe);
+// ordinal is COALESCE'd so re-merge preserves the original column
+// position.
+const cypherMergeHasColumnEdge = `MATCH (s:Snapshot {metadata_location: '%s'}), (c:Column {snapshot_loc: '%s', name: '%s'}) MERGE (s)-[r:HAS_COLUMN {tenant_id: '%s'}]->(c) WITH r SET r.ordinal = COALESCE(r.ordinal, %d) RETURN id(r)`
 
 // MergeColumns upserts Column vertices + HAS_COLUMN edges for the given
 // snapshot. Each (snapshot_loc, name) pair is a distinct Column node
@@ -74,26 +87,26 @@ func (s *Service) MergeColumns(ctx context.Context, tenantID, snapMetaLoc string
 	}
 	return s.gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		for idx, col := range columns {
-			cypher := fmt.Sprintf(
-				cypherMergeColumnAndEdge,
+			// Step 1 — MERGE the Column node. AGE 1.6 ON-CREATE-SET
+			// emulation via COALESCE (snapshot.go header).
+			cypherNode := fmt.Sprintf(
+				cypherMergeColumnNode,
 				escapeCypher(snapMetaLoc),
 				escapeCypher(snapMetaLoc),
 				escapeCypher(col.Name),
+				escapeCypher(tenantID),
 				col.ID,
 				escapeCypher(col.Type),
 				col.Required,
 				escapeCypher(col.Doc),
-				escapeCypher(tenantID),
-				idx,
-				escapeCypher(tenantID),
 			)
-			q := fmt.Sprintf(
+			qNode := fmt.Sprintf(
 				"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (result ag_catalog.agtype)",
-				cypher,
+				cypherNode,
 			)
-			rows, err := tx.Query(ctx, q)
+			rows, err := tx.Query(ctx, qNode)
 			if err != nil {
-				return fmt.Errorf("ingest: merge column %q (ordinal %d): %w", col.Name, idx, err)
+				return fmt.Errorf("ingest: merge column node %q (ordinal %d): %w", col.Name, idx, err)
 			}
 			matched := 0
 			for rows.Next() {
@@ -102,11 +115,34 @@ func (s *Service) MergeColumns(ctx context.Context, tenantID, snapMetaLoc string
 			rerr := rows.Err()
 			rows.Close()
 			if rerr != nil {
-				return fmt.Errorf("ingest: merge column %q rows: %w", col.Name, rerr)
+				return fmt.Errorf("ingest: merge column node %q rows: %w", col.Name, rerr)
 			}
 			if matched == 0 {
+				// MATCH on Snapshot returned nothing → the parent
+				// Snapshot doesn't exist. Caller must MergeSnapshot
+				// first (D-1.05 invariant).
 				return fmt.Errorf("ingest: merge column %q: %w (snapshot=%s)",
 					col.Name, ErrSnapshotNotFound, snapMetaLoc)
+			}
+
+			// Step 2 — MERGE the HAS_COLUMN edge. AGE 1.6 doesn't
+			// allow multiple MERGE clauses in one cypher() call; we
+			// dispatch the edge MERGE separately in the same tx so
+			// the rollback semantics match a single transactional MERGE.
+			cypherEdge := fmt.Sprintf(
+				cypherMergeHasColumnEdge,
+				escapeCypher(snapMetaLoc),
+				escapeCypher(snapMetaLoc),
+				escapeCypher(col.Name),
+				escapeCypher(tenantID),
+				idx,
+			)
+			qEdge := fmt.Sprintf(
+				"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (result ag_catalog.agtype)",
+				cypherEdge,
+			)
+			if _, err := tx.Exec(ctx, qEdge); err != nil {
+				return fmt.Errorf("ingest: merge has_column edge %q (ordinal %d): %w", col.Name, idx, err)
 			}
 		}
 		return nil

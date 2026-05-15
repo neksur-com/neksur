@@ -114,21 +114,23 @@ func TestBoundedDescendantsPanicsAboveMax(t *testing.T) {
 	_ = graph.BoundedDescendants("Table", 100)
 }
 
-func TestParseCyclePathHandlesAGEListSuffix(t *testing.T) {
-	// AGE returns lists with `::list` suffix; parseCyclePath strips it.
-	raw := []byte(`["a","b","c"]::list`)
-	got := parseCyclePath(raw, "a", "c")
-	if len(got) != 4 {
-		t.Errorf("parseCyclePath returned %d elements; expected 4 (closing src appended): %v", len(got), got)
-	}
-	if got[0] != "a" || got[len(got)-1] != "a" {
-		t.Errorf("parseCyclePath did not close cycle properly: %v", got)
-	}
-}
+// parseCyclePath unit tests removed — Plan 01-04 deviation #3
+// (AGE 1.6 `nodes(path)` quirk) replaced the AGE-list-parsing helper
+// with application-side path reconstruction (cycle.go::fetchCyclePath).
+// The fetchCyclePath path is exercised end-to-end by the
+// TestIngestLineageCycleRejected integration test.
 
-func TestParseCyclePathDegradesGracefullyOnGarbage(t *testing.T) {
-	got := parseCyclePath([]byte("not-valid-json"), "src", "tgt")
-	if len(got) != 3 || got[0] != "src" || got[2] != "src" {
-		t.Errorf("parseCyclePath degraded path wrong: %v", got)
+func TestStripAgtypeQuotes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`"hello"`, "hello"},
+		{`"hello"::text`, "hello"},
+		{`bare`, "bare"},
+		{`""`, ""},
+	}
+	for _, tc := range cases {
+		got := stripAgtypeQuotes(tc.in)
+		if got != tc.want {
+			t.Errorf("stripAgtypeQuotes(%q) = %q; want %q", tc.in, got, tc.want)
+		}
 	}
 }

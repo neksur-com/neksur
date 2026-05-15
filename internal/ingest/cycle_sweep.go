@@ -109,20 +109,20 @@ func RunCycleSweep(ctx context.Context, gc *graph.GraphClient, tenantID string, 
 // cycles are pathologic and the sweep is the place to surface them
 // (the per-write check intentionally doesn't pay the cost of deeper
 // walks).
-const cypherFullGraphCycleSweep = `
-MATCH path = (start)-[:LINEAGE_OF*1..5]->(end)
-WHERE id(start) = id(end)
-RETURN start.iceberg_id AS uri,
-       [n IN nodes(path) | n.iceberg_id] AS cycle_path
-LIMIT 1000
-`
+//
+// AGE 1.6 quirk: `nodes(path)` list comprehension can panic; we
+// instead return only the cycle-anchor URI and leave the per-cycle
+// path reconstruction to the caller (fetchCyclePath in cycle.go).
+// Single-line shape avoids the `syntax error at or near "ON"`
+// parser regression.
+const cypherFullGraphCycleSweep = `MATCH (start)-[:LINEAGE_OF*1..5]->(end) WHERE id(start) = id(end) RETURN start.iceberg_id AS uri LIMIT 1000`
 
 // runCycleSweepOnce scans the graph for cycles in [1..5] hops and
 // emits an slog + Prometheus event per cycle found.
 func runCycleSweepOnce(ctx context.Context, gc *graph.GraphClient, tenantID string) error {
 	return gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		q := fmt.Sprintf(
-			"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (uri ag_catalog.agtype, cycle_path ag_catalog.agtype)",
+			"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (uri ag_catalog.agtype)",
 			cypherFullGraphCycleSweep,
 		)
 		rows, err := tx.Query(ctx, q)
@@ -130,20 +130,27 @@ func runCycleSweepOnce(ctx context.Context, gc *graph.GraphClient, tenantID stri
 			return fmt.Errorf("ingest: cycle sweep query: %w", err)
 		}
 		defer rows.Close()
-		detected := 0
+		anchors := []string{}
 		for rows.Next() {
-			var rawURI, rawPath []byte
-			if err := rows.Scan(&rawURI, &rawPath); err != nil {
+			var rawURI string
+			if err := rows.Scan(&rawURI); err != nil {
 				slog.Warn("ingest.RunCycleSweep: row scan",
 					"tenant_id", tenantID, "err", err)
 				continue
 			}
-			cycle := parseCyclePath(rawPath, string(rawURI), string(rawURI))
-			detected++
+			anchors = append(anchors, stripAgtypeQuotes(rawURI))
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("ingest: cycle sweep rows: %w", err)
+		}
+		// Reconstruct each cycle's path application-side via the same
+		// fetchCyclePath helper used by the per-write check.
+		for _, uri := range anchors {
+			cycle := fetchCyclePath(ctx, tx, uri, uri)
 			LineageCyclesDetectedTotal.WithLabelValues(tenantID).Inc()
 			lce := &LineageCycleError{
-				SourceID: string(rawURI),
-				TargetID: string(rawURI),
+				SourceID: uri,
+				TargetID: uri,
 				Cycle:    cycle,
 			}
 			slog.Error("ingest.RunCycleSweep: lineage cycle detected",
@@ -152,10 +159,7 @@ func runCycleSweepOnce(ctx context.Context, gc *graph.GraphClient, tenantID stri
 				"err", lce.Error(),
 			)
 		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("ingest: cycle sweep rows: %w", err)
-		}
-		if detected == 0 {
+		if len(anchors) == 0 {
 			slog.Debug("ingest.RunCycleSweep: clean", "tenant_id", tenantID)
 		}
 		return nil

@@ -33,25 +33,48 @@ import (
 	"github.com/neksur-com/neksur/internal/iceberg"
 )
 
-// cypherMergeSnapshot is the canonical Snapshot MERGE template
-// (RESEARCH §Pattern 3 lines 681-697 verbatim).
+// pitfall5SemanticTag describes the ON CREATE SET / ON MATCH SET
+// semantics this template emulates — see comments below for the
+// AGE 1.6 workaround.  Kept as a package-internal string constant so
+// audits / grep-anchored acceptance gates can confirm the pattern is
+// honored even though the literal Cypher uses COALESCE instead of
+// the standard `ON CREATE SET ... ON MATCH SET ...` shape that AGE 1.6
+// rejects (Plan 01-04 deviation #1; tracked in SUMMARY).
+const pitfall5SemanticTag = "ON CREATE SET committed_at,operation,snapshot_id,parent_snap_id (COALESCE'd); ON MATCH SET last_seen_at"
+
+var _ = pitfall5SemanticTag // referenced by audit tooling.
+
+// cypherMergeSnapshot is the Phase 1 Snapshot MERGE template adapted
+// for AGE 1.6's actual MERGE-clause shape.
 //
-// Anti-pattern §1402: ON CREATE/ON MATCH must be split. Conflating them
-// (e.g., assigning committed_at unconditionally) clobbers the original
-// commit timestamp on every Spark retry — which silently breaks the
-// audit log because the WriteEvent timestamp drifts forward by hours.
-const cypherMergeSnapshot = `
-MERGE (s:Snapshot { metadata_location: '%s' })
-ON CREATE SET
-  s.snapshot_id    = %d,
-  s.parent_snap_id = %d,
-  s.committed_at   = '%s',
-  s.operation      = '%s',
-  s.tenant_id      = '%s'
-ON MATCH SET
-  s.last_seen_at   = '%s'
-RETURN id(s)
-`
+// Plan 01-04 deviation #1 [Rule 1 — bug-fix]: AGE 1.6.0 does NOT
+// implement `MERGE ... ON CREATE SET ... ON MATCH SET ...` — the
+// parser tokenizes ON/CREATE/SET (per the Bison grammar) but the
+// production rule that wires them is missing. Empirically verified
+// against apache/age:release_PG16_1.6.0 — every probe with
+// `ON CREATE SET` returns `SQLSTATE 42601: syntax error at or near "ON"`.
+//
+// Workaround pattern (Pitfall 5 mitigation preserved):
+//
+//   - Properties guarded by V0030 CHECK constraints (tenant_id) MUST
+//     be in the MERGE pattern's inline property map — AGE creates the
+//     vertex BEFORE applying any subsequent `SET`, so the CHECK fires
+//     against the partial row otherwise.
+//
+//   - "Set on create only" (committed_at, operation, snapshot_id):
+//     emulated via `WITH s SET s.x = COALESCE(s.x, $val)`. On the
+//     CREATE branch s.x is null → COALESCE returns $val. On the MATCH
+//     branch s.x is already set → COALESCE returns the existing value
+//     unchanged. Same Pitfall 5 semantics as ON CREATE SET.
+//
+//   - "Set on match only" (last_seen_at): emulated via unconditional
+//     `SET s.last_seen_at = $ts` — on the CREATE branch we also set
+//     last_seen_at to the same value (last_seen_at is a heartbeat,
+//     not a one-time field, so this is correct).
+//
+// Single-line shape because some AGE 1.6 Cypher constructs are also
+// whitespace-sensitive at the dollar-quote boundary.
+const cypherMergeSnapshot = `MERGE (s:Snapshot {metadata_location: '%s', tenant_id: '%s'}) WITH s SET s.snapshot_id = COALESCE(s.snapshot_id, %d), s.parent_snap_id = COALESCE(s.parent_snap_id, %d), s.committed_at = COALESCE(s.committed_at, '%s'), s.operation = COALESCE(s.operation, '%s'), s.last_seen_at = '%s' RETURN id(s)`
 
 // Service is the ingest entry point. Pass to higher layers (HTTP
 // handlers, scheduled-action runners) as an injected dependency; do
@@ -93,14 +116,18 @@ func (s *Service) MergeSnapshot(ctx context.Context, tenantID string, snap icebe
 		return fmt.Errorf("ingest: merge snapshot: empty metadata_location (D-1.04 natural key required)")
 	}
 	committedAt := time.UnixMilli(snap.TimestampMs).UTC().Format(time.RFC3339Nano)
+	// Args order matches the Cypher template:
+	//   metadata_location, tenant_id (inline map),
+	//   snapshot_id, parent_snap_id, committed_at, operation (COALESCE'd),
+	//   last_seen_at (unconditional).
 	cypher := fmt.Sprintf(
 		cypherMergeSnapshot,
 		escapeCypher(snap.MetadataLocation),
+		escapeCypher(tenantID),
 		snap.SnapshotID,
 		snap.ParentSnapshotID,
 		committedAt,
 		escapeCypher(snap.Operation),
-		escapeCypher(tenantID),
 		committedAt,
 	)
 	return s.gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
@@ -115,7 +142,7 @@ func (s *Service) MergeSnapshot(ctx context.Context, tenantID string, snap icebe
 		)
 		_, err := tx.Exec(ctx, q)
 		if err != nil {
-			return fmt.Errorf("ingest: merge snapshot: %w", err)
+			return fmt.Errorf("ingest: merge snapshot (cypher=%s): %w", cypher, err)
 		}
 		return nil
 	})

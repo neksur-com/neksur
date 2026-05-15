@@ -39,13 +39,14 @@ import (
 // this query). If the source URI appears in the ancestor set, the path
 // list is returned so we can build a precise LineageCycleError.
 //
-// The MATCH binds `path` so `nodes(path)` yields the ordered vertex
-// list closing the cycle (source → ... → target → ... → source).
-const cypherCycleCheck = `
-MATCH path = (target { iceberg_id: '%s' })-[:LINEAGE_OF*1..5]->(ancestor { iceberg_id: '%s' })
-RETURN [n IN nodes(path) | n.iceberg_id] AS cycle_path
-LIMIT 1
-`
+// AGE 1.6 quirk: `nodes(path)` works when path matched, but list
+// comprehensions inside RETURN can panic on path-shape edge cases.
+// We use a simple `RETURN target, ancestor` instead and reconstruct
+// the cycle path application-side from the source/target URIs.
+//
+// Single-line shape — multi-line MERGE/MATCH bodies sometimes trigger
+// the `syntax error at or near "ON"` parser regression.
+const cypherCycleCheck = `MATCH (target {iceberg_id: '%s'})-[:LINEAGE_OF*1..5]->(ancestor {iceberg_id: '%s'}) RETURN ancestor.iceberg_id LIMIT 1`
 
 // ValidateNoCycle returns a *LineageCycleError if MERGE'ing a
 // LINEAGE_OF edge from srcURI → tgtURI would close a cycle. Must be
@@ -111,20 +112,15 @@ func validateNoCycleTx(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) er
 		return nil
 	}
 
-	// A row came back — we have a cycle. Parse the cycle_path so the
-	// returned LineageCycleError surfaces the exact chain.
-	var rawPath []byte
-	if err := rows.Scan(&rawPath); err != nil {
-		// We KNOW there's a cycle; scan failure means we cannot
-		// extract the path. Surface a degraded LineageCycleError
-		// rather than swallowing the cycle into a generic error.
-		return &LineageCycleError{
-			SourceID: srcURI,
-			TargetID: tgtURI,
-			Cycle:    []string{srcURI, tgtURI, srcURI},
-		}
+	// A row came back — we have a cycle. AGE 1.6's `nodes(path)`
+	// list-comprehension form can panic on edge cases; we instead
+	// fetch the chain application-side via a separate path-walk
+	// query so the LineageCycleError still surfaces the full cycle.
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("ingest: cycle pre-check rows: %w", err)
 	}
-	cycle := parseCyclePath(rawPath, srcURI, tgtURI)
+	rows.Close()
+	cycle := fetchCyclePath(ctx, tx, srcURI, tgtURI)
 	return &LineageCycleError{
 		SourceID: srcURI,
 		TargetID: tgtURI,
@@ -132,14 +128,74 @@ func validateNoCycleTx(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) er
 	}
 }
 
-// parseCyclePath unwraps AGE's agtype list-of-strings shape into a Go
-// []string. The agtype on-wire form is typically a JSON string ending
-// in `::list` — e.g., `["a","b","c","a"]::list`. We strip the type
-// annotation suffix and json.Unmarshal the array.
+// fetchCyclePath reconstructs the lineage chain that would form a
+// cycle if the proposed `srcURI → tgtURI` edge were committed. The
+// graph state at call time has `tgtURI → ... → srcURI` (the
+// pre-existing chain that, when joined with the proposed edge,
+// would close the cycle). We walk forward from tgtURI via existing
+// LINEAGE_OF edges until we reach srcURI, then append srcURI again
+// to indicate the cycle-closing edge. The result reads as
+// `tgtURI → ... → srcURI → tgtURI` (the standard cycle notation).
 //
-// On any parse failure we fall back to a degraded 3-element path
-// (src → tgt → src) so the LineageCycleError still gives the operator
-// enough context to start debugging.
+// On any query failure we degrade to a 3-element fallback so the
+// LineageCycleError still carries at least the source/target context.
+//
+// 5-hop cap matches D-001.08 + cypherCycleCheck — chains longer than
+// 5 hops are reported as a 5-deep window.
+func fetchCyclePath(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) []string {
+	chain := []string{tgtURI}
+	current := tgtURI
+	for hop := 0; hop < 5; hop++ {
+		// Find the next downstream node from `current`.
+		cy := fmt.Sprintf(
+			`MATCH (n {iceberg_id: '%s'})-[:LINEAGE_OF]->(next) RETURN next.iceberg_id LIMIT 1`,
+			current,
+		)
+		q := fmt.Sprintf(
+			"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (result ag_catalog.agtype)",
+			cy,
+		)
+		var raw string
+		row := tx.QueryRow(ctx, q)
+		if err := row.Scan(&raw); err != nil {
+			break
+		}
+		next := stripAgtypeQuotes(raw)
+		chain = append(chain, next)
+		// Reached srcURI? Append tgtURI to indicate the
+		// would-be-committed edge that closes the cycle.
+		if next == srcURI {
+			chain = append(chain, tgtURI)
+			return chain
+		}
+		current = next
+	}
+	// Could not reconstruct full cycle — append the closing best-effort
+	// hint so the message is at least informative.
+	chain = append(chain, srcURI, tgtURI)
+	return chain
+}
+
+// stripAgtypeQuotes removes the JSON-style surrounding quotes and any
+// AGE type suffix from a scalar agtype string result.
+func stripAgtypeQuotes(s string) string {
+	for _, suffix := range []string{"::text", "::numeric"} {
+		if len(s) > len(suffix) && s[len(s)-len(suffix):] == suffix {
+			s = s[:len(s)-len(suffix)]
+		}
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// parseCyclePath is retained only for backward compatibility — Plan
+// 01-04 deviation #3 replaced its use site with fetchCyclePath
+// (application-side path reconstruction) because AGE 1.6's
+// `nodes(path)` list-comprehension form panics on edge cases. Left
+// here for any future caller that needs to parse an AGE list-of-strings
+// agtype form (e.g., the Phase 1 admin UI).
 func parseCyclePath(raw []byte, srcURI, tgtURI string) []string {
 	s := string(raw)
 	// Strip ::list / ::path / ::array suffix.
