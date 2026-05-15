@@ -237,9 +237,23 @@ func MultiTableCommitHandler(deps Deps) http.HandlerFunc {
 					// do NOT emit for the other refs.
 					observability.CommitRejectedTotal.WithLabelValues(
 						observability.ReasonPolicyDenied).Inc()
+					// CR-05 (multi-table parity): REJECTED audit
+					// emission failures are FATAL. No upstream
+					// commit has happened yet (Reject-All blocks
+					// the forward step), so failing the request
+					// with 503 is safe and prevents the
+					// "policy-denied-with-no-audit-trail" attacker
+					// scenario. See handler.go::CommitHandler for
+					// the equivalent single-table fix.
 					if auditErr := EmitWriteEvent(r.Context(), deps.Graph, ref,
 						"REJECTED", principal, principalSrc, bodyHash, nil, decision.Reason); auditErr != nil {
-						slog.Error("gateway: multi-table emit audit (REJECTED) failed", "err", auditErr)
+						observability.CommitRejectedTotal.WithLabelValues(
+							observability.ReasonPolicyEngineUnavailable).Inc()
+						slog.Error("gateway: multi-table emit audit (REJECTED) failed — failing request",
+							"err", auditErr, "ref", ref, "policy_id", p.ID)
+						http.Error(w, "policy-engine-unavailable: audit emission failed on policy denial",
+							http.StatusServiceUnavailable)
+						return
 					}
 					http.Error(w, "multi-table reject-all: policy denied on "+
 						ref.Name+": "+decision.Reason, http.StatusForbidden)

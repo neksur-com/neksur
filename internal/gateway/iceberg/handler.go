@@ -300,9 +300,26 @@ func CommitHandler(deps Deps) http.HandlerFunc {
 			if decision.Action == cel.ActionDeny {
 				observability.CommitRejectedTotal.WithLabelValues(
 					observability.ReasonPolicyDenied).Inc()
+				// CR-05: REJECTED audit emission failures are FATAL.
+				// Unlike APPROVED (where the upstream catalog has
+				// already accepted and we cannot roll back), a
+				// REJECTED commit has NO upstream side effect — we
+				// can safely refuse the request when the audit trail
+				// cannot be persisted. Returning 503 (rather than
+				// the cosmetic 403) prevents the
+				// "policy-denied-with-no-audit-trail" attacker
+				// scenario where forcing audit failures hides a
+				// denial pattern. SecOps prefer an ambiguous 503
+				// over a silently un-audited 403.
 				if auditErr := EmitWriteEvent(r.Context(), deps.Graph, ref,
 					"REJECTED", principal, principalSrc, bodyHash, nil, decision.Reason); auditErr != nil {
-					slog.Error("gateway: emit audit (REJECTED) failed", "err", auditErr)
+					observability.CommitRejectedTotal.WithLabelValues(
+						observability.ReasonPolicyEngineUnavailable).Inc()
+					slog.Error("gateway: emit audit (REJECTED) failed — failing request",
+						"err", auditErr, "ref", ref, "policy_id", p.ID)
+					http.Error(w, "policy-engine-unavailable: audit emission failed on policy denial",
+						http.StatusServiceUnavailable)
+					return
 				}
 				http.Error(w, "policy denied: "+decision.Reason, http.StatusForbidden)
 				return
