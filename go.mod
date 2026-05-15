@@ -10,6 +10,7 @@ go 1.25.0
 require (
 	github.com/PagerDuty/go-pagerduty v1.8.0
 	github.com/apache/iceberg-go v0.5.0
+	github.com/aws/aws-sdk-go-v2/config v1.32.9
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.27
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/cel-go v0.28.1
@@ -40,7 +41,6 @@ require (
 	github.com/apache/arrow-go/v18 v18.5.2-0.20260220015023-a886a5722b87 // indirect
 	github.com/apache/thrift v0.22.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.32.9 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.9 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.17 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
