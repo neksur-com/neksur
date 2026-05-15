@@ -1,0 +1,88 @@
+# AlertManager configuration — Phase 1 alert wiring (Plan 01-09 Task 2).
+#
+# This file MIRRORS the Phase 0.5 production config at
+# `infra/prometheus/alertmanager.yml`. Plan 01-09 Task 2 does NOT
+# need to change the routing TABLE — Phase 0.5 already ratified
+# severity-tier routing (severity=page → pagerduty, severity=warn →
+# slack) and the new Phase 1 alerts (PolicyEngineUnavailableAlert,
+# PolicyDeniedSpikeAlert in rules/phase1-commit-rejected.yml) inherit
+# that routing via their labels:
+#
+#   PolicyEngineUnavailableAlert  severity=page  → pagerduty
+#                                                  (commit_rejected_total
+#                                                   {reason=
+#                                                   "policy_engine_unavailable"}
+#                                                   rate >0 sustained 1m)
+#   PolicyDeniedSpikeAlert        severity=warn  → slack
+#                                                  (commit_rejected_total
+#                                                   {reason="policy_denied"}
+#                                                   rate >10 sustained 5m)
+#
+# Runbook (linked via PromQL annotations):
+#   runbooks/commit-rejected-503-rate.md (Plan 01-09 Task 1)
+#
+# Per-alert runbook links also live in the rule annotations
+# (runbook_url field) so the PagerDuty incident page surfaces the
+# diagnostic tree directly.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  # Default receiver is the page channel — fail-safe: if for any reason
+  # the severity-label routing tree doesn't match, the alert escalates
+  # rather than getting swallowed.
+  receiver: pagerduty
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # PAGE tier — wakes on-call. Phase 0 (CypherP99LatencyBreach,
+    # ClockSkewPage) and Phase 1 (PolicyEngineUnavailableAlert) both
+    # carry severity=page.
+    - matchers:
+        - severity = "page"
+      receiver: pagerduty
+      continue: false
+
+    # WARN tier — Slack only, no on-call wake. Phase 0 (ClockSkewWarn)
+    # and Phase 1 (PolicyDeniedSpikeAlert) both carry severity=warn.
+    - matchers:
+        - severity = "warn"
+      receiver: slack
+      continue: false
+
+# Phase 1 alerts routed by severity:
+#   PolicyEngineUnavailableAlert  severity=page  -> pagerduty
+#   PolicyDeniedSpikeAlert        severity=warn  -> slack
+# (Phase 0 alerts also routed by the same tree — see
+# `infra/prometheus/alertmanager.yml` for the production-canonical
+# version of this file.)
+
+receivers:
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_INTEGRATION_KEY}'
+        description: '{{ .GroupLabels.alertname }} — {{ .CommonAnnotations.summary }}'
+        details:
+          contract: '{{ .CommonLabels.contract }}'
+          phase: '{{ .CommonLabels.phase }}'
+          component: '{{ .CommonLabels.component }}'
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+          firing_count: '{{ .Alerts.Firing | len }}'
+
+  - name: slack
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#oncall-warn'
+        send_resolved: true
+        title: '{{ .GroupLabels.alertname }}'
+        text: |
+          *{{ .CommonAnnotations.summary }}*
+          Contract: `{{ .CommonLabels.contract }}`
+          Phase:    `{{ .CommonLabels.phase }}`
+          {{ range .Alerts.Firing -}}
+          • {{ .Annotations.description }}
+          {{- end }}

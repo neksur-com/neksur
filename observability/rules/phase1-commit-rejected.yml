@@ -1,0 +1,125 @@
+# Phase 1 commit-rejected PromQL alert rules — closes Plan 01-09 Task 2.
+#
+# Two rules cover the two reason-label paths emitted by
+# `internal/observability/metrics.go::CommitRejectedTotal`:
+#
+#   - PolicyEngineUnavailableAlert  (severity=page) →
+#     pagerduty per Phase 0.5 alertmanager severity-tier routing
+#     (`infra/prometheus/alertmanager.yml`). Wakes on-call: customers
+#     are being rejected 503 fail-closed; CONTEXT line 174 + D-1.09
+#     contract demand a paging response within 1 minute.
+#
+#   - PolicyDeniedSpikeAlert        (severity=warn) →
+#     slack per the same severity-tier routing. Trend signal for
+#     when a recent policy change OR a misconfigured Spark client is
+#     hammering the gateway with non-conforming commits at >10/sec.
+#
+# rule_files inclusion: the canonical Plan 01 Prometheus config
+# (`infra/prometheus/prometheus.yml`) is extended in this plan's
+# Task 2 to mount this file at /etc/prometheus/alerts/phase1-commit-rejected.yml.
+# A mirror copy lives at `ops/prometheus/alerts/phase1-commit-rejected.yaml`
+# to match the Phase 0 convention (Plan 00-05 — see
+# `ops/prometheus/alerts/cypher-latency.yaml`).
+#
+# Runbook: runbooks/commit-rejected-503-rate.md (Plan 01-09 Task 1).
+# Verified by Go test:
+#   tests/integration/commit_rejected_503_metric_alert_test.go
+#   (Plan 01-09 Task 3 — BLOCKING gate asserts metric increments AND
+#   the alert rule expression parses + matches the synthetic counter
+#   value).
+
+groups:
+  - name: phase1.commit_rejected
+    interval: 30s
+    rules:
+      # ----------------------------------------------------------------
+      # PolicyEngineUnavailableAlert — D-1.09 fail-closed paging alert.
+      #
+      # Threshold: rate > 0 sustained 1m (per CONTEXT line 174). The
+      # `for: 1m` requirement filters out single transient blips
+      # (e.g., RDS failover ~30-60s) so the alert auto-resolves
+      # without paging when the engine recovers in <1m. The `[1m]`
+      # rate window averages over 1 minute so a single spike doesn't
+      # trigger; sustained breach (multiple rejections in the window)
+      # is the only path to firing.
+      #
+      # severity=page → routed to pagerduty by the Phase 0.5
+      # alertmanager severity-tier routing (alertmanager.yml route
+      # match severity=page → receiver=pagerduty).
+      #
+      # Operator runbook MUST be linked via `runbook_url` so the
+      # PagerDuty incident page surfaces a click-through to the
+      # diagnosis tree (commit-rejected-503-rate.md §1 / §2).
+      # ----------------------------------------------------------------
+      - alert: PolicyEngineUnavailableAlert
+        expr: sum(rate(commit_rejected_total{reason="policy_engine_unavailable"}[1m])) > 0
+        for: 1m
+        labels:
+          severity: page
+          phase: "1"
+          component: gateway
+          contract: D-1.09
+        annotations:
+          summary: "Neksur L1 Catalog Gateway is rejecting commits with 503 policy-engine-unavailable (D-1.09 fail-closed)"
+          description: |
+            commit_rejected_total{reason="policy_engine_unavailable"} rate
+            is non-zero sustained 1m. Customer Spark/Trino writes are
+            being rejected without ever reaching upstream Polaris/Nessie.
+            Two D-1.09 fail-closed sub-paths emit this label:
+              - policy fetch failure (LoadPoliciesForTable returned err)
+              - policy eval failure  (Evaluator.Evaluate returned err)
+
+            Follow the diagnosis tree in
+            runbooks/commit-rejected-503-rate.md §1 — distinguishes
+            DB-unreachable / CEL-compiler-uninit / customer-policy-panic
+            / RLS-missing-GUC sub-paths and routes the page accordingly.
+
+            CONTEXT line 174 + D-1.09 demand a paging response within
+            1 minute; the ALB + ASG combo applies automatic mitigations
+            (pulling broken replicas via /readyz, launching replacements)
+            in parallel with the SRE diagnosis.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/commit-rejected-503-rate.md"
+
+      # ----------------------------------------------------------------
+      # PolicyDeniedSpikeAlert — warn-tier trend signal.
+      #
+      # Normal policy denials (a P1/P2/P3 returned ActionDeny → HTTP
+      # 403) are EXPECTED traffic: customer policies correctly blocking
+      # non-conforming commits. A SPIKE in denials (>10/sec sustained
+      # 5m) is the trend signal that something changed:
+      #   - a recent policy push tightened too aggressively
+      #   - a misconfigured Spark client is hammering with bad commits
+      #   - a malicious actor is probing
+      #
+      # Threshold: rate > 10 sustained 5m. Higher than the page-tier
+      # threshold + longer window because false-positive risk is high
+      # (legitimate big-batch ingest may trigger many denials in a
+      # short window).
+      #
+      # severity=warn → routed to slack #oncall-warn (Phase 0.5
+      # alertmanager).
+      # ----------------------------------------------------------------
+      - alert: PolicyDeniedSpikeAlert
+        expr: sum(rate(commit_rejected_total{reason="policy_denied"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: warn
+          phase: "1"
+          component: gateway
+          contract: D-1.09
+        annotations:
+          summary: "Neksur L1 Catalog Gateway is rejecting > 10 commits/sec with 403 policy-denied"
+          description: |
+            commit_rejected_total{reason="policy_denied"} rate is
+            > 10/sec sustained 5m. This is BUSINESS-AS-USUAL signal at
+            low volume (customer policies correctly blocking
+            non-conforming commits) but the high rate suggests either
+            a recent policy change tightened too aggressively OR a
+            misconfigured Spark client is hammering with bad commits.
+
+            Investigate via Prometheus by tenant_id label (Phase 2
+            will add the tenant label per Plan 02-08):
+              topk(10, sum by (tenant_id) (rate(commit_rejected_total{reason="policy_denied"}[5m])))
+
+            Surface to Slack channel: #neksur-ops
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/commit-rejected-503-rate.md"

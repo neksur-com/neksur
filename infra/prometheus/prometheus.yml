@@ -34,6 +34,13 @@ global:
 rule_files:
   - /etc/prometheus/alerts/cypher-latency.yaml
   - /etc/prometheus/alerts/clock-skew.yaml
+  # Phase 1 Plan 01-09 Task 2 — commit_rejected_total alerts
+  # (PolicyEngineUnavailableAlert severity=page + PolicyDeniedSpikeAlert
+  # severity=warn). Canonical rule source:
+  # observability/rules/phase1-commit-rejected.yml; production deploy
+  # mirrors it to /etc/prometheus/alerts/phase1-commit-rejected.yaml
+  # via docker-compose mount (see infra/otel/docker-compose.observability.yml).
+  - /etc/prometheus/alerts/phase1-commit-rejected.yaml
 
 alerting:
   alertmanagers:

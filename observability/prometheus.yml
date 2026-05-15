@@ -1,0 +1,81 @@
+# Prometheus configuration — Phase 1 alert wiring (Plan 01-09 Task 2).
+#
+# This file is the Phase 1 canonical Prometheus config; it MIRRORS the
+# Phase 0 production config at `infra/prometheus/prometheus.yml` and
+# extends it with the new Phase 1 commit-rejected alert rules.
+#
+# rule_files inclusion: the new `rules/phase1-commit-rejected.yml`
+# defines two alerts:
+#   - PolicyEngineUnavailableAlert  severity=page  → pagerduty
+#   - PolicyDeniedSpikeAlert        severity=warn  → slack
+# Both inherit the Phase 0.5 severity-tier routing in alertmanager.yml
+# (this directory's sibling file).
+#
+# For the production-canonical config (which lives at
+# `infra/prometheus/prometheus.yml`), the same rules file is referenced
+# via the `rule_files` directive in that file too (also updated by
+# Plan 01-09 Task 2). Keeping a mirror here at the plan-specified
+# path is operationally convenient: operators investigating Phase 1
+# observability can find the alert + scrape config + routing in one
+# tree (`/Users/evgeny/neksur-core/observability/`) without chasing
+# `infra/prometheus/` + `ops/prometheus/alerts/`.
+#
+# Runbook: runbooks/commit-rejected-503-rate.md (Plan 01-09 Task 1).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: neksur-core
+    env: dev
+
+# Alert rule files. The Phase 0 cypher-latency.yml + clock-skew.yml
+# files live at /etc/prometheus/alerts/ (mounted via docker-compose).
+# Plan 01-09 Task 2 adds `rules/phase1-commit-rejected.yml` for the
+# new PolicyEngineUnavailableAlert + PolicyDeniedSpikeAlert.
+rule_files:
+  - /etc/prometheus/alerts/cypher-latency.yaml         # Phase 0 (Plan 00-05)
+  - /etc/prometheus/alerts/clock-skew.yaml             # Phase 0 (Plan 00-05)
+  - rules/phase1-commit-rejected.yml                   # Phase 1 (Plan 01-09 — NEW)
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # The neksur-server application's Prometheus client_golang /metrics
+  # endpoint. In production it's a service name in the deployment;
+  # in local dev/test the docker-compose maps `app` to host.docker.internal.
+  #
+  # This is the scrape target that emits commit_rejected_total (Phase 1
+  # Plan 01-05 metric — internal/observability/metrics.go) so the
+  # PolicyEngineUnavailableAlert + PolicyDeniedSpikeAlert have data
+  # to evaluate against.
+  - job_name: neksur-graph
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - app:9100
+        labels:
+          component: graph-client
+
+  # OTel collector self-metrics + the OTel pipeline output. Phase 0.
+  - job_name: otel-collector
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - otel-collector:8889
+        labels:
+          component: otel-collector
+
+  # chrony exporter on every Postgres host. Phase 0 — drives the
+  # ClockSkewWarn + ClockSkewPage alerts.
+  - job_name: chrony
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - chrony-exporter:9123
+        labels:
+          component: clock

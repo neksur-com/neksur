@@ -1,0 +1,55 @@
+# Phase 1 commit-rejected PromQL alert rules — mirror of
+# `observability/rules/phase1-commit-rejected.yml` at the Phase 0
+# convention path (alongside `cypher-latency.yaml` + `clock-skew.yaml`).
+#
+# This is the file mounted into the Prometheus container at
+# /etc/prometheus/alerts/phase1-commit-rejected.yaml via the
+# docker-compose.observability.yml binding; the canonical-source
+# version lives at observability/rules/phase1-commit-rejected.yml
+# per Plan 01-09 frontmatter `files_modified`. Both files are
+# identical content; CI may diff them on every PR to enforce.
+#
+# Runbook: runbooks/commit-rejected-503-rate.md (Plan 01-09 Task 1).
+
+groups:
+  - name: phase1.commit_rejected
+    interval: 30s
+    rules:
+      - alert: PolicyEngineUnavailableAlert
+        expr: sum(rate(commit_rejected_total{reason="policy_engine_unavailable"}[1m])) > 0
+        for: 1m
+        labels:
+          severity: page
+          phase: "1"
+          component: gateway
+          contract: D-1.09
+        annotations:
+          summary: "Neksur L1 Catalog Gateway is rejecting commits with 503 policy-engine-unavailable (D-1.09 fail-closed)"
+          description: |
+            commit_rejected_total{reason="policy_engine_unavailable"} rate
+            is non-zero sustained 1m. Customer Spark/Trino writes are
+            being rejected without ever reaching upstream Polaris/Nessie.
+            Two D-1.09 fail-closed sub-paths emit this label:
+              - policy fetch failure (LoadPoliciesForTable returned err)
+              - policy eval failure  (Evaluator.Evaluate returned err)
+
+            Follow the diagnosis tree in
+            runbooks/commit-rejected-503-rate.md §1.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/commit-rejected-503-rate.md"
+
+      - alert: PolicyDeniedSpikeAlert
+        expr: sum(rate(commit_rejected_total{reason="policy_denied"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: warn
+          phase: "1"
+          component: gateway
+          contract: D-1.09
+        annotations:
+          summary: "Neksur L1 Catalog Gateway is rejecting > 10 commits/sec with 403 policy-denied"
+          description: |
+            commit_rejected_total{reason="policy_denied"} rate is
+            > 10/sec sustained 5m. Investigate per-tenant via:
+              topk(10, sum by (tenant_id) (rate(commit_rejected_total{reason="policy_denied"}[5m])))
+            Surface to #neksur-ops.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/commit-rejected-503-rate.md"
