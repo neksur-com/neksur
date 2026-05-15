@@ -12,6 +12,7 @@ package polaris
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrInvalidConfig is the package sentinel returned when Validate
@@ -83,6 +84,18 @@ func (c Config) Validate() error {
 		return fmt.Errorf("polaris: config: ClientSecret required: %w", ErrInvalidConfig)
 	case c.Warehouse == "":
 		return fmt.Errorf("polaris: config: Warehouse required: %w", ErrInvalidConfig)
+	}
+	// WR-07: the OAuth `credential` prop is constructed as
+	// `ClientID + ":" + ClientSecret`; iceberg-go splits on the FIRST
+	// colon. A ClientSecret containing `:` would silently truncate at
+	// the wrong position. Reject at config-Validate time so the bug
+	// is caught at boot, not at first commit. ClientID can ALSO not
+	// contain `:` for the same reason.
+	if strings.Contains(c.ClientID, ":") {
+		return fmt.Errorf("polaris: config: ClientID must not contain ':' (OAuth credential ambiguity): %w", ErrInvalidConfig)
+	}
+	if strings.Contains(c.ClientSecret, ":") {
+		return fmt.Errorf("polaris: config: ClientSecret must not contain ':' (OAuth credential ambiguity): %w", ErrInvalidConfig)
 	}
 	return nil
 }

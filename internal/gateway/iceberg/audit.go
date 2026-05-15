@@ -176,7 +176,10 @@ func EmitWriteEvent(
 	// Compose the per-emission audit-log payload as JSON. Includes
 	// principal sub + roles + ref so the relational query can join
 	// against the graph WriteEvent without a Cypher round-trip.
-	payload, _ := json.Marshal(map[string]any{
+	// WR-01: surface marshal errors instead of silently producing
+	// a malformed payload that the downstream `$2::jsonb` cast would
+	// reject with `invalid input syntax for type json`.
+	payload, err := json.Marshal(map[string]any{
 		"principal": map[string]any{
 			"sub":   principal.Sub,
 			"email": principal.Email,
@@ -188,6 +191,9 @@ func EmitWriteEvent(
 		},
 		"reason": reason,
 	})
+	if err != nil {
+		return fmt.Errorf("gateway: marshal audit payload: %w", err)
+	}
 
 	commitID := uuid.New().String()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -203,7 +209,7 @@ func EmitWriteEvent(
 	// (ExecuteInTenant exposes the pgx.Tx). Open Q 4 same-tx atomicity:
 	// if the graph write succeeds and the relational write fails, the
 	// rollback guarantees we don't have a half-emitted audit trail.
-	err := gc.ExecuteInTenant(ctx, tenantStr, func(ctx context.Context, tx pgx.Tx) error {
+	err = gc.ExecuteInTenant(ctx, tenantStr, func(ctx context.Context, tx pgx.Tx) error {
 		// Step 1 — WriteEvent vlabel MERGE.
 		weCypher := fmt.Sprintf(
 			cypherMergeWriteEvent,

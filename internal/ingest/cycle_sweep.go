@@ -80,6 +80,20 @@ func RunCycleSweep(ctx context.Context, gc *graph.GraphClient, tenantID string, 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// WR-12: emit a structured exit-reason log so operators can
+	// detect "sweep goroutine died" via grep (or via a Prometheus
+	// log-derived alert) instead of having to notice
+	// "no cycle alerts in 24h".
+	var exitErr error
+	defer func() {
+		reason := "ctx_done"
+		if exitErr != nil && !errors.Is(exitErr, context.Canceled) {
+			reason = "fatal_error"
+		}
+		slog.Info("ingest.RunCycleSweep: exiting",
+			"tenant_id", tenantID, "reason", reason, "err", exitErr)
+	}()
+
 	// Run once immediately so cancellation/blocker semantics are
 	// observable in tests without waiting the full interval.
 	if err := runCycleSweepOnce(ctx, gc, tenantID); err != nil && !errors.Is(err, context.Canceled) {
@@ -90,10 +104,12 @@ func RunCycleSweep(ctx context.Context, gc *graph.GraphClient, tenantID string, 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			exitErr = ctx.Err()
+			return exitErr
 		case <-ticker.C:
 			if err := runCycleSweepOnce(ctx, gc, tenantID); err != nil {
 				if errors.Is(err, context.Canceled) {
+					exitErr = err
 					return err
 				}
 				slog.Error("ingest.RunCycleSweep: sweep failed",

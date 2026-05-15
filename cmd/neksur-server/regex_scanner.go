@@ -118,9 +118,18 @@ func (r *regexScanner) Scan(ctx context.Context, hit dispatch.Hit) error {
 	// SHOULD include namespace+name in the Hit; the poller resolves it
 	// from the Snapshot's owning Table relationship. For Phase 1 if
 	// the Hit lacks namespace/name, we skip the LoadTable + classify
-	// pass and ONLY emit the DetectionRun audit (which is still
-	// useful — proves the trigger fired).
+	// pass.
+	//
+	// WR-03: when the Hit lacks a table ref, the scan did NOT
+	// actually run (no schema loaded → no columns classified). The
+	// previous code emitted a DetectionRun with strategy="regex" +
+	// sample_size=0 anyway, suggesting "we scanned this snapshot
+	// and found nothing" when in fact we never scanned. SecOps
+	// dashboards counting clean scans would be inflated by these
+	// no-op rows. Distinguish the two cases via strategy label so
+	// dashboards can filter "_skipped" rows out of clean-scan counts.
 	var schema iceberg.Schema
+	tableLoaded := false
 	if hit.TableName != "" {
 		ref := iceberg.TableRef{
 			Namespace: hit.TableNamespace,
@@ -128,10 +137,11 @@ func (r *regexScanner) Scan(ctx context.Context, hit dispatch.Hit) error {
 		}
 		meta, err := adapter.LoadTable(ctx, ref)
 		if err != nil {
-			slog.Warn("scanner: LoadTable failed; emitting DetectionRun without findings",
+			slog.Warn("scanner: LoadTable failed; emitting DetectionRun marked skipped",
 				"err", err, "tenant", hit.TenantID, "ref", ref)
 		} else if meta != nil {
 			schema = meta.Schema
+			tableLoaded = true
 		}
 	}
 
@@ -144,17 +154,25 @@ func (r *regexScanner) Scan(ctx context.Context, hit dispatch.Hit) error {
 	// manifest-reader integration ships.
 	sampleSize := len(findings)
 	strategy := "regex"
+	if !tableLoaded {
+		// WR-03: explicit "we did not actually scan" marker so audit
+		// dashboards can distinguish "clean scan" from "scan was
+		// skipped because the Hit had no table ref or LoadTable
+		// failed".
+		strategy = "regex_skipped_no_table_ref"
+	}
 
 	runID, err := regex.EmitDetectionResults(ctx, r.gc, hit.TenantID,
 		hit.MetadataLocation, strategy, sampleSize, findings)
 	if err != nil {
+		// WR-13: distinguish "cross-replica dedup hit" (clean skip)
+		// from any other error via errors.Is on the sentinel.
+		if errors.Is(err, regex.ErrDetectionAlreadyEmittedByPeer) {
+			slog.Debug("scanner: cross-replica dedup; skipped emission",
+				"tenant", hit.TenantID, "meta_loc", hit.MetadataLocation)
+			return nil
+		}
 		return fmt.Errorf("scanner: emit detection results: %w", err)
-	}
-	if runID == "" {
-		// Cross-replica dedup hit — another replica is scanning. OK.
-		slog.Debug("scanner: cross-replica dedup; skipped emission",
-			"tenant", hit.TenantID, "meta_loc", hit.MetadataLocation)
-		return nil
 	}
 
 	// Slack alerts on >= threshold findings (D-1.12 + D-OQ.07).

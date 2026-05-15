@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -281,7 +282,24 @@ func runWithSaasAuth(ctx context.Context) error {
 	// UNIQUE constraint (Pitfall 10).
 	slackClient := alerts.NewSlack(os.Getenv("NEKSUR_SLACK_WEBHOOK_URL"), "neksur-server")
 	scanner := newRegexScanner(pool, graphClient, gatewayDeps.CredStore, slackClient)
-	dispatchChan := make(chan dispatch.Hit, 256)
+	// WR-11: dispatch channel buffer size. The poller pushes up to
+	// pollerMaxPerTenant=100 per tenant per 30s; with 100 tenants
+	// that's 10,000 hits in one cycle. A buffer of 256 (the old
+	// default) fills in milliseconds and the poller blocks on `case
+	// in <- h` if workers stall. Default 1024 gives a 4x headroom
+	// over the old size; production deployments with high-tenant
+	// counts should bump via NEKSUR_L3_DISPATCH_BUFFER. Note: this
+	// buffer is the queue between producers (poller / webhook /
+	// s3-events) and consumers (the worker pool); a fuller queue is
+	// observable via len(dispatchChan) if a metric is added later
+	// (deferred).
+	dispatchBuf := 1024
+	if raw := os.Getenv("NEKSUR_L3_DISPATCH_BUFFER"); raw != "" {
+		if n, parseErr := strconv.Atoi(raw); parseErr == nil && n > 0 {
+			dispatchBuf = n
+		}
+	}
+	dispatchChan := make(chan dispatch.Hit, dispatchBuf)
 	dispatchPool := dispatch.NewPool(dispatchChan, scanner)
 	go dispatchPool.Run(ctx)
 	go dispatch.RunPoller(ctx, pool, graphClient, dispatchChan, dispatch.DefaultPollerInterval)

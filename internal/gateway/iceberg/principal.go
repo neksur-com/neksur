@@ -101,9 +101,31 @@ func ExtractPrincipal(r *http.Request) (*Principal, Source, error) {
 	}
 
 	// Step 3 — WorkOS session fallback. TenantMiddleware injects the
-	// tenant UUID; we use that as the principal subject. Lower-fidelity
-	// (per-tenant, not per-user) but always-on since the middleware is
-	// the gateway's auth precondition.
+	// tenant UUID; we use that as the principal subject.
+	// Lower-fidelity (per-tenant, not per-user) and always-on since
+	// the middleware is the gateway's auth precondition.
+	//
+	// WR-08 (REVIEW.md) — session principal + P2 write-ACL semantics:
+	//
+	// The fallback sets `Principal{Sub: tenantID.String()}` with an
+	// EMPTY `Roles` slice. P2 ACL policies that check
+	// `principal.sub in ["alice@example.com", ...]` will not match
+	// the tenant UUID, so they deny. P2 policies that read
+	// `principal.role(principal, "writer")` will see the empty
+	// roles list and deny.
+	//
+	// NET EFFECT: a session-only request (no mTLS, no JWT Bearer)
+	// is ALWAYS DENIED by any P2 ACL that requires a sub allow-list
+	// OR a role. This is intentional fail-closed for Phase 1 —
+	// production deployments MUST configure mTLS or upstream JWT
+	// for per-user attribution. Operators that want
+	// session-principal commits to pass MUST author tenant-scoped
+	// P1/P2 policies that explicitly include the tenant UUID in
+	// their allow-list.
+	//
+	// Phase 2 may surface a clearer 401 ("session principal lacks
+	// role claims; configure mTLS or upstream JWT") instead of the
+	// 403 that policy denial produces.
 	if tenantID, ok := tenant.IDFromContext(r.Context()); ok {
 		return &Principal{Sub: tenantID.String()}, SourceSession, nil
 	}

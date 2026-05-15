@@ -229,6 +229,20 @@ func CommitHandler(deps Deps) http.HandlerFunc {
 		}
 
 		// Step 6 — catalog creds fetch (RLS-scoped via tenant ctx).
+		//
+		// WR-09 (REVIEW.md): `prefix` (taken from r.PathValue) is
+		// used as the catalog `nickname` for lookup. The nickname is
+		// operator-set (`prod-polaris`, `staging-nessie`, etc.) and
+		// is TENANT-VISIBLE in the URL. Phase 1 accepts this
+		// trade-off — the nickname is enumerable by anyone with
+		// tenant credentials, but the V0060 RLS predicate ensures
+		// only the calling tenant's rows are visible, so an attacker
+		// can only enumerate their OWN catalog nicknames (not other
+		// tenants'). Operators who consider catalog nicknames
+		// confidential should use opaque content-addressable
+		// identifiers (e.g., the SHA-256 prefix of the catalog
+		// config) instead of human-readable names. Phase 2 may
+		// switch to a content-addressable scheme by default.
 		cred, err := deps.CredStore.GetCatalogCredentials(r.Context(), prefix)
 		if err != nil {
 			if errors.Is(err, catalog.ErrCredentialsNotFound) {
@@ -464,9 +478,33 @@ func commitRequestToMap(c iceberg.CommitRequest) map[string]any {
 // principalToMap converts the gateway Principal to the CEL inputs map.
 // Field names follow the OIDC convention (`sub` / `email`) so policy
 // authors who know JWT claims can write `principal.sub` directly.
+//
+// WR-02: principalToMap MUST receive a non-nil principal. The
+// handler validates via validatePrincipalNotEmpty before reaching
+// here; a nil arrival is a programming bug. Returning a
+// fully-populated zero-value map (rather than an empty one or
+// panicking) means any P2 policy that reads `principal.sub` evaluates
+// `"" == expected_sub` → false → fail-closed deny. This is the
+// correct defence-in-depth shape (no panic, no silent "missing key"
+// CEL error masquerading as ErrPolicyEvalFailed).
 func principalToMap(p *Principal) map[string]any {
 	if p == nil {
-		return map[string]any{}
+		// Defence-in-depth: emit a zero-value map shape so CEL
+		// expressions like `principal.sub == "alice"` evaluate to
+		// false (the empty string compares unequal to any non-empty
+		// sub) — yielding a deterministic deny rather than a CEL
+		// "no such key" error that the evaluator would wrap as
+		// ErrPolicyEvalFailed → 503. A 403 here would be more
+		// useful to the operator but requires plumbing a deny
+		// signal through; the zero-value shape is the cheapest
+		// safe fallback. The handler's
+		// validatePrincipalNotEmpty check makes this branch
+		// unreachable in production paths.
+		return map[string]any{
+			"sub":   "",
+			"email": "",
+			"roles": []any{},
+		}
 	}
 	roles := make([]any, 0, len(p.Roles))
 	for _, r := range p.Roles {

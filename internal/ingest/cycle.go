@@ -28,11 +28,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/neksur-com/neksur/internal/graph"
 )
+
+// cycleMaxDepth is the D-001.08 cycle-detection depth bound. Mirrors
+// the `*1..5` literal in cypherCycleCheck. Extracted as a constant
+// (WR-06) so fetchCyclePath's loop bound stays in sync with the
+// Cypher template — a future depth change updates one place.
+const cycleMaxDepth = 5
 
 // cypherCycleCheck walks ancestors of $target_uri via bounded
 // `[:LINEAGE_OF*1..5]` (D-001.08 — the ONLY permitted bounded form for
@@ -158,7 +165,7 @@ func validateNoCycleTx(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) er
 func fetchCyclePath(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) []string {
 	chain := []string{tgtURI}
 	current := tgtURI
-	for hop := 0; hop < 5; hop++ {
+	for hop := 0; hop < cycleMaxDepth; hop++ {
 		// Find the next downstream node from `current`.
 		cy := fmt.Sprintf(
 			`MATCH (n {iceberg_id: '%s'})-[:LINEAGE_OF]->(next) RETURN next.iceberg_id LIMIT 1`,
@@ -171,6 +178,14 @@ func fetchCyclePath(ctx context.Context, tx pgx.Tx, srcURI, tgtURI string) []str
 		var raw string
 		row := tx.QueryRow(ctx, q)
 		if err := row.Scan(&raw); err != nil {
+			// WR-06: surface scan failures so SREs see truncated
+			// cycle reconstructions rather than silent fallthrough.
+			// We log + break (still return a best-effort cycle so
+			// the LineageCycleError carries at least the
+			// source/target context — the caller cannot recover
+			// the full chain at this point).
+			slog.Warn("ingest.fetchCyclePath: scan failed; reporting truncated cycle",
+				"src", srcURI, "tgt", tgtURI, "hop", hop, "current", current, "err", err)
 			break
 		}
 		next := stripAgtypeQuotes(raw)
@@ -209,7 +224,14 @@ func stripAgtypeQuotes(s string) string {
 // `nodes(path)` list-comprehension form panics on edge cases. Left
 // here for any future caller that needs to parse an AGE list-of-strings
 // agtype form (e.g., the Phase 1 admin UI).
-func parseCyclePath(raw []byte, srcURI, tgtURI string) []string {
+//
+// WR-05 (REVIEW.md): on JSON unmarshal failure, returns
+// (nil, error) so callers can distinguish "parser failed" from
+// "valid cycle whose path happens to be [src, tgt, src]". The
+// previous shape returned a 3-element fallback that was
+// indistinguishable from a valid 3-hop cycle — a foot-gun for any
+// future caller that re-activates this path.
+func parseCyclePath(raw []byte, srcURI, tgtURI string) ([]string, error) {
 	s := string(raw)
 	// Strip ::list / ::path / ::array suffix.
 	for _, suffix := range []string{"::list", "::path", "::array"} {
@@ -220,12 +242,13 @@ func parseCyclePath(raw []byte, srcURI, tgtURI string) []string {
 	}
 	var out []string
 	if err := json.Unmarshal([]byte(s), &out); err != nil {
-		return []string{srcURI, tgtURI, srcURI}
+		return nil, fmt.Errorf("ingest: parse cycle path: unmarshal: %w (raw=%q)", err, raw)
 	}
 	// Append the closing src so the path reads as A → B → C → A
 	// (the cycle path query returns A → B → C; we append A).
 	if len(out) > 0 && out[len(out)-1] != srcURI {
 		out = append(out, srcURI)
 	}
-	return out
+	_ = tgtURI // tgtURI is preserved in the signature for future symmetry; not used in the close-the-cycle append.
+	return out, nil
 }

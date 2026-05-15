@@ -38,6 +38,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // defaultWorkers is the D-1.10 default — 4 goroutines per neksur-server
@@ -48,6 +49,21 @@ const defaultWorkers = 4
 // channelCapacity is the per-pool channel buffer size — absorbs short
 // trigger-source bursts. Phase 1 fixed; Phase 6 may make per-tenant.
 const channelCapacity = 256
+
+// seenTTL bounds the in-process dedup map's memory footprint
+// (REVIEW.md WR-04). Cross-replica dedup is the V0062 UNIQUE
+// constraint's job; this in-process cache is the cheap per-worker
+// optimization. After seenTTL, the entry is evicted so the same
+// metadata_location can re-trigger a scan if needed (which the
+// UNIQUE constraint catches if it was already scanned on this
+// replica).
+const seenTTL = 24 * time.Hour
+
+// seenSweepInterval is how often the eviction sweep runs. We do not
+// run a sweep per-call (the per-call critical path stays cheap);
+// instead, a separate goroutine (started by Run) wakes up every
+// seenSweepInterval and evicts entries older than seenTTL.
+const seenSweepInterval = 1 * time.Hour
 
 // Hit is one detection trigger emitted by a producer (poller / webhook /
 // s3events). MetadataLocation is the natural key for dedup.
@@ -97,7 +113,11 @@ type Scanner interface {
 type Pool struct {
 	workers int
 	in      chan Hit
-	seen    sync.Map // MetadataLocation → struct{}; in-process dedup
+	// WR-04: seen is keyed on MetadataLocation; the value is the
+	// time.Time when the entry was inserted, so a periodic eviction
+	// sweep can drop expired entries (preventing unbounded memory
+	// growth on long-running replicas).
+	seen    sync.Map // MetadataLocation → time.Time
 	scanner Scanner
 }
 
@@ -144,6 +164,14 @@ func (p *Pool) Workers() int {
 // Workers exit on ctx.Done regardless of channel state.
 func (p *Pool) Run(ctx context.Context) {
 	var wg sync.WaitGroup
+	// WR-04: launch the seen-map eviction sweep. Runs in its own
+	// goroutine so worker latency is unaffected.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.runSeenEviction(ctx)
+	}()
+
 	for i := 0; i < p.workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -164,6 +192,34 @@ func (p *Pool) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// runSeenEviction periodically evicts entries from p.seen that are
+// older than seenTTL. WR-04: bounds the in-process dedup cache's
+// memory footprint on long-running replicas.
+func (p *Pool) runSeenEviction(ctx context.Context) {
+	ticker := time.NewTicker(seenSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-seenTTL)
+			evicted := 0
+			p.seen.Range(func(k, v any) bool {
+				if t, ok := v.(time.Time); ok && t.Before(cutoff) {
+					p.seen.Delete(k)
+					evicted++
+				}
+				return true
+			})
+			if evicted > 0 {
+				slog.Debug("dispatch: seen-map eviction sweep",
+					"evicted", evicted, "ttl_hours", int(seenTTL.Hours()))
+			}
+		}
+	}
+}
+
 // processHit applies the per-MetadataLocation dedup + invokes the
 // scanner. Extracted for testability — the dedup branch is the load-
 // bearing in-process dedup invariant tested by
@@ -174,7 +230,9 @@ func (p *Pool) processHit(ctx context.Context, h Hit, workerID int) {
 			"worker", workerID, "source", h.Source)
 		return
 	}
-	if _, alreadySeen := p.seen.LoadOrStore(h.MetadataLocation, struct{}{}); alreadySeen {
+	// WR-04: store the current time so the eviction sweep can age
+	// entries out after seenTTL.
+	if _, alreadySeen := p.seen.LoadOrStore(h.MetadataLocation, time.Now()); alreadySeen {
 		slog.Debug("dispatch: in-process dedup hit",
 			"worker", workerID, "source", h.Source,
 			"meta_loc", h.MetadataLocation)

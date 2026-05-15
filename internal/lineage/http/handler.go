@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,6 +48,15 @@ import (
 // typical OpenLineage RunEvent with ~50 datasets + facets; pipelines
 // emitting larger events should split runs.
 const maxBodyBytes = 1 << 20
+
+// maxLineageCrossProduct caps `len(Inputs) * len(Outputs)` to prevent
+// a single OpenLineage RunEvent from triggering a quadratic-cost
+// MergeLineageEdge storm (WR-11). The default 1000 covers legitimate
+// fan-in / fan-out shapes (e.g., 50 inputs × 20 outputs) while
+// stopping a 10,000 × 10,000 = 100M-edge attack. Configurable via
+// NEKSUR_LINEAGE_MAX_CROSS_PRODUCT for operators with unusually wide
+// pipelines.
+const defaultMaxLineageCrossProduct = 1000
 
 // Handler constructs the POST /v1/lineage http.HandlerFunc. The
 // handler depends on:
@@ -98,6 +109,20 @@ func Handler(pool *pgxpool.Pool, ing *ingest.Service) http.HandlerFunc {
 		// Step 4 — validation.
 		if err := event.Validate(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Step 4a — WR-11: cap inputs/outputs cross-product. A
+		// malicious or buggy OpenLineage producer could submit a
+		// RunEvent with thousands of inputs × outputs producing a
+		// quadratic-cost MergeLineageEdge storm (each MERGE does its
+		// own pgx tx + advisory lock + cycle pre-check). Reject at
+		// validation time.
+		if cap := crossProductCap(); len(event.Inputs)*len(event.Outputs) > cap {
+			http.Error(w,
+				fmt.Sprintf("inputs × outputs (%d × %d) exceeds cap %d",
+					len(event.Inputs), len(event.Outputs), cap),
+				http.StatusBadRequest)
 			return
 		}
 
@@ -180,6 +205,19 @@ func Handler(pool *pgxpool.Pool, ing *ingest.Service) http.HandlerFunc {
 		// Step 7 — 202 Accepted (at-least-once semantics; RESEARCH line 823).
 		w.WriteHeader(http.StatusAccepted)
 	}
+}
+
+// crossProductCap returns the configured inputs × outputs upper
+// bound for a single RunEvent (WR-11). Reads NEKSUR_LINEAGE_MAX_CROSS_PRODUCT
+// once per call; an unset / invalid value falls back to
+// defaultMaxLineageCrossProduct (1000).
+func crossProductCap() int {
+	if raw := os.Getenv("NEKSUR_LINEAGE_MAX_CROSS_PRODUCT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxLineageCrossProduct
 }
 
 // persistInbox INSERTs the raw OpenLineage payload into the per-tenant

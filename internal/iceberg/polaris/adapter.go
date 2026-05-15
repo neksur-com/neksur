@@ -90,11 +90,19 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 	// Plan 01-02 Task 2; see SUMMARY for the deviation note).
 	// Production callers configure `cfg.Endpoint` to their Polaris
 	// catalog ROOT (e.g., `https://polaris.customer.com/api/catalog`).
+	// WR-07: the `credential` (containing the OAuth ClientSecret)
+	// is passed ONLY via rest.WithCredential — NOT through the
+	// `props` map below. iceberg-go's WithAdditionalProps stores the
+	// map verbatim on the catalog, and depending on the version it
+	// may surface props in debug logs / String() output. Keeping the
+	// secret behind the typed option (which the upstream lib treats
+	// as opaque credential material) confines its lifetime to the
+	// OAuth token exchange.
+	credential := cfg.ClientID + ":" + cfg.ClientSecret
 	props := icebergGo.Properties{
 		"uri":                                cfg.Endpoint,
 		"warehouse":                          cfg.Warehouse,
 		"oauth2-server-uri":                  cfg.Endpoint + "/v1/oauth/tokens",
-		"credential":                         cfg.ClientID + ":" + cfg.ClientSecret,
 		"scope":                              cfg.Scope,
 		"header.X-Iceberg-Access-Delegation": cfg.CredentialMode,
 	}
@@ -105,7 +113,7 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 	}
 
 	cat, err := rest.NewCatalog(ctx, "polaris", cfg.Endpoint,
-		rest.WithCredential(props["credential"]),
+		rest.WithCredential(credential),
 		rest.WithAuthURI(authURI),
 		rest.WithScope(cfg.Scope),
 		rest.WithWarehouseLocation(cfg.Warehouse),

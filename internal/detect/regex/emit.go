@@ -60,6 +60,19 @@ import (
 	"github.com/neksur-com/neksur/internal/tenant"
 )
 
+// ErrDetectionAlreadyEmittedByPeer is a sentinel returned by
+// EmitDetectionResults when the cross-replica Pitfall 10 dedup
+// constraint (V0062 UNIQUE on snapshot_metadata_location) fires —
+// another replica won the scan race and we silently no-op. Callers
+// distinguish "we emitted" from "we skipped" via errors.Is rather
+// than the previous "(runID, nil) where runID == ''" footgun
+// (REVIEW.md WR-13).
+//
+// Callers SHOULD check `errors.Is(err, ErrDetectionAlreadyEmittedByPeer)`
+// and treat it as a clean skip (debug log + return). Any OTHER
+// error is a real failure.
+var ErrDetectionAlreadyEmittedByPeer = errors.New("detect/regex: detection already emitted by peer replica")
+
 // adr007EmissionAuditAnchor preserves the canonical ADR-007 emission
 // shape this package implements. AGE 1.6's quirks force COALESCE-on-WITH-SET
 // and per-cypher-call MERGE dispatch in the live Cypher; this constant
@@ -328,7 +341,11 @@ func EmitDetectionResults(
 		return runID, fmt.Errorf("detect/regex: emit results: %w", emitErr)
 	}
 	if skipped {
-		return "", nil
+		// WR-13: return a sentinel error rather than the previous
+		// (runID="", err=nil) footgun. Callers use errors.Is to
+		// distinguish "skipped via cross-replica dedup" from
+		// "emitted with runID".
+		return "", ErrDetectionAlreadyEmittedByPeer
 	}
 	return runID, nil
 }
