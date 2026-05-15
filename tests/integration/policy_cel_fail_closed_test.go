@@ -5,11 +5,13 @@
 //
 // Three tests:
 //
-//   - TestGateway503OnCELPanic — a panicking custom binding triggers the
-//     defence-in-depth fail-closed path; assert ErrEvalPanic OR
-//     ErrPolicyEvalFailed surfaces (cel-go may catch the panic itself
-//     and convert to eval err — both paths are fail-closed at the
-//     gateway layer per CONTEXT D-1.09).
+//   - TestEvaluatorFailClosedOnCELPanic — a panicking custom binding
+//     triggers the defence-in-depth fail-closed path at the engine
+//     layer; assert ErrEvalPanic OR ErrPolicyEvalFailed surfaces (cel-go
+//     may catch the panic itself and convert to eval err — both paths
+//     are fail-closed at the gateway layer per CONTEXT D-1.09). The
+//     gateway-HTTP-level test for this path is TestGateway503OnCELPanic
+//     (Plan 01-06; gateway_503_unavailable_test.go).
 //
 //   - TestEvalErrorWrapsCompileFailure — malformed CEL surfaces as
 //     *EvalError wrapping ErrCompileFailed.
@@ -38,12 +40,24 @@ import (
 	"github.com/neksur-com/neksur/internal/tenant"
 )
 
-// TestGateway503OnCELPanic exercises the D-1.09 fail-closed path when a
-// custom binding panics. cel-go installs its own recover that converts
-// non-runtime.Error panics to eval errors; runtime.Error panics
-// propagate to our outer defer/recover. Either path satisfies the
-// fail-closed contract.
-func TestGateway503OnCELPanic(t *testing.T) {
+// TestEvaluatorFailClosedOnCELPanic exercises the D-1.09 fail-closed
+// path at the cel.Evaluator engine layer when a custom binding panics.
+// cel-go installs its own recover that converts non-runtime.Error
+// panics to eval errors; runtime.Error panics propagate to our outer
+// defer/recover. Either path satisfies the fail-closed contract.
+//
+// Plan 01-06 deviation [Rule 1 — naming collision]: the test was
+// originally named TestGateway503OnCELPanic in Plan 01-05 (which
+// scoped fail-closed only to the engine layer); Plan 01-06 added a
+// HTTP-level test that needed the same name. Renamed to make the
+// engine-vs-HTTP distinction explicit:
+//
+//   - TestEvaluatorFailClosedOnCELPanic (HERE) — engine-level: assert
+//     Evaluator.Evaluate returns wrapped ErrEvalPanic / ErrPolicyEvalFailed.
+//   - TestGateway503OnCELPanic (gateway_503_unavailable_test.go) —
+//     HTTP-level: assert the L1 gateway maps the engine error to
+//     503 + commit_rejected_total{reason=policy_engine_unavailable} increment.
+func TestEvaluatorFailClosedOnCELPanic(t *testing.T) {
 	// Custom env with a runtime.Error-panicking binding. We use nil
 	// pointer dereference because cel-go's internal recover re-throws
 	// runtime.Error panics — guaranteeing the panic reaches our outer
