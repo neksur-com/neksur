@@ -1,4 +1,4 @@
-h1:wn+VEkDWjbNos9bJTSk+bruZ0Q2gSBnAm5qOM50/H7Y=
+h1:JtCf+tHVqA4eZff6EBGHXqFgH4zOsUFtZIQAvZrcZ8k=
 V0001__enable_extensions.sql h1:vLn0FGCx878mDASxeCB9MHwKEcgBtlZ/dlRw090GUJI=
 V0030__rls_policies.sql h1:O44Noa3LnZB0HrZqQevcQ6TG321MmXBojnAxtepbrcA=
 V0041__public_tenants.sql h1:qfAsr2JISeClAQyXPdVZckMryOlkj1j709njt3UI/M4=
@@ -8,3 +8,10 @@ V0044__public_tenant_lookup_fn.sql h1:1gejF1RVt1SCl/6P+b9/5FSBCVN0mLotKvyUjdUpB9
 V0050__tenant_audit_log.sql h1:YR7fHHz/1ZqT0BTWz9Lqilv3iW2syUwpp0iHoAQNLms=
 V0051__tenant_query_history.sql h1:v/P1MzUlha9eX3S8ZA0aiUHvb/B6XrwxXa8wqT2CKpE=
 V0052__tenant_policies.sql h1:qrRUUwH5Atzs7tXcVtJ8MwvpHXcpeH4OPf4BMLxyod8=
+V0060__tenant_catalog_credentials.sql h1:IOtM8+m66sRAbN9XzLboOf5R1VtLYZgOD7eHFuE59EY=
+V0061__tenant_policy_cache.sql h1:b4dXxACfTUml0wJ3QuE5oa0GtEs9mXK8NK9bgjUGgMQ=
+V0062__tenant_detection_runs.sql h1:vKn9nyrJvUxdCTui5FRwtAnoeM2YzK9HNpoAtsMxgO4=
+V0063__tenant_lineage_inbox.sql h1:726WTIIu/u0c8o5utk1N+FMMY1DQS8X8GvjFsvQFcPk=
+V0064__tenant_iceberg_staging.sql h1:K8nEdgQbgqT/HOZ8LjILT6swZORH1BPu8jmB0PAg3Jc=
+V0065__tenant_audit_log_extension.sql h1:BMbYyx91JOcQxolCxYI+DlGMqqD/RtXWSNd9QjhZyKg=
+V0066__tenant_rls_phase1.sql h1:vjFXT9SvVE+Pcy6VuTExxSnyJy5EHl9rKAFrfKjZWFs=
