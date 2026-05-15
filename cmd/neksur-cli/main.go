@@ -36,12 +36,14 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Top-level dispatch — `tenant` is currently the only verb.
+	// Top-level dispatch — `tenant` / `polaris` / `policy` verbs.
 	switch os.Args[1] {
 	case "tenant":
 		os.Exit(dispatchTenant(ctx))
 	case "polaris":
 		os.Exit(dispatchPolaris(ctx))
+	case "policy":
+		os.Exit(dispatchPolicy(ctx))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -50,6 +52,41 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// dispatchPolicy routes `policy <verb>` subcommands. Plan 01-09 Task 3
+// adds the first verb: `compile` (CEL syntax dogfood for SecOps
+// policy authors before they push policy text to the per-tenant
+// graph — Pitfall 7 mitigation per CONTEXT line 84).
+func dispatchPolicy(ctx context.Context) int {
+	if len(os.Args) < 3 {
+		policyUsage()
+		return 2
+	}
+	verb := os.Args[2]
+	subArgs := os.Args[3:]
+	switch verb {
+	case "compile":
+		return runPolicyCompile(ctx, subArgs)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown policy verb: %q\n", verb)
+		policyUsage()
+		return 2
+	}
+}
+
+func policyUsage() {
+	fmt.Fprint(os.Stderr, `Usage:
+  neksur-cli policy <verb> [flags]
+
+Verbs:
+  compile  Validate a CEL policy file against the L1 gateway env (Plan 01-09)
+
+Exit codes:
+  0  Policy compiles cleanly.
+  1  CEL syntax error / undeclared binding (wrapped cel.ErrCompileFailed).
+  2  Usage error / file missing / unreadable.
+`)
 }
 
 // dispatchPolaris routes `polaris <verb>` subcommands. Plan 01-07
@@ -121,6 +158,7 @@ func usage() {
 Usage:
   neksur-cli tenant <verb> [flags]
   neksur-cli polaris <verb> [flags]
+  neksur-cli policy <verb> [flags]
 
 Tenant verbs:
   create             Create public.tenants row + AGE create_graph + per-tenant role
@@ -135,6 +173,9 @@ Tenant verbs:
 
 Polaris verbs:
   webhook-register   Register Neksur as a Polaris webhook subscriber (Plan 01-07)
+
+Policy verbs:
+  compile            Validate a CEL policy file against the L1 gateway env (Plan 01-09)
 
 Environment:
   DATABASE_URL         Admin pool DSN (required)
