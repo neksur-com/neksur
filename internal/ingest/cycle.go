@@ -62,6 +62,19 @@ const cypherCycleCheck = `MATCH (target {iceberg_id: '%s'})-[:LINEAGE_OF*1..5]->
 // nil is returned when no cycle would be introduced (the common case).
 // A non-LineageCycleError is returned for transport/auth failures.
 func ValidateNoCycle(ctx context.Context, gc *graph.GraphClient, tenantID, srcURI, tgtURI string) error {
+	// CR-01 entry-point validation: standalone callers (not routed
+	// through MergeLineageEdge's check) get the same defence-in-depth
+	// rejection. Cypher-unsafe input cannot reach the per-package
+	// escapeCypher defence-in-depth panic.
+	for _, field := range []struct{ name, value string }{
+		{"src_uri", srcURI},
+		{"tgt_uri", tgtURI},
+		{"tenant_id", tenantID},
+	} {
+		if _, err := graph.SanitizeCypherLiteral(field.value); err != nil {
+			return fmt.Errorf("ingest: validate no cycle: unsafe %s: %w", field.name, err)
+		}
+	}
 	return gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		return validateNoCycleTx(ctx, tx, srcURI, tgtURI)
 	})

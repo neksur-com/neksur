@@ -24,7 +24,6 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -115,6 +114,22 @@ func (s *Service) MergeSnapshot(ctx context.Context, tenantID string, snap icebe
 	if snap.MetadataLocation == "" {
 		return fmt.Errorf("ingest: merge snapshot: empty metadata_location (D-1.04 natural key required)")
 	}
+	// CR-01 entry-point validation: reject Cypher-unsafe inputs BEFORE
+	// any graph mutation. snap.MetadataLocation flows from the
+	// upstream catalog's commit response (server-controlled) AND from
+	// L3 dispatch Hits (poller/webhook/s3-events, attacker-influenced
+	// for the webhook path). tenantID is server-controlled (validated
+	// UUID) but we re-check defensively. Operation/etc. are
+	// server-controlled but routed through the same defence-in-depth.
+	for _, field := range []struct{ name, value string }{
+		{"metadata_location", snap.MetadataLocation},
+		{"tenant_id", tenantID},
+		{"operation", snap.Operation},
+	} {
+		if _, err := graph.SanitizeCypherLiteral(field.value); err != nil {
+			return fmt.Errorf("ingest: merge snapshot: unsafe %s: %w", field.name, err)
+		}
+	}
 	committedAt := time.UnixMilli(snap.TimestampMs).UTC().Format(time.RFC3339Nano)
 	// Args order matches the Cypher template:
 	//   metadata_location, tenant_id (inline map),
@@ -148,21 +163,32 @@ func (s *Service) MergeSnapshot(ctx context.Context, tenantID string, snap icebe
 	})
 }
 
-// escapeCypher single-quote-escapes a string literal for safe inlining
-// into a Cypher MERGE/MATCH body. AGE's `cypher()` SQL function takes
-// the Cypher body as a dollar-quoted text literal, so the only escape
-// needed is the single quote (Cypher's string delimiter). Inputs with
-// embedded `$$` would still be safe because we wrap with `$$ %s $$` —
-// but to be defensive we also reject NULs and CR/LF that could break
-// the wrapping shape.
+// escapeCypher validates a caller-supplied string for safe inlining
+// into a Cypher single-quoted string literal inside an AGE
+// `cypher('graph', $$ ... $$)` dollar-quoted block.
 //
-// This is the per-package safe-escape helper used by all MERGE
-// templates in this package; do NOT use fmt.Sprintf("'%s'", ...)
-// directly with caller-supplied strings.
+// CR-01 mitigation: routes through graph.MustSanitizeCypherLiteral —
+// the canonical Phase 1 defence is a strict allowlist of ASCII
+// letters/digits/URI-safe punctuation; characters that could break
+// out of the inner Cypher string literal OR the outer dollar-quoted
+// PostgreSQL text literal (`'`, `"`, `\`, `$`, `{`, `}`, `;`, CR/LF,
+// NUL, tab, non-ASCII) are REJECTED.
+//
+// This function panics on unsafe input — it is a defence-in-depth
+// chokepoint. All untrusted caller inputs (OpenLineage URIs,
+// Iceberg table/namespace identifiers, principal subjects) MUST be
+// validated at the HTTP/handler boundary BEFORE reaching this
+// function. A panic here surfaces a programming bug: an entry-point
+// validator was missed. The HTTP-layer validation is in:
+//
+//   - internal/lineage/http/handler.go (OpenLineage URIs).
+//   - internal/gateway/iceberg/handler.go (identifierRegex on path
+//     segments; principal sub validated by upstream auth chain).
+//   - internal/ingest/lineage.go::MergeLineageEdge (entry-point
+//     validation for direct callers bypassing the HTTP handler).
+//
+// Production code paths cannot reach this panic; tests that pass
+// unsafe input deliberately should expect a panic.
 func escapeCypher(s string) string {
-	// Disallow control characters that could break out of the
-	// dollar-quoted block (NULs are also rejected by Postgres text I/O).
-	s = strings.ReplaceAll(s, "\x00", "")
-	// Single-quote escape per Cypher syntax (double the quote).
-	return strings.ReplaceAll(s, "'", "\\'")
+	return graph.MustSanitizeCypherLiteral(s)
 }

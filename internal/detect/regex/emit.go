@@ -51,7 +51,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -169,6 +168,30 @@ func EmitDetectionResults(
 	}
 	if strategy == "" {
 		strategy = "regex"
+	}
+	// CR-01 entry-point validation. snapMetaLoc flows from the L3
+	// dispatch Hit, which the Polaris webhook receiver populates from
+	// the (HMAC-verified) request body. Reject Cypher-unsafe input
+	// here so a malformed/attacker-crafted metadata_location returns
+	// a clean error instead of panicking in escapeCypher.
+	if _, err := graph.SanitizeCypherLiteral(snapMetaLoc); err != nil {
+		return "", fmt.Errorf("detect/regex: emit results: unsafe metadata_location: %w", err)
+	}
+	if _, err := graph.SanitizeCypherLiteral(strategy); err != nil {
+		return "", fmt.Errorf("detect/regex: emit results: unsafe strategy: %w", err)
+	}
+	for i, f := range findings {
+		for _, field := range []struct{ name, value string }{
+			{"column_name", f.ColumnName},
+			{"tag_id", f.TagID},
+			{"tag_name", f.TagName},
+			{"tag_category", f.TagCategory},
+			{"match_type", f.MatchType},
+		} {
+			if _, err := graph.SanitizeCypherLiteral(field.value); err != nil {
+				return "", fmt.Errorf("detect/regex: emit results: unsafe finding[%d].%s: %w", i, field.name, err)
+			}
+		}
 	}
 
 	runID = uuid.New().String()
@@ -324,11 +347,18 @@ func execAGE(ctx context.Context, tx pgx.Tx, cypher, op string) error {
 	return nil
 }
 
-// escapeCypher single-quote-escapes a string literal for safe inlining
-// into a Cypher MERGE/MATCH body. Mirrors internal/ingest's escapeCypher
-// + internal/gateway/iceberg's escapeCypher exactly — duplicated here
-// to avoid a cross-package dependency.
+// escapeCypher validates a caller-supplied string for safe inlining
+// into a Cypher single-quoted string literal inside an AGE
+// `cypher('graph', $$ ... $$)` dollar-quoted block.
+//
+// CR-01 mitigation: routes through graph.MustSanitizeCypherLiteral
+// (strict allowlist of ASCII letters/digits/URI-safe punctuation;
+// rejects `'`, `"`, `\`, `$`, `{`, `}`, `;`, CR/LF, NUL, tab,
+// non-ASCII). Inputs come from L3 dispatch Hits (poller + Polaris
+// webhook + S3 events) — the webhook path is attacker-influenced via
+// HMAC-verified payload. EmitDetectionResults adds an entry-point
+// validation guard so a malformed metadata_location returns a clean
+// error instead of panicking here.
 func escapeCypher(s string) string {
-	s = strings.ReplaceAll(s, "\x00", "")
-	return strings.ReplaceAll(s, "'", "\\'")
+	return graph.MustSanitizeCypherLiteral(s)
 }

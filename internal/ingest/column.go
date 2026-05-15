@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/iceberg"
 )
 
@@ -78,6 +79,28 @@ const cypherMergeHasColumnEdge = `MATCH (s:Snapshot {metadata_location: '%s'}), 
 func (s *Service) MergeColumns(ctx context.Context, tenantID, snapMetaLoc string, columns []iceberg.SchemaField) error {
 	if snapMetaLoc == "" {
 		return fmt.Errorf("ingest: merge columns: empty snapshot metadata_location")
+	}
+	// CR-01 entry-point validation. snapMetaLoc + tenantID + each
+	// column's name/type/doc are spliced into Cypher via the
+	// per-package escapeCypher (defence-in-depth panic guard). Reject
+	// any Cypher-unsafe value here so direct callers (tests, future
+	// schedulers) get a clean error instead of a panic.
+	if _, err := graph.SanitizeCypherLiteral(snapMetaLoc); err != nil {
+		return fmt.Errorf("ingest: merge columns: unsafe metadata_location: %w", err)
+	}
+	if _, err := graph.SanitizeCypherLiteral(tenantID); err != nil {
+		return fmt.Errorf("ingest: merge columns: unsafe tenant_id: %w", err)
+	}
+	for i, col := range columns {
+		for _, field := range []struct{ name, value string }{
+			{"name", col.Name},
+			{"type", col.Type},
+			{"doc", col.Doc},
+		} {
+			if _, err := graph.SanitizeCypherLiteral(field.value); err != nil {
+				return fmt.Errorf("ingest: merge columns: unsafe column[%d].%s: %w", i, field.name, err)
+			}
+		}
 	}
 	if len(columns) == 0 {
 		// Empty batch is allowed (empty-schema Snapshot edge case);
@@ -153,6 +176,10 @@ func (s *Service) MergeColumns(ctx context.Context, tenantID, snapMetaLoc string
 // ErrSnapshotNotFound if no Snapshot row with the given
 // metadata_location exists in the current tenant scope.
 func (s *Service) assertSnapshotExists(ctx context.Context, tenantID, snapMetaLoc string) error {
+	// CR-01 defence-in-depth: snapMetaLoc is spliced into Cypher.
+	if _, err := graph.SanitizeCypherLiteral(snapMetaLoc); err != nil {
+		return fmt.Errorf("ingest: assert snapshot exists: unsafe metadata_location: %w", err)
+	}
 	return s.gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		cypher := fmt.Sprintf(
 			"MATCH (s:Snapshot { metadata_location: '%s' }) RETURN id(s) LIMIT 1",

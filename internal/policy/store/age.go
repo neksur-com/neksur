@@ -208,13 +208,19 @@ func joinNamespace(parts []string) string {
 	return strings.Join(parts, ".")
 }
 
-// escapeCypher single-quote-escapes a string for safe inlining into a
-// Cypher MATCH/MERGE body — same shape as internal/ingest's
-// escapeCypher, duplicated here to avoid a cross-package dependency
-// (the policy/store package should not import internal/ingest).
+// escapeCypher validates a caller-supplied string for safe inlining
+// into a Cypher single-quoted string literal inside an AGE
+// `cypher('graph', $$ ... $$)` dollar-quoted block.
+//
+// CR-01 mitigation: routes through graph.MustSanitizeCypherLiteral
+// (strict allowlist of ASCII letters/digits/URI-safe punctuation;
+// rejects `'`, `"`, `\`, `$`, `{`, `}`, `;`, CR/LF, NUL, tab,
+// non-ASCII). Inputs are ref.Name + joinNamespace(ref.Namespace),
+// both gated by the gateway's identifierRegex
+// `^[a-zA-Z0-9_-]+$` before reaching this package — a panic here
+// surfaces a programming bug: an entry-point validator was bypassed.
 func escapeCypher(s string) string {
-	s = strings.ReplaceAll(s, "\x00", "")
-	return strings.ReplaceAll(s, "'", "\\'")
+	return graph.MustSanitizeCypherLiteral(s)
 }
 
 // stripAgtypeQuotes removes the JSON-style surrounding quotes, any AGE

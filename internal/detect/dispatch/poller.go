@@ -26,7 +26,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -172,10 +171,18 @@ func freshSnapshots(
 	since string,
 ) ([]Hit, error) {
 	var hits []Hit
+	// CR-01 mitigation: `since` is a server-generated RFC3339Nano
+	// timestamp, but defence-in-depth requires we route it through
+	// graph.MustSanitizeCypherLiteral instead of the legacy
+	// `strings.ReplaceAll(since, "'", "\\'")` (which is the broken
+	// pattern called out by REVIEW.md CR-01). A future timestamp-format
+	// change that emits non-allowlist characters would panic here
+	// (programming bug) rather than silently open an injection vector.
+	safeSince := graph.MustSanitizeCypherLiteral(since)
 	err := gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		stmt := fmt.Sprintf(
 			`MATCH (s:Snapshot) WHERE s.committed_at > '%s' RETURN s.metadata_location LIMIT %d`,
-			strings.ReplaceAll(since, "'", "\\'"),
+			safeSince,
 			pollerMaxPerTenant,
 		)
 		q := fmt.Sprintf(

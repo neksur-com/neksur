@@ -35,6 +35,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/ingest"
 	"github.com/neksur-com/neksur/internal/tenant"
 )
@@ -100,6 +101,37 @@ func Handler(pool *pgxpool.Pool, ing *ingest.Service) http.HandlerFunc {
 			return
 		}
 
+		// Step 4b — CR-01 entry-point Cypher-injection guard.
+		//
+		// Dataset.URI() flows from attacker-controlled JSON body
+		// (`{namespace}://{name}` with both fields straight from the
+		// request payload). Reject any URI / Run ID containing
+		// Cypher-unsafe characters BEFORE the inbox INSERT and BEFORE
+		// MergeLineageEdge (which routes through AGE cypher()
+		// splicing). graph.SanitizeCypherLiteral's allowlist is
+		// permissive of legitimate OpenLineage URI characters
+		// (namespaces, names, paths, query strings) but rejects `'`,
+		// `"`, `\`, `$`, `{`, `}`, `;`, CR/LF, NUL, tab, non-ASCII —
+		// the canonical Cypher-injection vectors per REVIEW.md CR-01.
+		// Reject early (400) so the inbox is never polluted with
+		// payloads that the downstream MERGE would reject anyway.
+		for _, ds := range event.Inputs {
+			if _, err := graph.SanitizeCypherLiteral(ds.URI()); err != nil {
+				http.Error(w, "invalid OpenLineage payload: unsafe input dataset URI", http.StatusBadRequest)
+				return
+			}
+		}
+		for _, ds := range event.Outputs {
+			if _, err := graph.SanitizeCypherLiteral(ds.URI()); err != nil {
+				http.Error(w, "invalid OpenLineage payload: unsafe output dataset URI", http.StatusBadRequest)
+				return
+			}
+		}
+		if _, err := graph.SanitizeCypherLiteral(event.Run.RunID); err != nil {
+			http.Error(w, "invalid OpenLineage payload: unsafe run id", http.StatusBadRequest)
+			return
+		}
+
 		// Step 5 — Pitfall 5 durability: INSERT into lineage_inbox
 		// FIRST with ON CONFLICT DO NOTHING. The UNIQUE (producer,
 		// run_id) constraint (V0063) swallows duplicates.
@@ -119,6 +151,7 @@ func Handler(pool *pgxpool.Pool, ing *ingest.Service) http.HandlerFunc {
 		if err != nil {
 			ts = time.Now().UTC()
 		}
+
 		for _, in := range event.Inputs {
 			for _, out := range event.Outputs {
 				srcURI := in.URI()

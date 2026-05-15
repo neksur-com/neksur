@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/neksur-com/neksur/internal/graph"
 )
 
 // cypherMergeLineageEdge is the Phase 1 LINEAGE_OF MERGE template
@@ -50,6 +52,24 @@ const cypherMergeLineageEdge = `MATCH (src),(tgt) WHERE src.iceberg_id = '%s' AN
 func (s *Service) MergeLineageEdge(ctx context.Context, tenantID, srcURI, tgtURI, runID string, ts time.Time) error {
 	if srcURI == "" || tgtURI == "" {
 		return fmt.Errorf("ingest: merge lineage edge: %w", ErrLineageBatchEmpty)
+	}
+	// CR-01 entry-point validation: srcURI and tgtURI flow from
+	// OpenLineage Dataset.URI() (attacker-controlled per RESEARCH +
+	// REVIEW.md CR-01). Reject any Cypher-unsafe character BEFORE
+	// the value reaches escapeCypher (which is a defence-in-depth
+	// panic guard). The HTTP receiver in internal/lineage/http/handler.go
+	// also validates upfront so callers see a clean 400 — this
+	// secondary check covers direct callers (tests, future internal
+	// drivers).
+	for _, field := range []struct{ name, value string }{
+		{"src_uri", srcURI},
+		{"tgt_uri", tgtURI},
+		{"tenant_id", tenantID},
+		{"run_id", runID},
+	} {
+		if _, err := graph.SanitizeCypherLiteral(field.value); err != nil {
+			return fmt.Errorf("ingest: merge lineage edge: unsafe %s: %w", field.name, err)
+		}
 	}
 	if srcURI == tgtURI {
 		// Self-edges are trivially cycles (length 1). Reject before
