@@ -279,12 +279,27 @@ func EmitWriteEvent(
 		// principal_source / commit_request_hash columns (with CHECK
 		// constraints). The actor_user_id is the principal sub for
 		// continuity with Phase 0.5 audit shapes.
+		//
+		// Schema qualification: ExecuteInTenant uses the GraphClient's
+		// pool whose BeforeAcquire hook sets `search_path = ag_catalog,
+		// "$user", public` (so AGE Cypher operators resolve). This does
+		// NOT include the tenant's per-tenant schema, so an unqualified
+		// `audit_log` INSERT would fail with `relation does not exist`.
+		// We schema-qualify to `tenant_<uuid>.audit_log` so the Open
+		// Question 4 same-tx-as-graph-emission contract holds without
+		// a search_path-twiddling round-trip inside the audit tx.
+		// pgx.Identifier.Sanitize() handles the schema-name escaping
+		// (the schema name is computed from a validated UUID per
+		// internal/tenant/id.go::SchemaName so it is identifier-safe).
 		bodyHashHex := hex.EncodeToString(bodyHash[:])
 		bodyHashBytes, _ := hex.DecodeString(bodyHashHex)
-		_, err := tx.Exec(ctx, `
-			INSERT INTO audit_log (occurred_at, actor_user_id, event_type, payload, decision, principal_source, commit_request_hash)
+		schema := tenant.SchemaName(tenantID)
+		auditTable := pgx.Identifier{schema, "audit_log"}.Sanitize()
+		insertSQL := fmt.Sprintf(`
+			INSERT INTO %s (occurred_at, actor_user_id, event_type, payload, decision, principal_source, commit_request_hash)
 			VALUES (now(), $1, 'iceberg_commit', $2::jsonb, $3, $4, $5)
-		`, principal.Sub, string(payload), decision, string(principalSrc), bodyHashBytes)
+		`, auditTable)
+		_, err := tx.Exec(ctx, insertSQL, principal.Sub, string(payload), decision, string(principalSrc), bodyHashBytes)
 		if err != nil {
 			return fmt.Errorf("gateway: emit audit_log: %w", err)
 		}

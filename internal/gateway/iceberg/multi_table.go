@@ -147,7 +147,8 @@ func MultiTableCommitHandler(deps Deps) http.HandlerFunc {
 		}
 
 		// Step 7 — adapter build (one adapter; all refs route through it).
-		adapter, err := BuildAdapter(r.Context(), cred)
+		// Production: BuildAdapter; tests may inject Deps.AdapterFactory.
+		adapter, err := deps.adapterFor(r.Context(), cred)
 		if err != nil {
 			slog.Error("gateway: multi-table adapter build failed", "err", err, "kind", cred.Kind)
 			http.Error(w, "catalog adapter build failed", http.StatusInternalServerError)

@@ -106,26 +106,50 @@ var (
 // escapeCypher) or the upstream catalog.
 var identifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// AdapterBuilder is the per-request adapter construction surface. The
+// production wiring uses BuildAdapter (forwarder.go) which dispatches
+// V0060 creds to polaris/nessie/glue_stub/unity_stub. Tests can inject
+// a fake builder returning a stub iceberg.IcebergCatalogClient so the
+// gateway's 10-step pipeline can be exercised end-to-end without a
+// live Polaris testcontainer + working STS infrastructure (Plan 01-02
+// deviation #4 — CreateTable + STS deferred).
+type AdapterBuilder func(ctx context.Context, creds *catalog.Credentials) (iceberg.IcebergCatalogClient, error)
+
 // Deps is the constructor-injected dependency bag for the gateway
 // handlers. Construct ONCE at neksur-server startup and pass the value
 // (NOT a pointer) to CommitHandler / MultiTableCommitHandler.
 //
-// All fields are required:
-//   - Pool        — the AGE-aware pgxpool (used by audit_log + creds).
-//   - Graph       — the graph.GraphClient (used by audit emission +
-//                   policy store).
-//   - CredStore   — catalog.Repo for V0060 lookups.
-//   - PolicyStore — store.AGEStore for P1/P2/P3 policy fetch.
-//   - Evaluator   — cel.Evaluator for fail-closed policy evaluation.
-//   - IngestSvc   — ingest.Service for post-commit snapshot ingest
-//                   (best-effort; failure does not roll back commit).
+// All fields except AdapterFactory are required:
+//   - Pool          — the AGE-aware pgxpool (used by audit_log + creds).
+//   - Graph         — the graph.GraphClient (used by audit emission +
+//                     policy store).
+//   - CredStore     — catalog.Repo for V0060 lookups.
+//   - PolicyStore   — store.AGEStore for P1/P2/P3 policy fetch.
+//   - Evaluator     — cel.Evaluator for fail-closed policy evaluation.
+//   - IngestSvc     — ingest.Service for post-commit snapshot ingest
+//                     (best-effort; failure does not roll back commit).
+//   - AdapterFactory — optional; defaults to BuildAdapter (forwarder.go).
+//                     Tests inject a fake to bypass the live Polaris/Nessie
+//                     CreateTable + STS dependency.
 type Deps struct {
-	Pool        *pgxpool.Pool
-	Graph       *graph.GraphClient
-	CredStore   *catalog.Repo
-	PolicyStore *store.AGEStore
-	Evaluator   *cel.Evaluator
-	IngestSvc   *ingest.Service
+	Pool           *pgxpool.Pool
+	Graph          *graph.GraphClient
+	CredStore      *catalog.Repo
+	PolicyStore    *store.AGEStore
+	Evaluator      *cel.Evaluator
+	IngestSvc      *ingest.Service
+	AdapterFactory AdapterBuilder
+}
+
+// adapterFor resolves the per-request adapter — Deps.AdapterFactory if
+// non-nil, else BuildAdapter (the production default). Centralised so
+// the test injection path doesn't need to fork CommitHandler /
+// MultiTableCommitHandler.
+func (d Deps) adapterFor(ctx context.Context, creds *catalog.Credentials) (iceberg.IcebergCatalogClient, error) {
+	if d.AdapterFactory != nil {
+		return d.AdapterFactory(ctx, creds)
+	}
+	return BuildAdapter(ctx, creds)
 }
 
 // CommitHandler returns the http.HandlerFunc for the single-table
@@ -216,8 +240,9 @@ func CommitHandler(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// Step 7 — adapter build.
-		adapter, err := BuildAdapter(r.Context(), cred)
+		// Step 7 — adapter build (production: BuildAdapter; tests may
+		// inject Deps.AdapterFactory to substitute a stub adapter).
+		adapter, err := deps.adapterFor(r.Context(), cred)
 		if err != nil {
 			if errors.Is(err, catalog.ErrCatalogKindUnsupported) ||
 				errors.Is(err, catalog.ErrConfigUnmarshal) {
