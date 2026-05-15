@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // recordingScanner is a Scanner stub that records every Scan call.
@@ -195,26 +197,111 @@ func TestSignBodyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestIsValidTenantUUID — UUID format strictness.
-func TestIsValidTenantUUID(t *testing.T) {
+// TestWebhookHandler_UnifiedUnauthorizedResponse — REVIEW.md CR-02
+// mandates that EVERY pre-HMAC auth-failure path returns the SAME
+// status (401) and IDENTICAL body. This prevents the
+// tenant-enumeration oracle: attackers cannot distinguish
+// "tenant exists but no Polaris" from "tenant doesn't exist" from
+// "signature mismatch" via response content.
+//
+// We test the public-visible response shape across these failure
+// modes:
+//   - missing X-Polaris-Signature header
+//   - missing X-Polaris-Tenant header
+//   - malformed tenant UUID
+//
+// The "secret-lookup-failed / no-row" and "HMAC-mismatch" cases
+// require a real pool, so they live in the integration tier; the
+// failure-discrimination contract is documented in webhook.go's
+// WebhookHandler comment.
+func TestWebhookHandler_UnifiedUnauthorizedResponse(t *testing.T) {
+	t.Setenv("NEKSUR_POLARIS_WEBHOOK_ENABLED", "1")
+	handler := WebhookHandler(nil, make(chan Hit, 1))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{
+			name:    "missing_signature_header",
+			headers: map[string]string{polarisTenantHeader: "11111111-1111-4111-8111-111111111111"},
+		},
+		{
+			name:    "missing_tenant_header",
+			headers: map[string]string{polarisSignatureHeader: "deadbeef"},
+		},
+		{
+			name: "malformed_tenant_uuid",
+			headers: map[string]string{
+				polarisTenantHeader:    "not-a-uuid",
+				polarisSignatureHeader: "deadbeef",
+			},
+		},
+	}
+
+	bodies := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(`{}`))
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("status = %d; want 401 (CR-02 unified-auth-failure response)", resp.StatusCode)
+			}
+			buf := make([]byte, 256)
+			n, _ := resp.Body.Read(buf)
+			bodyStr := strings.TrimSpace(string(buf[:n]))
+			bodies = append(bodies, bodyStr)
+		})
+	}
+
+	// All bodies MUST be identical — that's the CR-02 contract.
+	for i := 1; i < len(bodies); i++ {
+		if bodies[i] != bodies[0] {
+			t.Errorf("body[%d]=%q != body[0]=%q (CR-02 demands identical body for all pre-HMAC failures)",
+				i, bodies[i], bodies[0])
+		}
+	}
+}
+
+// TestTenantUUIDValidation — REVIEW.md CR-06 mandates canonical
+// uuid.Parse() (rather than the hand-rolled isValidTenantUUID). This
+// test asserts the same accept/reject contract holds through the
+// canonical parser. Keeping the test prevents regressions on the
+// security-critical validation boundary.
+func TestTenantUUIDValidation(t *testing.T) {
 	good := []string{
 		"11111111-1111-4111-8111-111111111111",
 		"a1b2c3d4-e5f6-4789-8abc-def012345678",
 	}
 	for _, s := range good {
-		if !isValidTenantUUID(s) {
-			t.Errorf("isValidTenantUUID rejected good UUID %q", s)
+		if _, err := uuid.Parse(s); err != nil {
+			t.Errorf("uuid.Parse(%q): expected success, got err: %v", s, err)
 		}
 	}
+	// uuid.Parse is more permissive than the hand-rolled validator —
+	// it accepts dash-stripped, URN, and braced forms. The CR-06
+	// contract is "use canonical uuid.Parse"; any string it accepts
+	// is by definition a valid UUID. The rejects below are obviously
+	// malformed strings that no UUID form would normalize to.
 	bad := []string{
 		"not-a-uuid",
-		"11111111111141118111111111111111", // missing dashes
 		"; DROP TABLE catalog_credentials --",
 		"11111111-1111-4111-8111-11111111111z", // bad hex char
+		"",                                     // empty
+		"a1b2c3d4-e5f6-4789-8abc",              // truncated
 	}
 	for _, s := range bad {
-		if isValidTenantUUID(s) {
-			t.Errorf("isValidTenantUUID accepted bad input %q", s)
+		if _, err := uuid.Parse(s); err == nil {
+			t.Errorf("uuid.Parse(%q): expected error, got nil", s)
 		}
 	}
 }
