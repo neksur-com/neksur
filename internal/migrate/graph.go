@@ -164,6 +164,17 @@ func ApplyTenantGraph(ctx context.Context, pool *pgxpool.Pool, schemaName string
 	}
 
 	for _, e := range entries {
+		// Skip Phase 0 baseline migrations — they were applied globally
+		// at cluster setup (e.g., testfixture.Start during integration,
+		// the operator runbook in production). Re-applying them per-tenant
+		// errors out with "graph already exists" (SQLSTATE 3F000) because
+		// V0010 issues `SELECT create_graph('neksur')` and 'neksur' is
+		// the single shared graph (per-tenant isolation is enforced by
+		// the tenant_id property + RLS on the label tables, not by
+		// distinct AGE graph names).
+		if e.version <= Phase0GraphBaselineVersion {
+			continue
+		}
 		if applied[e.version] {
 			continue
 		}

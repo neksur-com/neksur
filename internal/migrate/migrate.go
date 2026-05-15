@@ -190,6 +190,18 @@ func ApplyPublic(ctx context.Context, dsn string) error {
 // calls, apply only versions > N that aren't already recorded".
 const TenantBaselineVersion = PublicMaxVersion
 
+// Phase0GraphBaselineVersion is the highest graph migration version
+// applied globally during Phase 0 setup (V0010 create_graph + labels,
+// V0020 property indexes, V0025 tenant + GIN indexes — all applied
+// once at cluster bootstrap, not per-tenant). ApplyTenantGraph SKIPS
+// any embedded file whose version is <= this baseline so per-tenant
+// runs don't try to recreate the global `neksur` graph (SQLSTATE 3F000
+// "graph already exists").
+//
+// When new Phase 0 graph migrations land (none are planned post-Phase 1),
+// this constant must move with them.
+const Phase0GraphBaselineVersion = "0025"
+
 // Phase1MaxVersion is the highest expected version number for Phase 1
 // per-tenant relational migrations (V0060–V0066 added in Plan 01-01).
 // Used by tests and the cmd/migrate tenant-loop high-water-mark

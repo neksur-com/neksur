@@ -29,10 +29,14 @@ import (
 )
 
 // PolarisImage is the canonical Apache Polaris release image for Phase 1.
-// The `incubating` suffix tracks Polaris's pre-graduation versioning;
-// when Polaris graduates from incubator (Apache TLP) the tag will drop
-// the suffix.
-const PolarisImage = "apache/polaris:1.4.0-incubating"
+//
+// Deviation note (Plan 01-01 Task 3 Rule 1): the plan referenced the
+// tag `apache/polaris:1.4.0-incubating` but Apache Polaris graduated
+// from the Incubator before that release was published, so the actual
+// Docker Hub tag is `apache/polaris:1.4.0` (the `-incubating` suffix
+// was dropped). 1.3.0-incubating is the last incubating-suffixed
+// build; 1.4.0+ ships without the suffix.
+const PolarisImage = "apache/polaris:1.4.0"
 
 // polarisHTTPPort is the Iceberg REST + admin API port inside the container.
 const polarisHTTPPort = "8181/tcp"
@@ -64,9 +68,21 @@ func StartPolaris(ctx context.Context) (*PolarisContainer, error) {
 			// test-only and never reach a production runtime.
 			"POLARIS_BOOTSTRAP_CREDENTIALS": "root,test-admin,test-secret",
 		},
-		WaitingFor: wait.ForHTTP("/api/v1/health").
+		// Polaris's `/api/catalog/v1/config` endpoint requires an OAuth
+		// bearer token (401 unauthenticated). 401 means the server is
+		// fully routing requests — the OAuth token endpoint at
+		// /api/catalog/v1/oauth/tokens is also up. We treat 401 (and
+		// 200, just in case Polaris ever relaxes auth on /config) as
+		// "ready". The Polaris bundle does expose a health endpoint
+		// on the separate management port 8182, but that requires
+		// publishing a second port to the host — the 401-tolerant probe
+		// on 8181 is simpler and equally diagnostic.
+		WaitingFor: wait.ForHTTP("/api/catalog/v1/config").
 			WithPort(polarisHTTPPort).
-			WithStartupTimeout(120 * time.Second),
+			WithStartupTimeout(180 * time.Second).
+			WithStatusCodeMatcher(func(status int) bool {
+				return status == 200 || status == 401
+			}),
 	}
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,

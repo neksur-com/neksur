@@ -28,7 +28,13 @@ import (
 
 // NessieImage is the canonical Project Nessie image for Phase 1 — pinned
 // at 0.100.0 (D-1.02 reference; Nessie's API v2 is stable from 0.80+).
-const NessieImage = "projectnessie/nessie:0.100.0"
+//
+// Deviation note (Plan 01-01 Task 3 Rule 1): the plan referenced
+// `projectnessie/nessie:0.100.0` (Docker Hub) but Project Nessie
+// stopped publishing to Docker Hub after 0.76.6 and moved newer
+// releases to ghcr.io. Image identity is unchanged; only the registry
+// prefix differs.
+const NessieImage = "ghcr.io/projectnessie/nessie:0.100.0"
 
 // nessieHTTPPort is the REST API port inside the Nessie container.
 const nessieHTTPPort = "19120/tcp"
@@ -97,31 +103,73 @@ func (n *NessieContainer) Terminate(ctx context.Context) error {
 }
 
 // CreateBranch forks a new branch off `main` at its current HEAD. The
-// function is idempotent — a 409 response (branch exists) is treated
-// as success. Tests that want sub-branches per t.Name can call this
-// directly with an arbitrary name.
+// function is idempotent — a 409 response (branch already exists) is
+// treated as success. Tests that want sub-branches per t.Name can
+// call this directly with an arbitrary name.
 //
-// Uses Nessie's REST v2: POST /api/v2/trees with body
-// `{"type":"BRANCH","name":"<branch>"}`. The `sourceRefName` /
-// `sourceHash` defaults to main / head when omitted.
+// Nessie's REST v2 create-reference shape requires a two-step approach
+// because the API splits the new-ref identity (query params) from the
+// source-ref identity (body):
+//
+//	1. GET /api/v2/trees/main          → extract main's current hash
+//	2. POST /api/v2/trees?type=BRANCH&name=<newname>
+//	   with body {"type":"BRANCH","name":"main","hash":"<mainHash>"}
+//
+// The body is the SOURCE reference (where the new branch forks from),
+// NOT the new branch's identity. This caught the Plan 01-01 BLOCKING
+// run by surprise; the old single-step shape returned 400 with
+// "createReference.type: must not be null". The split contract is
+// documented in Nessie's OpenAPI but easy to miss because the body
+// looks like it should describe the new branch.
 func (n *NessieContainer) CreateBranch(ctx context.Context, name string) error {
+	// (1) Read main's current head hash.
+	mainReq, err := http.NewRequestWithContext(ctx, "GET", n.Endpoint+"/api/v2/trees/main", nil)
+	if err != nil {
+		return fmt.Errorf("nessie create_branch: build main req: %w", err)
+	}
+	mainResp, err := http.DefaultClient.Do(mainReq)
+	if err != nil {
+		return fmt.Errorf("nessie create_branch: read main: %w", err)
+	}
+	defer mainResp.Body.Close()
+	if mainResp.StatusCode != 200 {
+		rb, _ := io.ReadAll(mainResp.Body)
+		return fmt.Errorf("nessie create_branch: GET main: status %d body %s", mainResp.StatusCode, string(rb))
+	}
+	var mainOut struct {
+		Reference struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+			Hash string `json:"hash"`
+		} `json:"reference"`
+	}
+	if err := json.NewDecoder(mainResp.Body).Decode(&mainOut); err != nil {
+		return fmt.Errorf("nessie create_branch: decode main: %w", err)
+	}
+	if mainOut.Reference.Hash == "" {
+		return fmt.Errorf("nessie create_branch: main reference returned empty hash")
+	}
+
+	// (2) Create the new branch with type+name in query, source in body.
 	body, _ := json.Marshal(map[string]any{
 		"type": "BRANCH",
-		"name": name,
+		"name": "main",
+		"hash": mainOut.Reference.Hash,
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST", n.Endpoint+"/api/v2/trees", bytes.NewReader(body))
+	createURL := fmt.Sprintf("%s/api/v2/trees?type=BRANCH&name=%s", n.Endpoint, name)
+	createReq, err := http.NewRequestWithContext(ctx, "POST", createURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("nessie create_branch: build req: %w", err)
+		return fmt.Errorf("nessie create_branch: build create req: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
 	if err != nil {
 		return fmt.Errorf("nessie create_branch: do: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 200 || resp.StatusCode == 201 || resp.StatusCode == 409 {
+	defer createResp.Body.Close()
+	if createResp.StatusCode == 200 || createResp.StatusCode == 201 || createResp.StatusCode == 409 {
 		return nil
 	}
-	rb, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("nessie create_branch(%s): status %d body %s", name, resp.StatusCode, string(rb))
+	rb, _ := io.ReadAll(createResp.Body)
+	return fmt.Errorf("nessie create_branch(%s): status %d body %s", name, createResp.StatusCode, string(rb))
 }
