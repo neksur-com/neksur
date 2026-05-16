@@ -33,12 +33,14 @@
 package cel
 
 import (
+	"context"
 	"regexp"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
+	"github.com/google/cel-go/interpreter"
 )
 
 // registerManifestFunctions returns the cel.EnvOption slice that wires
@@ -125,14 +127,23 @@ func registerManifestFunctions() []cel.EnvOption {
 			),
 		),
 		// principal.attribute(principal map, name string) string
-		// D-2.10 ABAC fetch. Layer 1 (OIDC claims via
-		// principal["claims"]) is honoured by this binding in
-		// isolation; Layers 2 (graph HAS_ATTRIBUTE) + 3
-		// (tenant_default_attributes) become reachable when Plan
-		// 02-04 wires the AttributeResolver via Inputs and enriches
-		// the principal map. Returns "" (never errors) when the
-		// attribute is unset across all reachable layers — Pitfall 8
-		// null-safety.
+		// D-2.10 ABAC fetch — 3-layer fallback (OIDC claims → graph
+		// HAS_ATTRIBUTE → tenant_default_attributes). Layer 1 is
+		// honoured here in isolation; Layers 2+3 are reached via the
+		// principalAttributeDecorator() ProgramOption registered in
+		// env.go, which wraps every call site with an activation-aware
+		// Interpretable that pulls the AttributeResolver + context.Context
+		// from activation["__resolver"] / activation["__ctx"]. When the
+		// resolver is absent (e.g., unit tests with no Inputs.AttributeResolver),
+		// the decorator-wrapped Eval falls back to the Layer-1-only path
+		// implemented in principalAttributeFuncImpl — preserves backward
+		// compatibility with the Plan 02-03 test suite.
+		//
+		// CR-A2 fix (Plan 02-11): the binding shape is `FunctionBinding`
+		// (variadic-args) instead of `BinaryBinding` so the call site is
+		// dispatched through the same code path as
+		// `manifest.classification_satisfied` — required so the decorator's
+		// `InterpretableCall.Function()` check picks it up consistently.
 		cel.Function("principal.attribute",
 			cel.Overload("principal_attribute_map_string",
 				[]*cel.Type{
@@ -140,7 +151,7 @@ func registerManifestFunctions() []cel.EnvOption {
 					cel.StringType,
 				},
 				cel.StringType,
-				cel.BinaryBinding(principalAttributeImpl),
+				cel.FunctionBinding(principalAttributeFuncImpl),
 			),
 		),
 	}
@@ -324,24 +335,166 @@ func partitionSpecImpl(tableVal ref.Val) ref.Val {
 	return types.NewStringStringMap(types.DefaultTypeAdapter, out)
 }
 
-// principalAttributeImpl is the D-2.10 ABAC fetch entry-point. In
-// THIS plan (02-03), the binding honours **Layer 1** only — OIDC
-// claims that the gateway has already inlined into
-// `principal["claims"]` (a map[string]any keyed by claim name). When
-// Plan 02-04 lands the gateway-side wiring + the cel.Activation
-// enrichment that surfaces the AttributeResolver under
-// activation["__resolver"], that wiring will be threaded into this
-// binding (via an activation-aware variant — cel-go ProgramOption
-// `cel.CustomDecorator` or a closure-binding) to make Layers 2+3
-// reachable. Until then, callers that need the full 3-layer fetch
-// MUST use `(*store.AttributeResolver).Resolve` directly from the
-// gateway projection logic.
+// principalAttributeFuncImpl is the Layer-1-only fallback path used by
+// the decorator (principalAttributeDecorator) when the activation has
+// no AttributeResolver stashed under "__resolver" — e.g., unit tests
+// that construct an Evaluator without setting Inputs.AttributeResolver,
+// or pre-tenant request paths (the dev-mode /policy/preview endpoint).
+// It walks `principal["claims"][name]` and returns the value as a CEL
+// string, or "" on any miss / type mismatch.
 //
-// Returns "" (never errors) on any miss — D-2.10 Pitfall 8
-// null-safety: policy authors compare
-// `principal.attribute(principal, "region") == ""` to detect
-// "attribute is unset across every layer".
-func principalAttributeImpl(principalVal, nameVal ref.Val) ref.Val {
+// In the production path (Inputs.AttributeResolver != nil), this
+// function is NEVER called directly by the CEL runtime — the decorator
+// intercepts the call site and routes to AttributeResolver.Resolve,
+// which itself walks Layer 1 → 2 → 3 (D-2.10 contract). This function
+// remains registered as the binding's FunctionBinding because cel-go
+// requires every Overload to declare an executable binding for the
+// type-checker; the decorator wraps but does not replace the binding
+// at the EnvOption layer.
+//
+// Returns "" (never errors) on any miss — D-2.10 Pitfall 8 null-safety:
+// policy authors compare `principal.attribute(principal, "region") == ""`
+// to detect "attribute is unset across every layer". The wider
+// fail-closed contract at the Evaluate boundary (panic-recover) catches
+// any binding-level panic.
+//
+// CR-A2 fix (Plan 02-11): the signature changed from
+// `func(principalVal, nameVal ref.Val) ref.Val` (BinaryBinding) to
+// `func(args ...ref.Val) ref.Val` (FunctionBinding) so the call site
+// dispatches through the same Interpretable shape as
+// `manifest.classification_satisfied`. The Interpretable shape is the
+// hook the CustomDecorator wraps.
+func principalAttributeFuncImpl(args ...ref.Val) ref.Val {
+	if len(args) != 2 {
+		return types.String("")
+	}
+	pMap, ok := args[0].(traits.Mapper)
+	if !ok {
+		return types.String("")
+	}
+	nameStr, ok := args[1].Value().(string)
+	if !ok {
+		return types.String("")
+	}
+	return principalAttributeLayer1(pMap, nameStr)
+}
+
+// principalAttributeLayer1 implements the pure Layer-1 OIDC-claim walk
+// extracted as a function so both principalAttributeFuncImpl AND the
+// decorator's Resolver-absent fallback path share the same code (no
+// drift between the two miss-paths).
+func principalAttributeLayer1(pMap traits.Mapper, name string) ref.Val {
+	// Layer 1: OIDC claims under principal["claims"]. The gateway
+	// projects the principal's OIDC claims onto this sub-map BEFORE
+	// calling Evaluate.
+	claimsVal, found := pMap.Find(types.String("claims"))
+	if !found {
+		return types.String("")
+	}
+	claims, ok := claimsVal.Value().(map[string]any)
+	if !ok {
+		return types.String("")
+	}
+	v, ok := claims[name]
+	if !ok {
+		return types.String("")
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return types.String("")
+	}
+	return types.String(s)
+}
+
+// principalAttributeFunctionName is the textual function identifier
+// the CEL parser produces for `principal.attribute(principal, name)`
+// call sites. The decorator matches against this string when filtering
+// InterpretableCall nodes — a small constant kept colocated with the
+// binding registration so the matcher cannot drift independently of
+// the cel.Function() name.
+const principalAttributeFunctionName = "principal.attribute"
+
+// principalAttributeDecorator returns a cel.ProgramOption that wraps
+// every InterpretableCall to `principal.attribute` with an
+// activation-aware Eval. At program-construction time the decorator
+// receives the Interpretable instructions; for `principal.attribute`
+// it returns a wrapper whose Eval(activation) (a) reads the
+// AttributeResolver + context.Context from activation under reserved
+// keys `__resolver` / `__ctx`, (b) evaluates the call's two argument
+// Interpretables against the activation to obtain the live principal
+// map + name, (c) extracts the principal `sub` + OIDC claims map for
+// the resolver call, (d) invokes Resolver.Resolve which itself walks
+// Layer 1 → 2 → 3 and returns the first non-empty value (or "" on
+// all-miss — Pitfall 8). When the resolver is absent the wrapper
+// falls back to Layer-1-only via principalAttributeLayer1.
+//
+// CR-A2 closure (Plan 02-11 / iteration-1 CR-04): before this
+// decorator the binding registered via cel.BinaryBinding could not
+// reach the activation — `cel.BinaryBinding(impl)` calls `impl(lhs, rhs ref.Val)`
+// with the two arg values but no Activation handle. cel-go does not
+// surface the Activation through FunctionBinding either (only the
+// args). The activation handle is reachable only by intercepting at
+// the Interpretable layer — which is precisely what the
+// CustomDecorator hook is designed for. See cel-go v0.28.1
+// interpreter.InterpretableDecorator.
+func principalAttributeDecorator() cel.ProgramOption {
+	return cel.CustomDecorator(func(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+		call, ok := i.(interpreter.InterpretableCall)
+		if !ok {
+			return i, nil
+		}
+		if call.Function() != principalAttributeFunctionName {
+			return i, nil
+		}
+		// Wrap the call. The wrapper preserves ID() + delegates to the
+		// original call's args (Interpretables) for argument evaluation;
+		// it ONLY overrides Eval to route through the AttributeResolver.
+		return &principalAttributeInterpretable{inner: call}, nil
+	})
+}
+
+// principalAttributeInterpretable wraps the original
+// `principal.attribute` InterpretableCall to thread the activation
+// through to the AttributeResolver. Its Eval(activation) is the only
+// method that diverges from the wrapped node — ID() proxies through
+// for trace fidelity.
+type principalAttributeInterpretable struct {
+	inner interpreter.InterpretableCall
+}
+
+// ID returns the original call's expression id so any tracing /
+// cost-tracking overlay sees the wrapped node as the same node.
+func (w *principalAttributeInterpretable) ID() int64 { return w.inner.ID() }
+
+// Eval is the activation-aware path. Steps:
+//
+//  1. Resolve the two argument Interpretables against the activation
+//     to obtain the live principal map + the attribute name string.
+//  2. Look up the AttributeResolver + context.Context from the
+//     activation under reserved keys `__resolver` / `__ctx`. If
+//     either is absent the wrapper short-circuits to the Layer-1-only
+//     fallback (principalAttributeLayer1) so unit tests + dev-mode
+//     callers without a resolver still work.
+//  3. Project Layer-1 inputs: extract `principal["sub"]` as the
+//     principalSub argument and `principal["claims"]` (string→string
+//     coerced) as the oidcClaims argument. The resolver itself walks
+//     Layer 1 first (so Layer 1 wins over Layer 2+3 per D-2.10), then
+//     Layer 2 (graph), then Layer 3 (tenant default).
+//  4. Return the resolved value as types.String. All-miss returns ""
+//     — Pitfall 8 null-safety sentinel.
+//
+// Defence in depth: every error path on type assertion / lookup
+// returns types.String(""), never panic / never error — the broader
+// fail-closed contract at the Evaluate boundary catches anything that
+// does panic via defer/recover (D-1.09).
+func (w *principalAttributeInterpretable) Eval(activation interpreter.Activation) ref.Val {
+	args := w.inner.Args()
+	if len(args) != 2 {
+		return types.String("")
+	}
+	principalVal := args[0].Eval(activation)
+	nameVal := args[1].Eval(activation)
+
 	pMap, ok := principalVal.(traits.Mapper)
 	if !ok {
 		return types.String("")
@@ -351,26 +504,81 @@ func principalAttributeImpl(principalVal, nameVal ref.Val) ref.Val {
 		return types.String("")
 	}
 
-	// Layer 1: OIDC claims under principal["claims"]. The gateway
-	// (Plan 02-04) is responsible for projecting the principal's
-	// OIDC claims onto this sub-map BEFORE calling Evaluate.
-	claimsVal, found := pMap.Find(types.String("claims"))
-	if !found {
-		return types.String("")
+	// Look up resolver — absent → Layer-1-only fallback.
+	resolverVal, resolverFound := activation.ResolveName("__resolver")
+	if !resolverFound || resolverVal == nil {
+		return principalAttributeLayer1(pMap, nameStr)
+	}
+	resolver, ok := resolverVal.(AttributeResolver)
+	if !ok {
+		return principalAttributeLayer1(pMap, nameStr)
+	}
+	// Look up ctx — required for the resolver's Layer 2 / Layer 3 calls
+	// (they pull tenant.IDFromContext + run pgx queries). Absent →
+	// degrade to Layer-1-only rather than risk a nil-context panic.
+	ctxVal, ctxFound := activation.ResolveName("__ctx")
+	if !ctxFound || ctxVal == nil {
+		return principalAttributeLayer1(pMap, nameStr)
+	}
+	ctx, ok := ctxVal.(context.Context)
+	if !ok {
+		return principalAttributeLayer1(pMap, nameStr)
+	}
+
+	// Project the principal sub + OIDC claims.
+	principalSub := principalSubFromMap(pMap)
+	oidcClaims := oidcClaimsFromPrincipal(pMap)
+
+	// Resolver.Resolve walks Layer 1 → 2 → 3 per D-2.10. All-miss
+	// returns "" (Pitfall 8). Errors at Layer 2/3 are swallowed by
+	// the resolver (fail-soft on transient backend faults — see
+	// store/attribute.go doc).
+	v := resolver.Resolve(ctx, principalSub, nameStr, oidcClaims)
+	return types.String(v)
+}
+
+// principalSubFromMap extracts principal["sub"] as a string for the
+// resolver's principalSub argument. Returns "" if the key is absent
+// or the value is not a string — the resolver tolerates this (Layer 2
+// match with `sub: ''` finds nothing, and Layer 3 doesn't need the
+// sub at all).
+func principalSubFromMap(pMap traits.Mapper) string {
+	v, ok := pMap.Find(types.String("sub"))
+	if !ok || v == nil {
+		return ""
+	}
+	s, ok := v.Value().(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+// oidcClaimsFromPrincipal extracts principal["claims"] and coerces it
+// to map[string]string for the resolver's oidcClaims argument. The
+// resolver only treats non-empty string values as Layer-1 hits, so
+// non-string values are silently dropped — they couldn't have produced
+// a Layer-1 winner anyway.
+//
+// Returns an empty (but non-nil) map on any miss / type mismatch so
+// the resolver's Layer-1 check (`if v, ok := oidcClaims[name]; ok && v != ""`)
+// always operates on a valid map (no nil-map panic risk).
+func oidcClaimsFromPrincipal(pMap traits.Mapper) map[string]string {
+	out := map[string]string{}
+	claimsVal, ok := pMap.Find(types.String("claims"))
+	if !ok || claimsVal == nil {
+		return out
 	}
 	claims, ok := claimsVal.Value().(map[string]any)
 	if !ok {
-		return types.String("")
+		return out
 	}
-	v, ok := claims[nameStr]
-	if !ok {
-		return types.String("")
+	for k, v := range claims {
+		if s, ok := v.(string); ok && s != "" {
+			out[k] = s
+		}
 	}
-	s, ok := v.(string)
-	if !ok || s == "" {
-		return types.String("")
-	}
-	return types.String(s)
+	return out
 }
 
 // hasColumnImpl walks `table.schema.fields[*].name` and returns Bool(true)

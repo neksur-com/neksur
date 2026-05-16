@@ -119,7 +119,19 @@ func (c *Compiler) CompileOrGet(policyID, text string) (cel.Program, error) {
 	// cancellation / deadline-exceeded mid-evaluation. Without this the
 	// runtime cannot interrupt a `.all()` over a 10K-element ABAC claims
 	// array — the gateway event loop blocks until the loop finishes.
-	prog, err := c.env.Program(ast, cel.InterruptCheckFrequency(programInterruptCheckFrequency))
+	//
+	// CR-A2 closure (Plan 02-11): also pass principalAttributeDecorator()
+	// — a CustomDecorator ProgramOption that wraps every
+	// `principal.attribute(principal, name)` call site with an
+	// activation-aware Interpretable so the AttributeResolver stashed
+	// under activation["__resolver"] (eval.go:217-220) is actually
+	// reached, making Layers 2 (graph) + 3 (tenant defaults) of D-2.10
+	// observable from the CEL expression. Without this decorator the
+	// binding was Layer-1-only — iteration-2 review finding CR-A2.
+	prog, err := c.env.Program(ast,
+		cel.InterruptCheckFrequency(programInterruptCheckFrequency),
+		principalAttributeDecorator(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("cel: program policy %s: %w",
 			policyID, errors.Join(ErrCompileFailed, err))

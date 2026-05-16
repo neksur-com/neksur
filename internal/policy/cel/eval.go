@@ -202,18 +202,25 @@ func (e *Evaluator) Evaluate(ctx context.Context, p Policy, in *Inputs) (decisio
 		"commit":    in.Commit,
 		"principal": in.Principal,
 	}
-	// D-2.10 Layer 2/3 seam (Plan 02-03): inject the AttributeResolver
-	// + the calling context under reserved keys so the
-	// principal.attribute binding (functions.go) can reach beyond
-	// Layer 1 (OIDC claims). cel-go's UnaryBinding/BinaryBinding
-	// signature does not natively carry the cel.Activation, so we
-	// stash both behind reserved keys ("__resolver", "__ctx") that
-	// (a) start with double-underscore — a convention reserved for
-	// engine-internal slots, never declared as a CEL variable in
-	// env.go, so a policy author cannot accidentally collide; and
-	// (b) are nil-safe — when the gateway hasn't wired a resolver
-	// (e.g., unit tests, Plan 02-04 not yet integrated), the keys are
-	// simply absent and the binding falls back to Layer 1.
+	// D-2.10 Layer 2/3 seam (Plan 02-03 + CR-A2 closure Plan 02-11):
+	// inject the AttributeResolver + the calling context under reserved
+	// keys so the principal.attribute binding (functions.go) can reach
+	// beyond Layer 1 (OIDC claims). cel-go's UnaryBinding/BinaryBinding/
+	// FunctionBinding signatures do not natively carry the cel.Activation
+	// — none of them are passed the activation handle directly. The keys
+	// we stash here are consumed by `principalAttributeInterpretable.Eval`
+	// (functions.go), which is the decorator-wrapped Interpretable
+	// registered via `principalAttributeDecorator()` as a ProgramOption
+	// in compile.go's CompileOrGet. That decorator IS passed the
+	// activation at Eval time and uses `activation.ResolveName("__resolver")`
+	// / `activation.ResolveName("__ctx")` to recover the values stashed
+	// here. The reserved keys (a) start with double-underscore — a
+	// convention reserved for engine-internal slots, never declared as a
+	// CEL variable in env.go, so a policy author cannot accidentally
+	// collide; and (b) are nil-safe — when the gateway hasn't wired a
+	// resolver (e.g., unit tests, dev-mode /policy/preview), the keys are
+	// simply absent and the decorator-wrapped Eval falls back to
+	// Layer-1-only via principalAttributeLayer1.
 	if in.AttributeResolver != nil {
 		activation["__resolver"] = in.AttributeResolver
 		activation["__ctx"] = ctx
