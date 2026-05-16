@@ -62,15 +62,16 @@ type sessionPolicyStatement struct {
 // Parameters:
 //   - table: the Iceberg table ref to scope the policy to
 //   - region: the allowed AWS region (P4 data residency enforcement)
-//   - warehouse: the Polaris warehouse URI (e.g. "s3://bucket/prefix")
-//     used to derive the S3 bucket name
+//   - warehouse: the Polaris warehouse URI (MUST start with "s3://" —
+//     CR-06 hardening rejects bare strings and operator-typo'd values
+//     that would otherwise mint credentials against the wrong bucket).
 //
 // Returns the JSON-encoded policy bytes and an error if the bucket
 // cannot be derived from the warehouse URI.
 func BuildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byte, error) {
-	bucket := extractBucketFromWarehouse(warehouse)
-	if bucket == "" {
-		return nil, fmt.Errorf("%w: cannot derive S3 bucket from warehouse URI %q", ErrSessionPolicyMalformed, warehouse)
+	bucket, err := extractBucketFromWarehouse(warehouse)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrSessionPolicyMalformed, err)
 	}
 
 	tablePrefix := tableS3PrefixFromRef(table)
@@ -100,18 +101,22 @@ func BuildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byt
 }
 
 // extractBucketFromWarehouse extracts the S3 bucket name from a warehouse
-// URI. Handles both "s3://bucket/prefix" and bare "bucket/prefix" forms.
-// Returns empty string if the URI is empty or has no discernible bucket.
-func extractBucketFromWarehouse(warehouse string) string {
-	s := warehouse
-	if after, ok := strings.CutPrefix(s, "s3://"); ok {
-		s = after
+// URI. CR-06: the warehouse MUST start with "s3://" — bare strings and
+// non-S3 schemes are rejected so an operator typo cannot mint credentials
+// against the wrong account's bucket or build a malformed ARN that AWS
+// IAM treats as a wildcard match against the assumed-role's permission
+// boundary. The bucket must also be followed by a "/" path component so
+// "arn:aws:s3:::{bucket}/{prefix}/*" interpolates with a real prefix.
+func extractBucketFromWarehouse(warehouse string) (string, error) {
+	after, ok := strings.CutPrefix(warehouse, "s3://")
+	if !ok {
+		return "", fmt.Errorf("warehouse %q must start with s3:// — refusing to derive bucket", warehouse)
 	}
-	if idx := strings.Index(s, "/"); idx >= 0 {
-		return s[:idx]
+	idx := strings.Index(after, "/")
+	if idx <= 0 {
+		return "", fmt.Errorf("warehouse %q has no path component after bucket — refusing to derive bucket", warehouse)
 	}
-	// Bare bucket name with no prefix.
-	return s
+	return after[:idx], nil
 }
 
 // tableS3PrefixFromRef derives the S3 key prefix for a table by joining

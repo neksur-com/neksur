@@ -374,9 +374,13 @@ func withDelegationHeaders(ctx context.Context, sessionPolicyJSON string) contex
 // reflect.Slice.
 func buildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byte, error) {
 	// Derive the S3 ARN resource from the warehouse path and table ref.
-	// warehouse is typically "s3://bucket/prefix" — we extract the
-	// bucket and build the per-table path.
-	bucket := extractBucket(warehouse)
+	// warehouse MUST be "s3://bucket/prefix" — CR-06 rejects bare strings
+	// and operator-typo'd values that would otherwise mint credentials
+	// for the wrong bucket.
+	bucket, err := extractBucket(warehouse)
+	if err != nil {
+		return nil, fmt.Errorf("build session policy: %w", err)
+	}
 	tablePrefix := tableS3Prefix(table)
 	resource := fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, tablePrefix)
 
@@ -403,17 +407,22 @@ func buildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byt
 	return data, nil
 }
 
-// extractBucket extracts the S3 bucket name from a warehouse URI.
-// Supports "s3://bucket/prefix" and bare "bucket/prefix" forms.
-func extractBucket(warehouse string) string {
-	s := warehouse
-	if after, ok := strings.CutPrefix(s, "s3://"); ok {
-		s = after
+// extractBucket extracts the S3 bucket name from a warehouse URI. CR-06:
+// the warehouse MUST start with "s3://" and include a "/" path component
+// after the bucket. Bare strings ("bucket/prefix") and non-S3 schemes
+// are rejected with a wrapped error so an operator typo cannot cause
+// the L4 vending path to mint credentials against the wrong account's
+// bucket or a malformed ARN that AWS IAM treats as a wildcard match.
+func extractBucket(warehouse string) (string, error) {
+	after, ok := strings.CutPrefix(warehouse, "s3://")
+	if !ok {
+		return "", fmt.Errorf("polaris: warehouse %q must start with s3:// — refusing to derive bucket", warehouse)
 	}
-	if idx := strings.Index(s, "/"); idx >= 0 {
-		return s[:idx]
+	idx := strings.Index(after, "/")
+	if idx <= 0 {
+		return "", fmt.Errorf("polaris: warehouse %q has no path component after bucket — refusing to derive bucket", warehouse)
 	}
-	return s
+	return after[:idx], nil
 }
 
 // tableS3Prefix derives the S3 key prefix for a table from its TableRef.
