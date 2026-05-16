@@ -147,8 +147,18 @@ func (b *BatchCache) GetOrGenerate(tenantID, columnName, batchID string, generat
 
 	b.Set(tenantID, columnName, batchID, plaintext)
 
-	// Return a copy from Get to ensure consistent copy semantics.
-	return b.Get(tenantID, columnName, batchID), nil
+	// CR-08 fix: return a defensive copy of the generated plaintext
+	// directly rather than re-reading via b.Get. The previous code
+	// could return nil under LRU pressure: between Set and Get a
+	// concurrent Add from another (tenant,column,batchID) might evict
+	// this entry, in which case Get returned nil and the caller paid
+	// a redundant GenerateDataKey on retry — exactly the Pitfall 10
+	// condition this cache was built to prevent. Returning the
+	// in-hand plaintext guarantees the caller always gets the value
+	// it just generated, even if LRU evicts it before Get can re-read.
+	out := make([]byte, len(plaintext))
+	copy(out, plaintext)
+	return out, nil
 }
 
 // Len returns the current number of entries in the cache (for metrics /
