@@ -40,6 +40,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
@@ -63,6 +64,8 @@ import (
 	"github.com/neksur-com/neksur/internal/policy/compiler"
 	"github.com/neksur-com/neksur/internal/policy/compiler/dialect"
 	policystore "github.com/neksur-com/neksur/internal/policy/store"
+	"github.com/neksur-com/neksur/internal/sqlproxy"
+	sqlproxydialect "github.com/neksur-com/neksur/internal/sqlproxy/dialect"
 	"github.com/neksur-com/neksur/internal/tenant"
 )
 
@@ -293,7 +296,98 @@ func runWithSaasAuth(ctx context.Context) error {
 			slog.Error("policy/compiler/trigger: Listen exited", "err", err)
 		}
 	}()
-	_ = compiledStore // wired into Deps via the compiler; reserved for direct gateway reads in Plan 02-05+
+
+	// Plan 02-05 Wave 2 — sqlproxy mTLS listener wiring. The proxy lives
+	// on a SEPARATE listener (NEKSUR_SQLPROXY_ADDR; default :8443) per
+	// D-2.08; it is NOT mounted onto the main mux. The sqlproxy mux is
+	// wrapped in workosauth.TenantMiddleware before being served (CC1).
+	//
+	// Conditional start: if any of the three required mTLS env vars
+	// is unset, the listener is DISABLED and a structured log line is
+	// emitted. Phase 2 dev/test runs do not require mTLS material out
+	// of the box; integration tests inject real cert paths via the
+	// Phase2Fixture (tests/testfixture/mtls_cert.go).
+	var sqlProxyShutdown func(context.Context) error
+	{
+		sqlProxyCache, err := lru.New[sqlproxy.CacheKey, []byte](4096)
+		if err != nil {
+			return fmt.Errorf("sqlproxy cache: %w", err)
+		}
+		injectorDeps := sqlproxy.InjectorDeps{Store: compiledStore, Cache: sqlProxyCache}
+		trinoInjector, err := sqlproxydialect.BuildInjector("trino", injectorDeps)
+		if err != nil {
+			return fmt.Errorf("sqlproxy build trino: %w", err)
+		}
+		sparkInjector, err := sqlproxydialect.BuildInjector("spark", injectorDeps)
+		if err != nil {
+			return fmt.Errorf("sqlproxy build spark: %w", err)
+		}
+		dremioInjector, err := sqlproxydialect.BuildInjector("dremio", injectorDeps)
+		if err != nil {
+			return fmt.Errorf("sqlproxy build dremio: %w", err)
+		}
+		sqlInjectors := map[string]sqlproxy.Injector{
+			"trino":  trinoInjector,
+			"spark":  sparkInjector,
+			"dremio": dremioInjector,
+		}
+
+		certPath := os.Getenv("NEKSUR_TLS_CERT_PATH")
+		keyPath := os.Getenv("NEKSUR_TLS_KEY_PATH")
+		caBundlePath := os.Getenv("NEKSUR_CA_BUNDLE_PATH")
+		sqlProxyAddr := os.Getenv("NEKSUR_SQLPROXY_ADDR")
+		if sqlProxyAddr == "" {
+			sqlProxyAddr = ":8443"
+		}
+
+		if certPath == "" || keyPath == "" || caBundlePath == "" {
+			slog.Info("sqlproxy: mTLS material missing, listener disabled",
+				"cert_path_set", certPath != "",
+				"key_path_set", keyPath != "",
+				"ca_bundle_path_set", caBundlePath != "",
+			)
+		} else {
+			certWatcher, err := sqlproxy.NewCertWatcher(certPath, keyPath)
+			if err != nil {
+				return fmt.Errorf("sqlproxy cert watcher: %w", err)
+			}
+			go func() {
+				if err := certWatcher.Watch(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Error("sqlproxy: cert watcher exited", "err", err)
+				}
+			}()
+			tlsConfig, err := sqlproxy.NewTLSConfig(certWatcher, caBundlePath)
+			if err != nil {
+				return fmt.Errorf("sqlproxy tls config: %w", err)
+			}
+			sqlServer, err := sqlproxy.NewServer(sqlproxy.Deps{
+				Injectors: sqlInjectors,
+				TLSConfig: tlsConfig,
+				Logger:    slog.Default(),
+			})
+			if err != nil {
+				return fmt.Errorf("sqlproxy.NewServer: %w", err)
+			}
+			// Wrap sqlproxy mux in TenantMiddleware before serving
+			// (D-2.08 + Plan 02-05 spec). We bypass sqlServer.ListenAndServeTLS
+			// in favor of a locally-constructed *http.Server so the wrapper
+			// can interpose without modifying the sqlproxy package.
+			wrappedHandler := workosauth.TenantMiddleware(workosClient, tenantRepo)(sqlServer.Handler())
+			wrappedSrv := &http.Server{
+				Addr:              sqlProxyAddr,
+				Handler:           wrappedHandler,
+				TLSConfig:         tlsConfig,
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+			go func() {
+				slog.Info("sqlproxy: starting mTLS listener", "addr", sqlProxyAddr)
+				if err := wrappedSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+					slog.Error("sqlproxy: ListenAndServeTLS exited", "err", err)
+				}
+			}()
+			sqlProxyShutdown = wrappedSrv.Shutdown
+		}
+	}
 
 	// CR-03 fail-fast startup guard: refuse to boot if any active
 	// tenant is configured for a Phase-1-unsupported catalog kind
@@ -469,6 +563,9 @@ func runWithSaasAuth(ctx context.Context) error {
 		shutdownCtx, sc := context.WithTimeout(context.Background(), 5*time.Second)
 		defer sc()
 		_ = srv.Shutdown(shutdownCtx)
+		if sqlProxyShutdown != nil {
+			_ = sqlProxyShutdown(shutdownCtx)
+		}
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen: %w", err)
