@@ -102,9 +102,17 @@ func (c *Cache) Get(tenantID, namespace, tableName, region string) *iceberg.STSC
 	// treat as a cache miss so the caller refreshes before expiry (Anti-Pattern 3).
 	half := entry.issuedAt.Add(entry.expiresAt.Sub(entry.issuedAt) / 2)
 	if now.After(half) {
-		// Don't evict — let the stale entry serve any in-flight concurrent
-		// callers while the refresh is pending. The caller will Add the fresh
-		// entry which overwrites this one.
+		// WR-14: proactively evict on TTL/2 so concurrent callers do not
+		// repeatedly inflate l4_token_refresh_total against a stale
+		// entry. The original "let the stale entry serve in-flight
+		// callers" intent required actual single-flight (only the FIRST
+		// miss triggers the upstream call, others block on the result);
+		// no caller path implements that, so each concurrent Get just
+		// returned nil and triggered a redundant upstream
+		// IssueScopedSTSCredentials call. Eviction here forces the
+		// rolling N-1 callers to take a clean cache-miss path that the
+		// refresh-counter metric represents accurately.
+		c.c.Remove(key)
 		return nil
 	}
 	return entry.creds
