@@ -15,6 +15,7 @@ package polaris
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/neksur-com/neksur/internal/iceberg"
@@ -83,6 +84,16 @@ func parseVendedCreds(config map[string]string) (*iceberg.STSCredentials, error)
 				expiration = t.UTC()
 				parsed = true
 				break
+			}
+		}
+		// WR-04 fallback: Polaris 1.4 deployments observed emitting
+		// milliseconds-since-epoch (integer string) for session
+		// expiration in some preview builds. Try that shape only after
+		// every RFC3339-family layout has been exhausted.
+		if !parsed {
+			if ms, mErr := strconv.ParseInt(expirationStr, 10, 64); mErr == nil && ms > 0 {
+				expiration = time.UnixMilli(ms).UTC()
+				parsed = true
 			}
 		}
 		if !parsed {
