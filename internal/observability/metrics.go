@@ -78,3 +78,100 @@ var CommitRejectedTotal = promauto.NewCounterVec(
 	},
 	[]string{"reason"},
 )
+
+// ---------------------------------------------------------------------
+// Wave 2 / Plan 02-05 sqlproxy metrics — registered alongside the
+// Phase 1 commit_rejected_total counter. Three observables let SREs
+// dashboard the SQL-layer enforcement proxy independently of the
+// catalog gateway:
+//
+//   - SqlProxyOverheadMs (histogram, labeled by engine) — end-to-end
+//     handler latency in milliseconds. Buckets are tuned for the
+//     <100ms warm-path target (RESEARCH §Pattern 7 line 1184) with
+//     long-tail buckets so Phase 2 SREs can spot pathological cold-
+//     compile spikes (>1s = wrong; >10s = page).
+//   - SqlProxyLookupTotal (counter, labeled by engine + cache_status)
+//     — request count by cache outcome. cache_status is one of
+//     {hit, miss, error} — Injector implementations report verbatim
+//     via the CacheStatus* constants in internal/sqlproxy/injector.go.
+//     The 3-value cardinality is enforced at the call site (Go's type
+//     system can't constrain string labels); any drift surfaces as a
+//     new label-value time series on the dashboard.
+//   - SqlProxyInjectFailuresTotal (counter, labeled by engine + reason)
+//     — failure count by reason. reason is one of
+//     {policy_engine_unavailable, engine_not_supported, injection_failed}
+//     — mirrors the sqlproxy.Err* sentinels (errors.go) so the
+//     dashboard alert routing matches the HTTP status code mapping.
+//
+// Registration shape mirrors CommitRejectedTotal above: promauto
+// against the default registry so the existing /metrics endpoint
+// (graph/telemetry.go) serves the new families with no extra wiring.
+// ---------------------------------------------------------------------
+
+// Allowed sql_proxy_lookup_total cache_status label values. Re-exported
+// from internal/sqlproxy/injector.go's CacheStatus* constants so
+// non-sqlproxy callers (test code, ops tooling) can use the
+// observability package as the single import path for label values.
+const (
+	// CacheStatusHit — artifact served from the process-local LRU.
+	CacheStatusHit = "hit"
+	// CacheStatusMiss — artifact fetched from the CompiledStore.
+	CacheStatusMiss = "miss"
+	// CacheStatusError — cache layer threw; request proceeded
+	// against the store directly (best-effort fallback).
+	CacheStatusError = "error"
+)
+
+// Allowed sql_proxy_inject_failures_total reason label values.
+// Mirrors the sqlproxy.Err* sentinels (internal/sqlproxy/errors.go).
+const (
+	// ReasonSqlProxyPolicyEngineUnavailable — store fetch failed
+	// or artifact malformed (HTTP 503 mapping).
+	ReasonSqlProxyPolicyEngineUnavailable = "policy_engine_unavailable"
+	// ReasonSqlProxyEngineNotSupported — dialect dispatch returned
+	// ErrEngineNotSupported (HTTP 501 mapping).
+	ReasonSqlProxyEngineNotSupported = "engine_not_supported"
+	// ReasonSqlProxyInjectionFailed — per-dialect rewriter rejected
+	// the query (HTTP 422 mapping).
+	ReasonSqlProxyInjectionFailed = "injection_failed"
+)
+
+// SqlProxyOverheadMs is the end-to-end sqlproxy handler latency
+// histogram in milliseconds, labeled by engine. Buckets cover the
+// <100ms warm-path target (RESEARCH §Pattern 7) with long-tail
+// 1s / 5s / 10s buckets for pathological cold-compile detection.
+var SqlProxyOverheadMs = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name: "sql_proxy_overhead_ms",
+		Help: "End-to-end sqlproxy handler latency in milliseconds, " +
+			"by engine. Warm-path target <100ms; >1s buckets surface " +
+			"pathological cold-compile or store-fetch stalls.",
+		Buckets: []float64{5, 10, 25, 50, 100, 200, 500, 1000, 5000, 10000},
+	},
+	[]string{"engine"},
+)
+
+// SqlProxyLookupTotal counts sqlproxy handler dispatches by engine
+// + cache_status. cache_status MUST be one of CacheStatusHit /
+// CacheStatusMiss / CacheStatusError; callers use the constants above.
+var SqlProxyLookupTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "sql_proxy_lookup_total",
+		Help: "sqlproxy handler dispatches by engine + cache_status. " +
+			"Allowed cache_status: hit | miss | error.",
+	},
+	[]string{"engine", "cache_status"},
+)
+
+// SqlProxyInjectFailuresTotal counts sqlproxy injection failures by
+// engine + reason. reason MUST be one of the ReasonSqlProxy* constants
+// above (mirrors the sqlproxy.Err* sentinels).
+var SqlProxyInjectFailuresTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "sql_proxy_inject_failures_total",
+		Help: "sqlproxy injection failures by engine + reason. " +
+			"Allowed reasons: policy_engine_unavailable | " +
+			"engine_not_supported | injection_failed.",
+	},
+	[]string{"engine", "reason"},
+)
