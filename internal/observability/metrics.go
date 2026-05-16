@@ -70,6 +70,13 @@ const (
 //	    http.Error(w, decision.Reason, http.StatusForbidden)
 //	    return
 //	}
+//
+// WR-A3 contract: increment site is L1 catalog gateway ONLY
+// (internal/gateway/iceberg/handler.go + multi_table.go). Phase 2
+// sqlproxy uses sql_proxy_inject_failures_total for the analogous
+// signal — see WR-A3 in 02-REVIEW.md. Any new sqlproxy-side
+// CommitRejectedTotal.Inc() call must be rejected at code review
+// (it would re-introduce the paging-semantics drift WR-A3 closed).
 var CommitRejectedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "commit_rejected_total",

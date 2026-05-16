@@ -246,10 +246,13 @@ func (s *Server) handleInject(w http.ResponseWriter, r *http.Request) {
 		// Error → status mapping per package-doc table.
 		switch {
 		case errors.Is(ierr, ErrPolicyEngineUnavailable):
+			// WR-A3: do NOT increment commit_rejected_total here. That
+			// counter is documented as "L1 catalog gateway only" — the
+			// sqlproxy path emits sql_proxy_inject_failures_total instead
+			// so Phase 1 alert rules on commit_rejected_total are not
+			// perturbed by sqlproxy traffic (paging semantics stay honest).
 			observability.SqlProxyInjectFailuresTotal.
 				WithLabelValues(engine, observability.ReasonSqlProxyPolicyEngineUnavailable).Inc()
-			observability.CommitRejectedTotal.
-				WithLabelValues(observability.ReasonPolicyEngineUnavailable).Inc()
 			s.deps.Logger.Error("sqlproxy: policy engine unavailable",
 				"err", ierr, "engine", engine, "table", req.Table.Name)
 			http.Error(w, "policy engine unavailable", http.StatusServiceUnavailable)

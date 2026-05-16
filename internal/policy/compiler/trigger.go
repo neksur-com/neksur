@@ -186,10 +186,17 @@ func (t *Trigger) Listen(ctx context.Context) error {
 
 		// Fallback poller activates once we've been failing > 5min.
 		// Best-effort: a single scan of recent changes per cycle.
+		// WR-A8: log line demoted from Warn → Debug and the message
+		// is now explicit about the no-op nature, so an SRE reading
+		// the log does not mistakenly believe a real poll runs. The
+		// `no_op` field lets observability filters route on the
+		// property. Plan 02-05+ wires the real poll query; until
+		// then the LISTEN reconnect loop is authoritative.
 		if time.Since(lastSuccess) > pollerFallbackThreshold {
-			slog.Warn("policy/compiler/trigger: sustained failure, activating fallback poller",
-				"since", time.Since(lastSuccess))
-			t.pollOnce(ctx)
+			slog.Debug("policy/compiler/trigger: sustained failure, fallback poller is a no-op stub (Plan 02-05+ wires the real poll query); LISTEN reconnect loop remains authoritative",
+				"since", time.Since(lastSuccess),
+				"no_op", true)
+			t.pollOnceStub(ctx)
 		}
 
 		// Exponential backoff with cap.
@@ -308,14 +315,19 @@ func (t *Trigger) handleNotification(ctx context.Context, notif *pgconn.Notifica
 	}
 }
 
-// pollOnce is the sustained-failure fallback (Assumption A6). It is a
-// no-op placeholder in Phase 2 — the trigger is the authoritative
+// pollOnceStub is the sustained-failure fallback (Assumption A6). It is
+// a no-op placeholder in Phase 2 — the trigger is the authoritative
 // source. A future iteration will scan `policies` for
 // `changed_at > last_compile` per active tenant and emit the same
 // (tenantID, policyID) tuples through handleNotification. The
 // scaffolding lives here so a follow-up plan can land the polling
 // query without restructuring the supervisor loop.
-func (t *Trigger) pollOnce(ctx context.Context) {
+//
+// WR-A8: the `Stub` suffix is load-bearing — it signals at the call
+// site (and to anyone grepping for `pollOnce` expecting a real poll)
+// that THIS function does NOT actually poll. The renamed call site +
+// the demoted Debug log together close the SRE-misleading-log gap.
+func (t *Trigger) pollOnceStub(ctx context.Context) {
 	// Phase 2: placeholder. The Listen retry loop already covers most
 	// connection-drop scenarios; the dedicated poller is the safety
 	// net for the rare "trigger function disabled" / "pg restart with

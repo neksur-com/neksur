@@ -1,7 +1,11 @@
 // handler.go — HTTP handler for POST /v1/credvend/sts.
 //
 // Mounted behind workosauth.TenantMiddleware (matching Plan 02-05 pattern).
-// Fail-closed: any Service.Issue error → HTTP 503.
+// Fail-closed status code mapping (WR-A2):
+//   - Service.Issue returning ErrEngineNotSupported → HTTP 501 (catalog
+//     kind does not support STS vending; warn-not-page).
+//   - Service.Issue returning ErrCredVendUnavailable or any other error
+//     → HTTP 503 (vending path broken; page).
 //
 // Defense-in-depth:
 //   - tenant.IDFromContext check (CC1 — redundant with TenantMiddleware but
@@ -166,9 +170,24 @@ func Handler(deps Deps) http.Handler {
 				"is_unavailable", errors.Is(err, ErrCredVendUnavailable),
 				"is_not_supported", errors.Is(err, ErrEngineNotSupported),
 			)
-			// Fail-closed: any error → 503 (D-1.09 carryover).
-			observability.L4TokenFailuresTotal.WithLabelValues(adapter.Capabilities().Name, "issue_failed").Inc()
-			http.Error(w, "credential vending unavailable", http.StatusServiceUnavailable)
+			// WR-A2: distinguish 501 (engine does not support STS vending —
+			// configuration drift signal; warn-not-page) from 503 (vending
+			// path broken — incident signal; page). The earlier blanket
+			// 503 collapsed both into a single "always page" channel,
+			// hiding the configuration-vs-outage distinction operators
+			// need for triage. Per 02-REVIEW.md WR-A2 fix-option-b.
+			switch {
+			case errors.Is(err, ErrEngineNotSupported):
+				observability.L4TokenFailuresTotal.WithLabelValues(adapter.Capabilities().Name, "engine_not_supported").Inc()
+				http.Error(w, "credential vending: engine not supported", http.StatusNotImplemented)
+			case errors.Is(err, ErrCredVendUnavailable):
+				observability.L4TokenFailuresTotal.WithLabelValues(adapter.Capabilities().Name, "issue_failed").Inc()
+				http.Error(w, "credential vending unavailable", http.StatusServiceUnavailable)
+			default:
+				// Fail-closed: any unclassified error → 503 (D-1.09 carryover).
+				observability.L4TokenFailuresTotal.WithLabelValues(adapter.Capabilities().Name, "issue_failed").Inc()
+				http.Error(w, "credential vending unavailable", http.StatusServiceUnavailable)
+			}
 			return
 		}
 

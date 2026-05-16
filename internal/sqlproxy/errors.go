@@ -11,10 +11,12 @@ import "errors"
 // ErrPolicyEngineUnavailable signals a fail-closed condition: the
 // CompiledStore lookup failed (graph fetch error / agtype scan error)
 // or the active CompiledPolicy artifact is malformed. The HTTP
-// handler maps this to 503 + commit_rejected_total{reason=
-// "policy_engine_unavailable"} so the existing Phase 1 dashboards
-// surface the rejection alongside the L1 gateway's fail-closed path
-// (D-1.09 reuse).
+// handler maps this to 503 + sql_proxy_inject_failures_total{reason=
+// "policy_engine_unavailable"} (WR-A3: NOT commit_rejected_total —
+// that counter is L1-catalog-gateway-only so Phase 1 paging rules
+// stay honest). Dashboard the sqlproxy metric family in parallel
+// with the L1 gateway's commit_rejected_total to recover the
+// "policy engine outage spans both paths" view.
 var ErrPolicyEngineUnavailable = errors.New("sqlproxy: policy engine unavailable")
 
 // ErrEngineNotSupported signals the request path's `{engine}` segment

@@ -8,12 +8,16 @@
 // counter and does not page SREs — so a tenant configured for Dremio
 // would silently run queries with NO policy enforcement and zero
 // alerting. A fail-closed system must translate 'engine with no
-// emitter registered' to 503 + commit_rejected_total{
+// emitter registered' to 503 + sql_proxy_inject_failures_total{
 // reason='policy_engine_unavailable'} so the dashboard surfaces the
 // rejection.
 //
-// The injector now returns sqlproxy.ErrPolicyEngineUnavailable so the
-// server maps the request to 503 and the counter increments.
+// WR-A3: the counter family is the Phase 2 sqlproxy-side
+// sql_proxy_inject_failures_total (NOT commit_rejected_total — that is
+// L1-catalog-gateway-only; the duplicate increment was removed from
+// server.go in plan 02-10). The injector returns
+// sqlproxy.ErrPolicyEngineUnavailable so the server maps the request
+// to 503 and the sqlproxy counter increments.
 
 package dialect
 
@@ -41,9 +45,9 @@ func NewDremioInjector() *DremioInjector {
 // InjectPolicy is a Phase 2 fail-closed stub: every call returns
 // sqlproxy.ErrPolicyEngineUnavailable wrapped with a per-dialect
 // prefix. The sqlproxy server's error switch maps this to HTTP 503
-// AND increments commit_rejected_total{reason='policy_engine_unavailable'},
+// AND increments sql_proxy_inject_failures_total{reason='policy_engine_unavailable'},
 // so a tenant accidentally routed to a Dremio engine is fail-closed
-// AND visible on the SRE dashboard (CR-09).
+// AND visible on the SRE dashboard (CR-09 + WR-A3).
 //
 // Per Pitfall 11: no query body is read or logged on this path.
 func (i *DremioInjector) InjectPolicy(_ context.Context, _ string, _ sqlproxy.TableRef, _ sqlproxy.Claims) (string, string, error) {

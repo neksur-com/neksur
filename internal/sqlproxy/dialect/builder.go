@@ -23,8 +23,9 @@ import (
 //
 //   - "trino"  → NewTrinoInjector(deps.Store, deps.Cache)
 //   - "spark"  → NewSparkInjector(deps.Store, deps.Cache)
-//   - "dremio" → NewDremioInjector() (Phase 2 stub; returns 501
-//     at request time via iceberg.ErrAdapterStub)
+//   - "dremio" → NewDremioInjector() (Phase 2 fail-closed stub;
+//     returns 503 + sql_proxy_inject_failures_total{reason='policy_engine_unavailable'}
+//     at request time via sqlproxy.ErrPolicyEngineUnavailable — CR-09 + WR-A3)
 //
 // Any other engine kind returns a wrapped sqlproxy.ErrEngineNotSupported
 // so callers can branch via errors.Is and the wiring layer can either

@@ -20,7 +20,8 @@ import "errors"
 // ErrCredVendUnavailable mirrors ErrPolicyEngineUnavailable from Phase 1
 // D-1.09: the credential vending service is fail-closed — any upstream
 // error (Polaris unreachable, STS error, cache error) causes the handler
-// to return HTTP 503 to Spark, which then cannot write to S3.
+// to return HTTP 503 to Spark, which then cannot write to S3. The 503
+// mapping is asserted by the handler's switch in handler.go (WR-A2 fix).
 //
 // The L4 gate is the strongest write-ACL protection per ADR-003 D-003.01:
 // without scoped STS tokens Spark physically cannot write to managed S3
@@ -29,8 +30,11 @@ var ErrCredVendUnavailable = errors.New("credvend: credential vending unavailabl
 
 // ErrEngineNotSupported is returned when the target catalog kind does not
 // support L4 STS vending (Unity + Glue in Phase 2 — both adapters return
-// iceberg.ErrAdapterStub; Phase 3 lights Unity live). Callers map to
-// HTTP 501 Not Implemented.
+// iceberg.ErrAdapterStub; Phase 3 lights Unity live). Callers map this
+// sentinel to HTTP 501 Not Implemented (matches handler.go switch — see
+// WR-A2 fix). The 501 vs 503 split distinguishes a configuration-drift
+// signal (an operator pointed a tenant at a stub-only catalog kind) from
+// an incident signal (vending broken for a kind that should work).
 var ErrEngineNotSupported = errors.New("credvend: engine does not support STS credential vending")
 
 // ErrSessionPolicyMalformed is returned if the session policy JSON cannot
