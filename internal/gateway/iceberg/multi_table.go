@@ -217,9 +217,10 @@ func MultiTableCommitHandler(deps Deps) http.HandlerFunc {
 				Updates:      tc.Updates,
 			}
 			inputs := &cel.Inputs{
-				Table:     tableMetadataToMap(currentMeta),
-				Commit:    commitRequestToMap(rc),
-				Principal: principalToMap(principal),
+				Table:             tableMetadataToMap(currentMeta),
+				Commit:            commitRequestToMap(rc),
+				Principal:         principalToMap(principal),
+				AttributeResolver: deps.AttributeResolver,
 			}
 			for _, p := range policies {
 				decision, err := deps.Evaluator.Evaluate(r.Context(), p, inputs)

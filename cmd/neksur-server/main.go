@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -45,6 +46,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
+	"github.com/google/uuid"
+
 	workosauth "github.com/neksur-com/neksur/internal/auth/workos"
 	"github.com/neksur-com/neksur/internal/admin"
 	"github.com/neksur-com/neksur/internal/alerts"
@@ -53,9 +56,12 @@ import (
 	"github.com/neksur-com/neksur/internal/detect/dispatch"
 	iceberggw "github.com/neksur-com/neksur/internal/gateway/iceberg"
 	"github.com/neksur-com/neksur/internal/graph"
+	"github.com/neksur-com/neksur/internal/iceberg"
 	"github.com/neksur-com/neksur/internal/ingest"
 	lineagehttp "github.com/neksur-com/neksur/internal/lineage/http"
 	celpolicy "github.com/neksur-com/neksur/internal/policy/cel"
+	"github.com/neksur-com/neksur/internal/policy/compiler"
+	"github.com/neksur-com/neksur/internal/policy/compiler/dialect"
 	policystore "github.com/neksur-com/neksur/internal/policy/store"
 	"github.com/neksur-com/neksur/internal/tenant"
 )
@@ -217,14 +223,77 @@ func runWithSaasAuth(ctx context.Context) error {
 		return fmt.Errorf("cel.NewCompiler: %w", err)
 	}
 
+	// Plan 02-04 Part B (Fix #3 cross-plan seam) — cross-engine compiler
+	// + ABAC AttributeResolver wire-up. Constructed BEFORE gatewayDeps
+	// so AttributeResolver can be threaded into the iceberg gateway
+	// Deps (handler.go + multi_table.go Step 10 use it to populate
+	// cel.Inputs.AttributeResolver — Plan 02-03 declared the field;
+	// this commit wires it).
+	attrResolver := policystore.NewAttributeResolver(graphClient, pool)
+	engineRegistry := policystore.NewEngineRegistry(graphClient)
+	compiledStore := policystore.NewCompiledStore(graphClient)
+	policyAGEStore := policystore.NewAGEStore(graphClient)
+
 	gatewayDeps := iceberggw.Deps{
-		Pool:        pool,
-		Graph:       graphClient,
-		CredStore:   catalog.NewRepo(pool),
-		PolicyStore: policystore.NewAGEStore(graphClient),
-		Evaluator:   celpolicy.NewEvaluator(celCompiler),
-		IngestSvc:   ingest.NewService(graphClient),
+		Pool:              pool,
+		Graph:             graphClient,
+		CredStore:         catalog.NewRepo(pool),
+		PolicyStore:       policyAGEStore,
+		Evaluator:         celpolicy.NewEvaluator(celCompiler),
+		IngestSvc:         ingest.NewService(graphClient),
+		AttributeResolver: attrResolver,
 	}
+
+	// Dialect registry — per-engine SQL emitters. Each constructor is
+	// stateless; one instance per process is shared across all
+	// CompileAll invocations.
+	dialects := map[string]dialect.DialectCompiler{
+		"trino":  dialect.NewTrinoCompiler(),
+		"spark":  dialect.NewSparkCompiler(),
+		"dremio": dialect.NewDremioCompiler(),
+	}
+
+	// ProbeRunner — Phase 2 ships with an empty executor map. The live
+	// Trino / Spark probe clients land in Plan 02-05 (SQL proxy)
+	// where the engine HTTP clients are first constructed. A nil-/empty-
+	// executor probe runner causes the compiler to skip the synthetic
+	// probe (probe_skipped log line) and persist CompiledPolicy nodes
+	// in `pending` → `active` directly; this is correct for the
+	// trigger-driven re-compile path in Phase 2.
+	probeRunner := compiler.NewProbeRunner(nil)
+
+	comp, err := compiler.NewCompiler(compiler.CompilerConfig{
+		Dialects:       dialects,
+		Probes:         probeRunner,
+		CompiledStore:  compiledStore,
+		EngineRegistry: engineRegistry,
+		CELEnv:         celEnv,
+		CELCompiler:    celCompiler,
+	})
+	if err != nil {
+		return fmt.Errorf("compiler.NewCompiler: %w", err)
+	}
+
+	// Trigger consumer — LISTEN policy_changed on the admin pool,
+	// dispatch every NOTIFY to comp.CompileAll. Validates the
+	// tenant_id against tenantRepo (defence-in-depth against forged
+	// NOTIFY payloads). The PolicyLoader is a thin adapter — the
+	// store API for "load PolicySource by ID" lands in Plan 02-05;
+	// for now a fail-safe stub logs the receipt and returns
+	// ErrLoaderNotWired so the trigger plumbing is exercised end-to-end
+	// without invoking compile on a not-yet-implemented loader.
+	trig := compiler.NewTrigger(
+		pool,
+		comp,
+		&tenantExistsAdapter{pool: pool},
+		&policyLoaderStub{},
+	)
+	go func() {
+		if err := trig.Listen(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("policy/compiler/trigger: Listen exited", "err", err)
+		}
+	}()
+	_ = compiledStore // wired into Deps via the compiler; reserved for direct gateway reads in Plan 02-05+
 
 	// CR-03 fail-fast startup guard: refuse to boot if any active
 	// tenant is configured for a Phase-1-unsupported catalog kind
@@ -508,4 +577,40 @@ func assertNoUnsupportedCatalogs(ctx context.Context, adminPool *pgxpool.Pool) e
 	msg.WriteString("Remediation: UPDATE catalog_credentials SET catalog_kind = 'polaris' (or 'nessie') ")
 	msg.WriteString("and re-supply config_json. Glue + Unity adapters arrive in Phase 3.")
 	return errors.New(msg.String())
+}
+
+// tenantExistsAdapter satisfies compiler.TenantValidator. The lookup
+// is a single SELECT against public.tenants (admin-scoped row; the
+// admin pool is the same pool the rest of runWithSaasAuth uses).
+type tenantExistsAdapter struct {
+	pool *pgxpool.Pool
+}
+
+func (a *tenantExistsAdapter) TenantExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	var exists bool
+	err := a.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM public.tenants WHERE id = $1 AND lifecycle_state = 'active')`,
+		id,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("tenantExistsAdapter.TenantExists: %w", err)
+	}
+	return exists, nil
+}
+
+// policyLoaderStub satisfies compiler.PolicyLoader. The production
+// loader (a thin wrapper over policystore.AGEStore exposing a
+// LoadPolicyByID surface) lands in Plan 02-05 alongside the SQL
+// proxy's per-policy fetch path. Until then the trigger logs the
+// NOTIFY and returns errPolicyLoaderNotWired; the compiler.Trigger
+// treats this as a skip (logs + continues) so the LISTEN goroutine
+// stays alive for end-to-end smoke tests.
+type policyLoaderStub struct{}
+
+var errPolicyLoaderNotWired = errors.New("policy loader: not yet wired (Plan 02-05)")
+
+func (policyLoaderStub) LoadPolicyForCompile(ctx context.Context, policyID string) (compiler.PolicySource, iceberg.TableRef, error) {
+	_ = ctx
+	_ = policyID
+	return compiler.PolicySource{}, iceberg.TableRef{}, errPolicyLoaderNotWired
 }

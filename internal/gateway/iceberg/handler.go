@@ -139,6 +139,14 @@ type Deps struct {
 	Evaluator      *cel.Evaluator
 	IngestSvc      *ingest.Service
 	AdapterFactory AdapterBuilder
+
+	// AttributeResolver, when non-nil, is threaded through cel.Inputs
+	// (Step 10) so the principal.attribute(…) binding can reach
+	// Layers 2+3 of D-2.10 (Plan 02-03 type-level hook + Plan 02-04
+	// Part B cross-plan seam wire-up — Fix #3). nil-safe: tests and
+	// pre-Plan-02-03 callers leave this nil and the binding falls
+	// back to Layer-1 (OIDC claims).
+	AttributeResolver cel.AttributeResolver
 }
 
 // adapterFor resolves the per-request adapter — Deps.AdapterFactory if
@@ -298,9 +306,10 @@ func CommitHandler(deps Deps) http.HandlerFunc {
 
 		// Step 10 — evaluate — FAIL-CLOSED + first-deny rejects.
 		inputs := &cel.Inputs{
-			Table:     tableMetadataToMap(currentMeta),
-			Commit:    commitRequestToMap(commit),
-			Principal: principalToMap(principal),
+			Table:             tableMetadataToMap(currentMeta),
+			Commit:            commitRequestToMap(commit),
+			Principal:         principalToMap(principal),
+			AttributeResolver: deps.AttributeResolver,
 		}
 		for _, p := range policies {
 			decision, err := deps.Evaluator.Evaluate(r.Context(), p, inputs)
