@@ -37,6 +37,20 @@ import (
 // and matches RESEARCH §Pattern 6 line 1032.
 const defaultCacheSize = 4096
 
+// programInterruptCheckFrequency is the cel-go opcode-count budget
+// between interrupt checks. Per Phase 2 RESEARCH Pitfall 6 (line 776):
+// cel-go has no resource budget by default — a CEL `.all()` / `.exists()`
+// over a 10K-element list runs unbounded without InterruptCheckFrequency.
+// Phase 1 didn't need this (P1/P2/P3 policies don't iterate); Phase 2's
+// ABAC + classification bindings DO iterate over claims arrays, so
+// retrofit is required BEFORE adding new bindings (Plan 02-03).
+//
+// 100 opcodes is the cel-go recommended frequency per [CITED: cel-go
+// ContextEval docs](https://pkg.go.dev/github.com/google/cel-go/cel) —
+// frequent enough to interrupt within 1-2ms of context cancellation,
+// rare enough to avoid measurable hot-path overhead on small policies.
+const programInterruptCheckFrequency = 100
+
 // cacheKey is the LRU key shape: (PolicyID, SHA-256(text)). Both fields
 // are comparable (string + [32]byte) so the struct itself is comparable,
 // which is required for golang-lru/v2's generic K constraint.
@@ -100,7 +114,12 @@ func (c *Compiler) CompileOrGet(policyID, text string) (cel.Program, error) {
 		return nil, fmt.Errorf("cel: compile policy %s: %w",
 			policyID, errors.Join(ErrCompileFailed, issues.Err()))
 	}
-	prog, err := c.env.Program(ast)
+	// Pitfall 6 retrofit (Phase 2 RESEARCH line 776): pass
+	// InterruptCheckFrequency so Program.ContextEval honors context
+	// cancellation / deadline-exceeded mid-evaluation. Without this the
+	// runtime cannot interrupt a `.all()` over a 10K-element ABAC claims
+	// array — the gateway event loop blocks until the loop finishes.
+	prog, err := c.env.Program(ast, cel.InterruptCheckFrequency(programInterruptCheckFrequency))
 	if err != nil {
 		return nil, fmt.Errorf("cel: program policy %s: %w",
 			policyID, errors.Join(ErrCompileFailed, err))

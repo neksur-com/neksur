@@ -21,7 +21,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
+
+// EvalTimeout is the per-evaluation budget for cel.Program.ContextEval.
+// Per Phase 2 RESEARCH Pitfall 6 + Plan 02-01: pair this with the
+// InterruptCheckFrequency option (compile.go) so the runtime exits
+// within ~1-2ms of the deadline elapsing.
+//
+// 100ms is a generous ceiling for the Phase 1 P1/P2/P3 policies AND
+// the Phase 2 ABAC/classification bindings — a normal eval takes
+// 5-50µs warm; the budget catches pathological policies (a malicious
+// or buggy `.all()` over a huge claims array) and surfaces them as
+// fail-closed 503 instead of a hung gateway event loop (D-1.09 contract
+// extended to cover timeout).
+const EvalTimeout = 100 * time.Millisecond
 
 // Action is the binary policy decision: allow or deny. The L1 gateway
 // translates ActionAllow to "proceed with commit" and ActionDeny to
@@ -149,7 +163,21 @@ func (e *Evaluator) Evaluate(ctx context.Context, p Policy, in *Inputs) (decisio
 		"principal": in.Principal,
 	}
 
-	out, _, eerr := prog.ContextEval(ctx, activation)
+	// Pitfall 6 retrofit (Phase 2 RESEARCH line 776 + Plan 02-01):
+	// wrap ContextEval in a 100ms deadline so cel-go's
+	// InterruptCheckFrequency (compile.go) can interrupt unbounded
+	// computation (e.g., `.all()` over a 10K-element ABAC claims array).
+	// The cel-go runtime translates context cancellation into an
+	// evaluation error, which we surface as ErrPolicyEvalFailed — fail
+	// closed at the gateway (D-1.09 + commit_rejected_total{
+	// reason="policy_engine_unavailable"} → HTTP 503).
+	//
+	// We compose the timeout on top of the inbound ctx so request-level
+	// cancellations (e.g., client disconnect, request-level deadline)
+	// still propagate; the timeout only TIGHTENS the deadline.
+	evalCtx, evalCancel := context.WithTimeout(ctx, EvalTimeout)
+	defer evalCancel()
+	out, _, eerr := prog.ContextEval(evalCtx, activation)
 	if eerr != nil {
 		return nil, &EvalError{
 			PolicyID: p.ID,
