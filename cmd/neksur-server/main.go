@@ -376,10 +376,15 @@ func runWithSaasAuth(ctx context.Context) error {
 			// in favor of a locally-constructed *http.Server so the wrapper
 			// can interpose without modifying the sqlproxy package.
 			wrappedHandler := workosauth.TenantMiddleware(workosClient, tenantRepo)(sqlServer.Handler())
+			// WR-02: Clone the TLSConfig so the wrapped *http.Server owns
+			// an independent value. The go std library docs explicitly
+			// warn to Clone() before passing to http.Server — a future
+			// refactor that mutates the original via sqlproxy.Server's
+			// fields would otherwise race the live handshake path.
 			wrappedSrv := &http.Server{
 				Addr:              sqlProxyAddr,
 				Handler:           wrappedHandler,
-				TLSConfig:         tlsConfig,
+				TLSConfig:         tlsConfig.Clone(),
 				ReadHeaderTimeout: 10 * time.Second,
 			}
 			go func() {
