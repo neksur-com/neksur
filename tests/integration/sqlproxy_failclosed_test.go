@@ -15,10 +15,13 @@
 //      dashboards / alert rules cover both surfaces).
 //
 //   2. TestSQLProxyFailClosedOnDremio — the Dremio Injector is a
-//      Phase 2 stub that returns iceberg.ErrAdapterStub on every call.
-//      The server's error switch maps this sentinel to HTTP 501
-//      "engine not supported" so clients can distinguish "stub" from
-//      "transient failure".
+//      Phase 2 fail-closed stub (CR-09). Previously it returned
+//      iceberg.ErrAdapterStub → HTTP 501, which neither fired the
+//      policy-engine-unavailable counter nor paged SREs, so a tenant
+//      routed to Dremio ran queries with no policy enforcement and
+//      zero alerting. The stub now returns
+//      sqlproxy.ErrPolicyEngineUnavailable → HTTP 503 + counter
+//      increment, matching the L1 gateway's fail-closed semantics.
 
 package integration
 
@@ -115,7 +118,9 @@ func TestSQLProxyFailClosedOnInactivePolicy(t *testing.T) {
 		"commit_rejected_total{reason=policy_engine_unavailable} must increment by exactly 1")
 }
 
-// TestSQLProxyFailClosedOnDremio — see file header.
+// TestSQLProxyFailClosedOnDremio — see file header. CR-09: the Dremio
+// stub now fails closed with 503 + policy-engine-unavailable counter
+// (was 501 'engine not supported', which fired no alert).
 func TestSQLProxyFailClosedOnDremio(t *testing.T) {
 	fx := StartPhase2Fixture(t)
 	defer fx.Terminate()
@@ -128,6 +133,13 @@ func TestSQLProxyFailClosedOnDremio(t *testing.T) {
 	defer ts.Close()
 
 	client := newSqlproxyTestClient(t, caPEM, clientCert)
+
+	// Snapshot the counter so we measure the delta this request
+	// produces (process-wide promauto registry is shared with other tests).
+	beforeCount := testutil.ToFloat64(
+		observability.CommitRejectedTotal.WithLabelValues(
+			observability.ReasonPolicyEngineUnavailable))
+
 	body := mustJSON(t, map[string]any{
 		"query": "SELECT * FROM orders",
 		"table": map[string]string{"namespace": "ns", "name": "orders"},
@@ -141,8 +153,14 @@ func TestSQLProxyFailClosedOnDremio(t *testing.T) {
 	resp, errBody := doSqlproxyPOST(t, client,
 		ts.URL+"/v1/sql/dremio/myprefix/dummy",
 		body, sqlProxyDremioTenant)
-	require.Equal(t, http.StatusNotImplemented, resp.StatusCode,
-		"Dremio stub must produce 501; body=%s", errBody)
-	require.Contains(t, errBody, "engine not supported",
-		"501 body must surface the engine-not-supported reason")
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"Dremio stub must fail closed with 503; body=%s", errBody)
+	require.Contains(t, errBody, "policy engine unavailable",
+		"503 body must surface the policy-engine-unavailable reason")
+
+	afterCount := testutil.ToFloat64(
+		observability.CommitRejectedTotal.WithLabelValues(
+			observability.ReasonPolicyEngineUnavailable))
+	require.Equal(t, beforeCount+1, afterCount,
+		"commit_rejected_total{reason=policy_engine_unavailable} must increment by exactly 1")
 }
