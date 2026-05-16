@@ -1,11 +1,15 @@
-// neksur-server — main backend binary entry point.
+// neksur-server — main backend binary entry point for the Neksur
+// cross-engine policy plane.
 //
-// Phase 0 stub. M1 wires up the REST API skeleton + Iceberg REST proxy
-// foundation; M2 adds the MCP server + policy CRUD; M3 adds the pgwire
-// SQL proxy + L1 Catalog Gateway full validation; M4 adds the Spark
-// write-path integration. See docs/phase-0-stack.md §5 for the milestone
-// breakdown, and §6 for the planned internal/ package layout this binary
-// will compose.
+// Two independent bootstrap modes, both env-flag gated:
+//   - NEKSUR_OBSERVABILITY=1 — OTel trace exporter + Prometheus metrics
+//   - NEKSUR_SAAS_AUTH=1     — Phase 0.5+ SaaS auth + Phase 1+ catalog
+//                              gateway + Phase 2 cross-engine policy
+//                              compiler trigger + SQL proxy mTLS listener
+//
+// Run `neksur-server --help` for the env-flag matrix. See
+// runbooks/dev-cold-start.md for the Phase 2 cold-start recipe and
+// runbooks/phase0-deploy.md for the production-ish deploy recipe.
 //
 // Plan 00-05 (Wave 4) addition: when NEKSUR_OBSERVABILITY=1 is set the
 // binary wires up the OTLP gRPC trace exporter and the Prometheus
@@ -29,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -85,20 +90,91 @@ func (g workosAdminGate) LoadSessionOrgID(r *http.Request) (string, error) {
 	return s.OrganizationID, nil
 }
 
+// usageBanner is the single source of truth for "what env vars does
+// neksur-server read, and which bootstrap mode does each enable?".
+// Printed by `--help` (stdout) and by the no-mode-flag path (stderr).
+// The runbooks/dev-cold-start.md env-flag matrix is the human-readable
+// mirror of this banner — keep them in sync when env reads change.
+const usageBanner = `Neksur Server — backend binary for the Neksur cross-engine policy plane.
+
+USAGE:
+  neksur-server [no args]      Print this banner and exit 0.
+  neksur-server --help | -h    Print this banner and exit 0.
+
+BOOTSTRAP MODES (set via env vars; default no-op):
+
+  NEKSUR_OBSERVABILITY=1
+    Enable the OTel gRPC trace exporter + Prometheus /metrics server.
+    Reads:  NEKSUR_METRICS_ADDR (default :9100)
+            OTLP collector at localhost:4317 (or OTEL_EXPORTER_OTLP_ENDPOINT)
+
+  NEKSUR_SAAS_AUTH=1
+    Enable the Phase 0.5+ SaaS auth stack and the Phase 1+ catalog
+    gateway + Phase 2 cross-engine policy compiler trigger + SQL proxy.
+    This is the canonical Phase 2 boot mode.
+    Required:  DATABASE_URL
+               WORKOS_API_KEY, WORKOS_CLIENT_ID, WORKOS_WEBHOOK_SECRET
+    Optional:  NEKSUR_LISTEN_ADDR (default :8080)
+               NEKSUR_TLS_CERT_PATH, NEKSUR_TLS_KEY_PATH,
+                 NEKSUR_CA_BUNDLE_PATH, NEKSUR_SQLPROXY_ADDR
+                 (all four needed to enable the mTLS SQL proxy listener;
+                  if any is missing the listener is disabled — a structured
+                  log line is emitted at boot)
+               NEKSUR_S3_EVENTS_QUEUE_URL, NEKSUR_S3_EVENTS_TENANT_ID
+               NEKSUR_SLACK_WEBHOOK_URL
+               STRIPE_WEBHOOK_SECRET (security best-practice when SAAS=1;
+                 sig is verified BEFORE the BILLING_ENABLED gate to defeat
+                 spoofed-webhook attacks)
+               STRIPE_API_KEY, BILLING_ENABLED
+               WORKOS_INTERNAL_ADMIN_ORG_ID, PAGERDUTY_SERVICE_ID
+
+Both modes can be enabled simultaneously (observability + saas).
+
+See runbooks/dev-cold-start.md for the full Phase 2 cold-start recipe.
+See runbooks/phase0-deploy.md for the production-ish deploy recipe.
+`
+
+// printUsage writes the usage banner to w. Used by --help (stdout) and
+// by the no-mode-flag path (stderr).
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, usageBanner)
+}
+
 func main() {
-	fmt.Println("Neksur Server (placeholder — Phase 0 stub; M1 will wire up REST API, MCP server, SQL proxy).")
+	// --help / -h / help — print usage to stdout and exit 0.
+	for _, a := range os.Args[1:] {
+		if a == "--help" || a == "-h" || a == "help" {
+			printUsage(os.Stdout)
+			return
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if os.Getenv("NEKSUR_OBSERVABILITY") == "1" {
+	observability := os.Getenv("NEKSUR_OBSERVABILITY") == "1"
+	saasAuth := os.Getenv("NEKSUR_SAAS_AUTH") == "1"
+
+	// No mode flag set — print usage to stderr (so a user piping stdout
+	// to a file still sees the affordance) + exit 0. This is the path
+	// 02-UAT.md Test 1 surfaced: a fresh `go run ./cmd/neksur-server`
+	// from a clean checkout used to print a misleading "Phase 0 stub"
+	// placeholder line. The banner now self-documents that the binary
+	// is intentionally a no-op when no mode flag is set, and points
+	// at the runbook + the env-flag matrix.
+	if !observability && !saasAuth {
+		printUsage(os.Stderr)
+		return
+	}
+
+	if observability {
 		if err := runWithObservability(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "observability bootstrap failed: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	if os.Getenv("NEKSUR_SAAS_AUTH") == "1" {
+	if saasAuth {
 		if err := runWithSaasAuth(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "saas auth bootstrap failed: %v\n", err)
 			os.Exit(1)
