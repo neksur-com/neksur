@@ -8,8 +8,9 @@
 //
 //   1. POST /v1/sql/trino/{prefix}/dummy with a valid envelope returns
 //      HTTP 200 and a {"rewritten_query": "..."} body containing the
-//      structural splice marker `/* neksur-policy: ` added by dispatch
-//      B's rewriteWithBody helper.
+//      spliced WHERE-clause predicate `WHERE (region = 'us-east-1')`
+//      produced by the Plan 02-12 dialect.SpliceArtifact splicer. The
+//      previous structural-comment marker is gone (Plan 02-12 / CR-A3).
 //   2. Cache-hit latency over 100 sequential requests is P95 < 50 ms
 //      (REQ-NFR-latency-sql-proxy budget).
 //
@@ -54,13 +55,15 @@ import (
 const sqlProxyTrinoTenant = "d10cd10c-0205-4d11-8a11-111111111111"
 
 // TestSQLProxyTrinoInjection — see file header.
+//
+// Plan 02-12 (CR-A3): the dialect's structural rewrite is no longer a
+// no-op — SpliceArtifact parses the user query and weaves the
+// CompiledPolicy.ArtifactBody into the WHERE clause. The env-gate
+// (NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP) is gone; the splicer is
+// fail-closed by construction. The test's positive-path assertion
+// now checks the real spliced WHERE shape rather than the previous
+// `/* neksur-policy: */` comment marker.
 func TestSQLProxyTrinoInjection(t *testing.T) {
-	// CR-01 fix: the dialect's structural rewrite is a no-op (appends a
-	// SQL comment, does NOT splice into WHERE) and is gated off by
-	// default. The Phase 2 integration tests exercise the structural
-	// shape only — set the env-gate explicitly so the dialect emits the
-	// `/* neksur-policy: */` comment without failing closed.
-	t.Setenv("NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP", "1")
 	fx := StartPhase2Fixture(t)
 	defer fx.Terminate()
 
@@ -99,7 +102,11 @@ func TestSQLProxyTrinoInjection(t *testing.T) {
 		TableNamespace: tableNS,
 		Status:         store.CompiledPolicyStatusActive,
 		SourceChecksum: "deadbeef",
-		ArtifactBody:   "WHERE region='us-east-1'",
+		// Plan 02-12: artifact body is a bare predicate (no leading
+		// WHERE keyword). The splicer wraps it in `WHERE (...)` or
+		// AND-conjoins as appropriate.
+		ArtifactBody: "region = 'us-east-1'",
+		ArtifactKind: store.KindRowFilter,
 	}))
 
 	ts, clientCert, caPEM := startSqlproxyTestServer(t, fx)
@@ -123,8 +130,12 @@ func TestSQLProxyTrinoInjection(t *testing.T) {
 	resp, rewritten := doSqlproxyPOST(t, client, ts.URL+"/v1/sql/trino/myprefix/dummy",
 		body, sqlProxyTrinoTenant)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "warm-up: body=%s", rewritten)
-	require.Contains(t, rewritten, "/* neksur-policy: ",
-		"rewritten_query must contain structural splice marker")
+	// Plan 02-12 (CR-A3): the splicer wraps the artifact body in a real
+	// WHERE clause that the downstream engine parser will honor at
+	// plan time. The previous `/* neksur-policy: */` comment marker is
+	// gone — the assertion now checks for the spliced predicate.
+	require.Contains(t, rewritten, "WHERE (region = 'us-east-1')",
+		"rewritten_query must contain spliced WHERE-clause predicate")
 
 	// Drive 100 cache-hit requests, collect latencies, assert P95
 	// < 50 ms.

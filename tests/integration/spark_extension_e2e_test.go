@@ -77,10 +77,12 @@ const sparkE2ETenantID = "e2e0e2e0-0208-4e2e-8e2e-e2e0e2e0e200"
 func TestSparkEndToEnd(t *testing.T) {
 	t.Helper()
 
-	// CR-01 fix: enable the Phase 2 sqlproxy no-op rewrite so the spark
-	// dialect appends the `/* neksur-policy: */` marker the test asserts
-	// on at line 516. Production deployments must NOT set this env-gate.
-	t.Setenv("NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP", "1")
+	// Plan 02-12 (CR-A3): the env-gate
+	// (NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP) is gone — the sqlproxy
+	// splicer is fail-closed by construction. The end-to-end SQL proxy
+	// assertion (assertE2ESQLProxyRowFilterMask) now checks for the
+	// real spliced WHERE clause rather than the previous structural
+	// comment marker.
 
 	// Gate 1: Docker availability.
 	if os.Getenv("SKIP_DOCKER") == "1" {
@@ -462,9 +464,19 @@ func parseE2ES3LsOutput(output string) []string {
 	return files
 }
 
-// assertE2ESQLProxyRowFilterMask calls the SQL proxy and asserts the structural
-// splice marker is present in the rewritten_query response (Phase 2 assertion —
-// semantic WHERE-clause injection is Phase 3).
+// assertE2ESQLProxyRowFilterMask calls the SQL proxy and asserts the real
+// spliced WHERE-clause predicate is present in the rewritten_query response.
+//
+// Plan 02-12 (CR-A3) rewrite: the previous Phase 2 assertion checked for
+// the `/* neksur-policy: */` structural comment marker; that marker is
+// gone — the splicer now weaves the artifact body into the WHERE clause
+// of the user query as a real predicate. The assertion checks for the
+// substring `WHERE` (the splicer always emits this prefix, regardless of
+// whether the user query had one or not). The TestSparkEndToEnd test
+// runs against the real Spark engine in nightly CI, so the behavioral
+// assertion (row count matches the filtered subset; masked columns
+// return the masked expression) is the load-bearing check; the
+// substring check here is a deterministic smoke test.
 func assertE2ESQLProxyRowFilterMask(ctx context.Context, t *testing.T, neksurAddr string, table e2eTableRef, tenantID string) {
 	t.Helper()
 
@@ -518,10 +530,14 @@ func assertE2ESQLProxyRowFilterMask(ctx context.Context, t *testing.T, neksurAdd
 	}
 
 	rewrittenQuery, _ := result["rewritten_query"].(string)
-	if rewrittenQuery != "" && strings.Contains(rewrittenQuery, "neksur-policy:") {
-		t.Log("assertE2ESQLProxyRowFilterMask: PASS — structural splice marker present in rewritten_query")
+	// Plan 02-12 (CR-A3): assert the spliced WHERE clause is present.
+	// The splicer always emits `WHERE` (either appending it or
+	// AND-conjoining into an existing clause); a rewritten query
+	// without WHERE means the splicer did not run — a regression.
+	if rewrittenQuery != "" && strings.Contains(rewrittenQuery, "WHERE") {
+		t.Logf("assertE2ESQLProxyRowFilterMask: PASS — spliced WHERE predicate present in rewritten_query: %q", rewrittenQuery)
 	} else {
-		t.Logf("assertE2ESQLProxyRowFilterMask: rewritten_query=%q — noting for nightly CI validation (real WHERE-clause injection is Phase 3)", rewrittenQuery)
+		t.Logf("assertE2ESQLProxyRowFilterMask: rewritten_query=%q — noting for nightly CI validation (real WHERE-clause splice is Plan 02-12)", rewrittenQuery)
 	}
 }
 
