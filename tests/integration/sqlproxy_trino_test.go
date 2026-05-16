@@ -55,6 +55,12 @@ const sqlProxyTrinoTenant = "d10cd10c-0205-4d11-8a11-111111111111"
 
 // TestSQLProxyTrinoInjection — see file header.
 func TestSQLProxyTrinoInjection(t *testing.T) {
+	// CR-01 fix: the dialect's structural rewrite is a no-op (appends a
+	// SQL comment, does NOT splice into WHERE) and is gated off by
+	// default. The Phase 2 integration tests exercise the structural
+	// shape only — set the env-gate explicitly so the dialect emits the
+	// `/* neksur-policy: */` comment without failing closed.
+	t.Setenv("NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP", "1")
 	fx := StartPhase2Fixture(t)
 	defer fx.Terminate()
 

@@ -52,7 +52,11 @@ func (i *TrinoInjector) InjectPolicy(ctx context.Context, query string, table sq
 	}
 
 	if body, hit := i.cache.Get(cacheKey); hit {
-		return rewriteWithBody(query, body, principal), sqlproxy.CacheStatusHit, nil
+		rewritten, rerr := rewriteWithBody(query, body, principal)
+		if rerr != nil {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/trino: %w", rerr)
+		}
+		return rewritten, sqlproxy.CacheStatusHit, nil
 	}
 
 	compiled, err := i.store.LoadCompiledForTable(ctx, iceberg.TableRef{
@@ -67,7 +71,11 @@ func (i *TrinoInjector) InjectPolicy(ctx context.Context, query string, table sq
 		if cp.EngineKind == "trino" && cp.Status == store.CompiledPolicyStatusActive {
 			body := []byte(cp.ArtifactBody)
 			i.cache.Add(cacheKey, body)
-			return rewriteWithBody(query, body, principal), sqlproxy.CacheStatusMiss, nil
+			rewritten, rerr := rewriteWithBody(query, body, principal)
+			if rerr != nil {
+				return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/trino: %w", rerr)
+			}
+			return rewritten, sqlproxy.CacheStatusMiss, nil
 		}
 	}
 

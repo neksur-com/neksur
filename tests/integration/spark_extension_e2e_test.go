@@ -77,6 +77,11 @@ const sparkE2ETenantID = "e2e0e2e0-0208-4e2e-8e2e-e2e0e2e0e200"
 func TestSparkEndToEnd(t *testing.T) {
 	t.Helper()
 
+	// CR-01 fix: enable the Phase 2 sqlproxy no-op rewrite so the spark
+	// dialect appends the `/* neksur-policy: */` marker the test asserts
+	// on at line 516. Production deployments must NOT set this env-gate.
+	t.Setenv("NEKSUR_SQLPROXY_PHASE2_ALLOW_NOOP", "1")
+
 	// Gate 1: Docker availability.
 	if os.Getenv("SKIP_DOCKER") == "1" {
 		t.Skip("SKIP_DOCKER=1 — skipping TestSparkEndToEnd")
