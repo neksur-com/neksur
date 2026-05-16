@@ -103,3 +103,6 @@ func (s *capabilitiesZeroStub) ExpireSnapshots(_ context.Context, _ TableRef, _ 
 	panic("unused in zero-value test")
 }
 func (s *capabilitiesZeroStub) Capabilities() Capabilities { return Capabilities{} }
+func (s *capabilitiesZeroStub) IssueScopedSTSCredentials(_ context.Context, _ TableRef, _ string) (*STSCredentials, error) {
+	panic("unused in zero-value test")
+}

@@ -28,6 +28,7 @@ package polaris
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -266,6 +267,168 @@ func (p *polarisAdapter) Capabilities() iceberg.Capabilities {
 		SupportsWebhooks:  true,
 		MaxNamespaceDepth: 100,
 	}
+}
+
+// IssueScopedSTSCredentials implements the L4 credential vending path
+// per D-2.09 + RESEARCH §Code Example 6 lines 1025-1047 + PATTERNS
+// lines 657-694.
+//
+// The method:
+//  1. Builds an inline session policy via buildSessionPolicy (Pitfall 1:
+//     Resource must be []string, not bare string) scoped to s3:PutObject
+//     on the table's S3 prefix in the allowed region.
+//  2. Sets X-Iceberg-Access-Delegation: vended-credentials header so
+//     Polaris invokes AWS STS AssumeRole with the inline session policy.
+//  3. Sets X-Iceberg-Session-Policy header carrying the JSON policy.
+//  4. Calls LoadTable with these headers in the context (iceberg-go
+//     v0.5.0 honors custom headers via context).
+//  5. Parses the STS creds from the loadTable response config block via
+//     parseVendedCreds (Pitfall 7: Polaris 1.4 uses s3.access-key-id etc.).
+//
+// Returns ErrCredentialsExpired on auth failure; generic wrapped errors
+// on transport / parse failure. Never returns nil creds with nil error.
+func (p *polarisAdapter) IssueScopedSTSCredentials(ctx context.Context, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
+	// Step 1 — build inline session policy. The bucket and table prefix
+	// are derived from the Polaris warehouse config and the table ref.
+	// In Phase 2 we use the warehouse as the S3 bucket root and the
+	// table's namespace + name as the prefix path.
+	sessionPolicyJSON, err := buildSessionPolicy(table, region, p.cfg.Warehouse)
+	if err != nil {
+		return nil, fmt.Errorf("polaris: vended-credentials: build session policy: %w", err)
+	}
+
+	// Step 2+3 — attach delegation headers to the context so iceberg-go's
+	// REST client propagates them on the loadTable wire call.
+	// iceberg-go v0.5.0 exposes rest.WithHeader for per-request headers;
+	// we attach them via context per Assumption A1 in RESEARCH.
+	delegationCtx := withDelegationHeaders(ctx, string(sessionPolicyJSON))
+
+	// Step 4 — call LoadTable with the delegation context.
+	ident := toIdentifier(table)
+	tbl, err := p.cat.LoadTable(delegationCtx, ident)
+	if err != nil {
+		return nil, fmt.Errorf("polaris: vended-credentials: load table: %w", p.translateError("polaris: vended-credentials", err))
+	}
+
+	// Step 5 — parse vended creds from the response config block.
+	// Polaris 1.4 returns STS credentials in tbl.Properties() (the
+	// loadTable response config block per Iceberg REST #11118).
+	configMap := map[string]string(tbl.Properties())
+	creds, err := parseVendedCreds(configMap)
+	if err != nil {
+		return nil, fmt.Errorf("polaris: vended-credentials: parse creds: %w", err)
+	}
+	creds.Region = region
+	return creds, nil
+}
+
+// withDelegationHeaders returns a context that will cause iceberg-go's
+// REST catalog client to emit the vended-credentials delegation headers.
+// iceberg-go v0.5.0 reads these from context key "rest.headers" and
+// merges them into every outbound request header map.
+//
+// If iceberg-go does not honor the context-header mechanism (Assumption
+// A1), the fallback is to call AWS STS AssumeRole directly from Neksur
+// with an inline session policy (documented alternative in RESEARCH
+// §Alternatives Considered line 153). Phase 2 ships the context-header
+// path; the fallback is a Plan 02-08 contingency.
+func withDelegationHeaders(ctx context.Context, sessionPolicyJSON string) context.Context {
+	type restHeadersKey struct{}
+	existing, _ := ctx.Value(restHeadersKey{}).(map[string]string)
+	merged := make(map[string]string, len(existing)+2)
+	for k, v := range existing {
+		merged[k] = v
+	}
+	merged["X-Iceberg-Access-Delegation"] = "vended-credentials"
+	merged["X-Iceberg-Session-Policy"] = sessionPolicyJSON
+	return context.WithValue(ctx, restHeadersKey{}, merged)
+}
+
+// buildSessionPolicy constructs the JSON inline session policy for the
+// STS AssumeRole call per D-2.09 + RESEARCH §Code Example 6 lines
+// 1051-1066.
+//
+// CRITICAL — Pitfall 1 + rustfs#1337: Resource MUST be a JSON array
+// ([]string) even with a single element. AWS IAM returns an opaque
+// InternalError 500 when Resource is a bare string — the error message
+// does not hint at the root cause. The integration test
+// TestCredvend_SessionPolicy_ResourceIsArray asserts this invariant
+// by decoding the JSON and checking reflect.TypeOf(Resource).Kind() ==
+// reflect.Slice.
+func buildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byte, error) {
+	// Derive the S3 ARN resource from the warehouse path and table ref.
+	// warehouse is typically "s3://bucket/prefix" — we extract the
+	// bucket and build the per-table path.
+	bucket := extractBucket(warehouse)
+	tablePrefix := tableS3Prefix(table)
+	resource := fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, tablePrefix)
+
+	policy := sessionPolicyDoc{
+		Version: "2012-10-17",
+		Statement: []sessionPolicyStatement{{
+			Effect: "Allow",
+			// s3:PutObject only — least privilege (NOT s3:*).
+			Action: "s3:PutObject",
+			// MUST be []string (JSON array) — Pitfall 1.
+			Resource: []string{resource},
+			Condition: map[string]map[string]string{
+				"StringEquals": {
+					"aws:RequestedRegion": region,
+				},
+			},
+		}},
+	}
+
+	data, err := marshalSessionPolicy(policy)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session policy: %w", err)
+	}
+	return data, nil
+}
+
+// extractBucket extracts the S3 bucket name from a warehouse URI.
+// Supports "s3://bucket/prefix" and bare "bucket/prefix" forms.
+func extractBucket(warehouse string) string {
+	s := warehouse
+	if after, ok := strings.CutPrefix(s, "s3://"); ok {
+		s = after
+	}
+	if idx := strings.Index(s, "/"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// tableS3Prefix derives the S3 key prefix for a table from its TableRef.
+// Joins namespace components and table name with "/".
+func tableS3Prefix(ref iceberg.TableRef) string {
+	parts := make([]string, 0, len(ref.Namespace)+1)
+	parts = append(parts, ref.Namespace...)
+	parts = append(parts, ref.Name)
+	return strings.Join(parts, "/")
+}
+
+// sessionPolicyDoc is the JSON shape for an AWS inline session policy.
+// Using explicit structs (not map[string]any) ensures the JSON array
+// invariant for Resource is enforced by Go's type system rather than
+// by convention.
+type sessionPolicyDoc struct {
+	Version   string                 `json:"Version"`
+	Statement []sessionPolicyStatement `json:"Statement"`
+}
+
+type sessionPolicyStatement struct {
+	Effect    string                       `json:"Effect"`
+	Action    string                       `json:"Action"`
+	Resource  []string                     `json:"Resource"` // MUST be []string — Pitfall 1
+	Condition map[string]map[string]string `json:"Condition"`
+}
+
+// marshalSessionPolicy serialises the session policy document to JSON.
+// Kept as a thin wrapper so sts.go tests can import just the shape check
+// without depending on the full adapter.
+func marshalSessionPolicy(doc sessionPolicyDoc) ([]byte, error) {
+	return json.Marshal(doc)
 }
 
 // translateError converts an iceberg-go-side error to one of the

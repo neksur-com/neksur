@@ -49,8 +49,8 @@ type LocalStackContainer struct {
 // pulls can add 60-90s.
 func StartLocalStack(ctx context.Context) (*LocalStackContainer, error) {
 	env := map[string]string{
-		"SERVICES":       "s3,sns,sqs",
-		"DEBUG":          "0",
+		"SERVICES":              "s3,sns,sqs,kms",
+		"DEBUG":                 "0",
 		"EAGER_SERVICE_LOADING": "1",
 	}
 	if token := os.Getenv("LOCALSTACK_AUTH_TOKEN"); token != "" {
@@ -94,4 +94,12 @@ func (l *LocalStackContainer) Terminate(ctx context.Context) error {
 		return nil
 	}
 	return l.Container.Terminate(ctx)
+}
+
+// KMSEndpoint returns the LocalStack KMS endpoint URL. LocalStack routes
+// all services through the same edge gateway port (localStackEdgePort),
+// so this is identical to Endpoint — the AWS SDK uses path-based routing
+// for service disambiguation when the endpoint is overridden.
+func (l *LocalStackContainer) KMSEndpoint() string {
+	return l.Endpoint
 }

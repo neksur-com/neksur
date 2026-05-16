@@ -85,3 +85,12 @@ func (g *glueAdapter) Capabilities() iceberg.Capabilities {
 		MaxNamespaceDepth: 1,
 	}
 }
+
+// IssueScopedSTSCredentials: not implemented in Phase 2 — returns
+// ErrAdapterStub per D-2.09. Glue's STS shape differs from Polaris
+// (different token format, different API). Phase 3+ lights Glue live.
+// Defense-in-depth on top of the CR-03 boot-time guard.
+func (g *glueAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	const op = "IssueScopedSTSCredentials"
+	return nil, fmt.Errorf("iceberg.glue_stub: %s: %w", op, iceberg.ErrAdapterStub)
+}

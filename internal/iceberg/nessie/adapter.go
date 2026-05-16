@@ -308,6 +308,16 @@ func (n *nessieAdapter) Capabilities() iceberg.Capabilities {
 	}
 }
 
+// IssueScopedSTSCredentials: Nessie does not support STS credential
+// vending (SupportsCredVend=false). Returns ErrAdapterStub. Nessie is a
+// branching catalog, not an STS-issuing catalog — this method exists to
+// satisfy the IcebergCatalogClient interface extension added in Phase 2
+// Plan 02-07. Phase 3+ may revisit if Nessie adds credential vending.
+func (n *nessieAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	const op = "IssueScopedSTSCredentials"
+	return nil, fmt.Errorf("iceberg.nessie: %s: %w", op, iceberg.ErrAdapterStub)
+}
+
 // translateError converts an iceberg-go-side error to one of the
 // Phase 1 sentinels when the shape matches; otherwise wraps with
 // the call-site-supplied prefix. Inspecting err.Error() for the

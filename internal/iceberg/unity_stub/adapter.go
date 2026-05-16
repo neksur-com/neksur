@@ -83,3 +83,13 @@ func (u *unityAdapter) Capabilities() iceberg.Capabilities {
 		MaxNamespaceDepth: 1,
 	}
 }
+
+// IssueScopedSTSCredentials: not implemented in Phase 2 — returns
+// ErrAdapterStub per D-2.09. Phase 3 lights up live Unity STS when
+// the real Unity adapter ships. Defense-in-depth on top of the
+// CR-03 boot-time assertNoUnsupportedCatalogs guard that prevents
+// live Unity tenants from existing in Phase 2.
+func (u *unityAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	const op = "IssueScopedSTSCredentials"
+	return nil, fmt.Errorf("iceberg.unity_stub: %s: %w", op, iceberg.ErrAdapterStub)
+}

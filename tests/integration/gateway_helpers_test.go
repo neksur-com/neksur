@@ -141,6 +141,10 @@ func (f *fakeIcebergAdapter) Capabilities() iceberg.Capabilities {
 	return iceberg.Capabilities{Name: "fake", MaxNamespaceDepth: 1}
 }
 
+func (f *fakeIcebergAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	return nil, iceberg.ErrAdapterStub
+}
+
 // startGatewayHarness boots a Phase1Fixture, provisions a tenant, and
 // wires the gateway handlers against a fake adapter. Returns a fully-
 // constructed harness; callers MUST defer h.terminate() via t.Cleanup

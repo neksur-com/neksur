@@ -30,8 +30,10 @@ import (
 	"time"
 )
 
-// IcebergCatalogClient is the 6-method surface every catalog adapter
+// IcebergCatalogClient is the 7-method surface every catalog adapter
 // satisfies. D-1.01 + D-1.03: tiny interface + per-catalog Config.
+// Phase 2 Plan 02-07 extends Phase 1's 6-method interface with
+// IssueScopedSTSCredentials (L4 credential vending per D-2.09).
 //
 // The interface is intentionally narrow — Phase 1 ingestion +
 // L1 gateway need exactly these six operations and nothing more.
@@ -80,6 +82,33 @@ type IcebergCatalogClient interface {
 	// does it support credential vending? what is the max namespace
 	// depth so the planner can reject ListTables on too-deep paths?).
 	Capabilities() Capabilities
+
+	// IssueScopedSTSCredentials issues short-lived AWS STS credentials
+	// scoped to the specified table and region per D-2.09 (L4 credential
+	// vending). The Polaris adapter calls Polaris's vended-credentials
+	// path (X-Iceberg-Access-Delegation header); Unity and Glue stub
+	// adapters return iceberg.ErrAdapterStub (Phase 3 lights these live).
+	//
+	// Session policy narrows the returned credentials to s3:PutObject
+	// only on the table prefix and allowed region (Pitfall 1: Resource
+	// must be a JSON array, not a bare string).
+	//
+	// Returns ErrAdapterStub for catalogs that do not yet support
+	// live credential vending (Unity, Glue in Phase 2).
+	IssueScopedSTSCredentials(ctx context.Context, table TableRef, region string) (*STSCredentials, error)
+}
+
+// STSCredentials holds the short-lived AWS STS credentials returned by
+// the L4 credential vending path (D-2.09). All fields are required on
+// a successful Polaris vend; Expiration is parsed from the Polaris 1.4
+// loadTable response config block (s3.session-expiration — Iceberg REST
+// #11118 standardization, Pitfall 7).
+type STSCredentials struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Expiration      time.Time
+	Region          string
 }
 
 // TableRef is the catalog-agnostic table identifier. Namespace is a
