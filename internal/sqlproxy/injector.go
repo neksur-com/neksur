@@ -85,6 +85,25 @@ type CacheKey struct {
 	Engine    string
 }
 
+// ArtifactEntry is the LRU cache value shape. Carries both the
+// engine-native artifact body AND the discriminator kind so the
+// runtime splicer (dialect/splice.go) does not have to re-fetch
+// the CompiledPolicy node on a cache hit just to learn the kind.
+// Plan 02-12 widened this from a bare []byte to capture the kind
+// alongside the body when the splicer became kind-discriminated.
+type ArtifactEntry struct {
+	// Body is the engine-native artifact body — either a WHERE-clause
+	// predicate (KindRowFilter) or a comma-separated `col AS expr`
+	// list (KindColumnMask). Opaque to the cache layer.
+	Body []byte
+	// Kind is the store.Kind* discriminator that tells the splicer
+	// which splice path to apply. Stored as a bare string to keep
+	// this package's import graph free of policy/store (the dialect
+	// package owns the store import; this package only carries the
+	// raw value through).
+	Kind string
+}
+
 // Injector is the per-dialect rewriter contract. Implementations
 // are constructed via BuildInjector and stored in Server.Deps.Injectors
 // keyed by their EngineKind string ("trino", "spark", "bigquery",
@@ -126,8 +145,11 @@ type InjectorDeps struct {
 
 	// Cache is the process-local LRU for compiled artifacts. Shared
 	// across all dialect implementations: the CacheKey carries the
-	// Engine field so per-dialect entries never collide.
-	Cache *lru.Cache[CacheKey, []byte]
+	// Engine field so per-dialect entries never collide. The cache
+	// value (ArtifactEntry) carries both the artifact body and the
+	// kind discriminator so the splicer can route on a cache hit
+	// without re-fetching the CompiledPolicy node.
+	Cache *lru.Cache[CacheKey, ArtifactEntry]
 }
 
 // BuildInjector moved to internal/sqlproxy/dialect/builder.go in

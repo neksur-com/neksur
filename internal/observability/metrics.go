@@ -139,8 +139,21 @@ const (
 	// ErrEngineNotSupported (HTTP 501 mapping).
 	ReasonSqlProxyEngineNotSupported = "engine_not_supported"
 	// ReasonSqlProxyInjectionFailed — per-dialect rewriter rejected
-	// the query (HTTP 422 mapping).
+	// the query (HTTP 422 mapping). Phase 2 splicer (Plan 02-12) uses
+	// this for malformed SQL only; grammar-mismatch and column-mask
+	// authoring issues get the distinct labels below.
 	ReasonSqlProxyInjectionFailed = "injection_failed"
+	// ReasonSqlProxyUnsupportedQueryShape — splicer rejected the query
+	// shape (JOIN, subquery, CTE, set operation, non-SELECT DML —
+	// Plan 02-12 CR-A3). HTTP 422 mapping. Distinct from
+	// `injection_failed` so SREs can dashboard "Phase 3 extension
+	// surface signal" separately from "malformed SQL signal".
+	ReasonSqlProxyUnsupportedQueryShape = "unsupported_query_shape"
+	// ReasonSqlProxySpliceMismatch — column-mask splicer rejected the
+	// request because the user's projection used `*` (Phase 2 cannot
+	// expand schema-less SELECT) OR a masked column is absent from
+	// the projection list (Plan 02-12 CR-A3). HTTP 422 mapping.
+	ReasonSqlProxySpliceMismatch = "splice_mismatch"
 )
 
 // SqlProxyOverheadMs is the end-to-end sqlproxy handler latency
@@ -178,7 +191,8 @@ var SqlProxyInjectFailuresTotal = promauto.NewCounterVec(
 		Name: "sql_proxy_inject_failures_total",
 		Help: "sqlproxy injection failures by engine + reason. " +
 			"Allowed reasons: policy_engine_unavailable | " +
-			"engine_not_supported | injection_failed.",
+			"engine_not_supported | injection_failed | " +
+			"unsupported_query_shape | splice_mismatch.",
 	},
 	[]string{"engine", "reason"},
 )

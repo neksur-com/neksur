@@ -186,7 +186,7 @@ func startSqlproxyTestServer(t *testing.T, fx *Phase2Fixture) (*httptest.Server,
 	gc, err := graph.NewGraphClient(context.Background(), fx.Container.SuperuserDSN)
 	require.NoError(t, err)
 	t.Cleanup(gc.Close)
-	cache, err := lru.New[sqlproxy.CacheKey, []byte](128)
+	cache, err := lru.New[sqlproxy.CacheKey, sqlproxy.ArtifactEntry](128)
 	require.NoError(t, err)
 	injDeps := sqlproxy.InjectorDeps{
 		Store: store.NewCompiledStore(gc),

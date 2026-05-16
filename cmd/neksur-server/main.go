@@ -312,7 +312,7 @@ func runWithSaasAuth(ctx context.Context) error {
 	// Phase2Fixture (tests/testfixture/mtls_cert.go).
 	var sqlProxyShutdown func(context.Context) error
 	{
-		sqlProxyCache, err := lru.New[sqlproxy.CacheKey, []byte](4096)
+		sqlProxyCache, err := lru.New[sqlproxy.CacheKey, sqlproxy.ArtifactEntry](4096)
 		if err != nil {
 			return fmt.Errorf("sqlproxy cache: %w", err)
 		}

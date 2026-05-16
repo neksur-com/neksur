@@ -1,7 +1,12 @@
 // SparkInjector — sqlproxy.Injector implementation for the Spark
-// dialect. Wave 2 Plan 02-05 dispatch B. Mirrors TrinoInjector in
-// structure; differs only in the engine label used for the CacheKey
-// and the CompiledPolicy filter.
+// dialect. Wave 2 Plan 02-05 dispatch B + Plan 02-12 CR-A3 splicer.
+// Mirrors TrinoInjector in structure; differs only in the engine
+// label used for the CacheKey and the CompiledPolicy filter. The
+// splice logic in splice.go is dialect-agnostic for SELECT shape
+// and dialect-specific only in the function-name vocabulary the
+// per-dialect compiler emits inside artifact bodies (already
+// handled by the Phase 2 internal/policy/compiler/dialect/
+// subdirectory).
 
 package dialect
 
@@ -21,18 +26,19 @@ import (
 // the per-field rationale — the two structs share an identical shape.
 type SparkInjector struct {
 	store *store.CompiledStore
-	cache *lru.Cache[sqlproxy.CacheKey, []byte]
+	cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
 }
 
 // NewSparkInjector constructs a SparkInjector bound to the given
 // CompiledStore + shared LRU cache.
-func NewSparkInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, []byte]) *SparkInjector {
+func NewSparkInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *SparkInjector {
 	return &SparkInjector{store: s, cache: cache}
 }
 
 // InjectPolicy fetches the active Spark CompiledPolicy artifact for
-// (tenant=ctx, table) and structurally rewrites `query` — see
-// dialect.go package doc for the Phase 2 rewrite-shape contract.
+// (tenant=ctx, table) and splices it into `query` via
+// dialect.SpliceArtifact (Plan 02-12 — replaces the iter-1 no-op
+// comment-appending rewrite).
 //
 // Per Pitfall 11: no query body or artifact body is ever logged.
 func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sqlproxy.TableRef, principal sqlproxy.Claims) (string, string, error) {
@@ -48,8 +54,8 @@ func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sq
 		Engine:    "spark",
 	}
 
-	if body, hit := i.cache.Get(cacheKey); hit {
-		rewritten, rerr := rewriteWithBody(query, body, principal)
+	if entry, hit := i.cache.Get(cacheKey); hit {
+		rewritten, rerr := SpliceArtifact(query, entry.Body, entry.Kind, principal)
 		if rerr != nil {
 			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/spark: %w", rerr)
 		}
@@ -65,15 +71,19 @@ func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sq
 	}
 
 	for _, cp := range compiled {
-		if cp.EngineKind == "spark" && cp.Status == store.CompiledPolicyStatusActive {
-			body := []byte(cp.ArtifactBody)
-			i.cache.Add(cacheKey, body)
-			rewritten, rerr := rewriteWithBody(query, body, principal)
-			if rerr != nil {
-				return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/spark: %w", rerr)
-			}
-			return rewritten, sqlproxy.CacheStatusMiss, nil
+		if cp.EngineKind != "spark" || cp.Status != store.CompiledPolicyStatusActive {
+			continue
 		}
+		if cp.ArtifactKind == store.KindPredicate {
+			continue
+		}
+		entry := sqlproxy.ArtifactEntry{Body: []byte(cp.ArtifactBody), Kind: cp.ArtifactKind}
+		i.cache.Add(cacheKey, entry)
+		rewritten, rerr := SpliceArtifact(query, entry.Body, entry.Kind, principal)
+		if rerr != nil {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/spark: %w", rerr)
+		}
+		return rewritten, sqlproxy.CacheStatusMiss, nil
 	}
 
 	return "", sqlproxy.CacheStatusMiss, fmt.Errorf("dialect/spark: no active policy: %w", sqlproxy.ErrPolicyEngineUnavailable)

@@ -15,7 +15,9 @@
 //   - 400 — malformed path identifier (engine / prefix segment failed
 //     identifierRegex) OR body parse error.
 //   - 413 — request body exceeded 1 MiB cap (http.MaxBytesReader).
-//   - 422 — Injector returned ErrInjectionFailed (un-rewritable SQL).
+//   - 422 — Injector returned ErrInjectionFailed (un-rewritable SQL)
+//     OR ErrUnsupportedQueryShape (JOIN/subquery/CTE — Plan 02-12)
+//     OR ErrSpliceMismatch (column-mask vs SELECT * — Plan 02-12).
 //   - 500 — tenant ctx missing OR unexpected Injector error.
 //   - 501 — engine kind not registered (Dremio / Snowflake stubs) OR
 //     Injector returned ErrEngineNotSupported.
@@ -265,6 +267,31 @@ func (s *Server) handleInject(w http.ResponseWriter, r *http.Request) {
 				"engine", engine, "table", req.Table.Name)
 			http.Error(w, "engine not supported", http.StatusNotImplemented)
 			finish(http.StatusNotImplemented, req.Table.Name)
+			return
+		case errors.Is(ierr, ErrUnsupportedQueryShape):
+			// Plan 02-12 (CR-A3): the splicer rejected the query as
+			// outside the Phase 2 single-table SELECT grammar (JOIN,
+			// subquery, CTE, etc.). Use Warn (not Error) — this is a
+			// policy-authoring / client-grammar issue, not an engine
+			// outage. The distinct reason label lets SREs distinguish
+			// "Phase 3 extension surface" from "malformed SQL".
+			observability.SqlProxyInjectFailuresTotal.
+				WithLabelValues(engine, observability.ReasonSqlProxyUnsupportedQueryShape).Inc()
+			s.deps.Logger.Warn("sqlproxy: unsupported query shape",
+				"engine", engine, "table", req.Table.Name)
+			http.Error(w, "unsupported query shape (Phase 2: single-table SELECT only)", http.StatusUnprocessableEntity)
+			finish(http.StatusUnprocessableEntity, req.Table.Name)
+			return
+		case errors.Is(ierr, ErrSpliceMismatch):
+			// Plan 02-12 (CR-A3): column-mask splicer cannot apply the
+			// artifact (SELECT * or masked column absent from
+			// projection). Use Warn — policy-authoring issue.
+			observability.SqlProxyInjectFailuresTotal.
+				WithLabelValues(engine, observability.ReasonSqlProxySpliceMismatch).Inc()
+			s.deps.Logger.Warn("sqlproxy: splice mismatch",
+				"engine", engine, "table", req.Table.Name)
+			http.Error(w, "splice mismatch (column-mask requires explicit column projection)", http.StatusUnprocessableEntity)
+			finish(http.StatusUnprocessableEntity, req.Table.Name)
 			return
 		case errors.Is(ierr, ErrInjectionFailed):
 			observability.SqlProxyInjectFailuresTotal.
