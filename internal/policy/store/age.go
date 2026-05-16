@@ -124,7 +124,15 @@ func (s *AGEStore) LoadPoliciesForTable(ctx context.Context, ref iceberg.TableRe
 		// Audit anchor: the openCypher disjunction shape this code emulates is
 		//   MATCH (p:Policy)-[:SCHEMA_GOVERNS|WRITE_GOVERNS]->(t:Table {name, namespace})
 		// (split into two queries below for AGE 1.6 compatibility).
-		for _, edgeLabel := range []string{"SCHEMA_GOVERNS", "WRITE_GOVERNS"} {
+		for _, edgeLabel := range []string{
+			"SCHEMA_GOVERNS",
+			"WRITE_GOVERNS",
+			"RETENTION_GOVERNS",
+			"RESIDENCY_GOVERNS",
+			"CLASSIFICATION_GOVERNS",
+			"PARTITION_GOVERNS",
+			"ABAC_GOVERNS",
+		} {
 			policyCypher := fmt.Sprintf(
 				`MATCH (p:Policy)-[:%s]->(t:Table {name: '%s', namespace: '%s'}) RETURN p.id, p.kind, p.definition_cel`,
 				edgeLabel,
