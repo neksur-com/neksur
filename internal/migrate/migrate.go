@@ -216,6 +216,44 @@ const Phase1MaxVersion = "0066"
 // assert that the runner reached the end of the Phase 1 graph schema.
 const GraphPhase1MaxVersion = "0032"
 
+// Phase2MaxVersion is the highest expected version number for Phase 2
+// per-tenant relational migrations (V0070–V0073 added in Plan 02-01).
+// Used by tests and the cmd/migrate tenant-loop high-water-mark
+// assertion to confirm a successful tenant apply lands every Phase 2
+// table — see tests/integration/phase2_migrations_applied_per_tenant_test.go.
+//
+// V0070 — public.engines registry (D-2.08; public-tier, not per-tenant).
+// V0071 — public.tenants.tenant_default_attributes column (D-2.10 ABAC
+//         layer 3 fallback; public-tier, not per-tenant).
+// V0072 — per-tenant policy_compile_log (D-2.05 + OQ4 resolution).
+// V0073 — per-tenant policy_changed LISTEN/NOTIFY trigger (D-2.05 substrate).
+//
+// Note: V0070 + V0071 are PUBLIC-tier migrations but Atlas applies them
+// in numeric order alongside per-tenant migrations. The PublicMaxVersion
+// stop-marker (currently "0044") prevents V0070+ from running against
+// public during ApplyPublic; instead they ride the per-tenant loop. This
+// is the same pattern Phase 1's V0060+ established (per-tenant migrations
+// numbered above PublicMaxVersion are applied per-tenant via ApplyTenant).
+//
+// However V0070 + V0071 are public-tier targets — they're applied per
+// each tenant's loop iteration but the SQL targets `public.*`. That's
+// idempotent (CREATE TABLE IF NOT EXISTS + ADD COLUMN IF NOT EXISTS) so
+// re-applying from N tenants is a no-op after the first apply. Atlas
+// records the migration as applied in each tenant's per-tenant revisions
+// table, which is correct bookkeeping per the Plan 04 trade-off.
+const Phase2MaxVersion = "0073"
+
+// Phase2GraphMaxVersion is the highest expected version number for the
+// per-tenant AGE graph migrations after Plan 02-01 (V0040–V0042). The
+// graph-migration runner ApplyTenantGraph (graph.go) walks
+// migrations/graph/V*.sql lexicographically; this constant lets tests
+// assert that the runner reached the end of the Phase 2 graph schema.
+//
+// V0040 — 2 new vlabels + 10 new elabels (D-2.02 + D-2.04 + D-2.10).
+// V0041 — property + GC-01 structural indexes for the 10 new elabels.
+// V0042 — FORCE RLS + 4 policies + CHECK constraint per new label.
+const Phase2GraphMaxVersion = "0042"
+
 // ApplyTenant applies all pending tenant-tier migrations to the given
 // tenant schema. Composes a search_path-scoped DSN of the form
 //
