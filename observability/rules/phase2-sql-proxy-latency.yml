@@ -1,0 +1,139 @@
+# Phase 2 SQL proxy latency alert rules — Phase 2 Plan 02-08 Task 2.
+#
+# Two rules cover the P95 + P99 overhead percentiles emitted by
+# `internal/sqlproxy/metrics.go::sql_proxy_overhead_ms` (histogram):
+#
+#   - SqlProxyP95Breach  (severity=page) →
+#     pagerduty per Phase 0.5 alertmanager severity-tier routing.
+#     Fires when P95 proxy overhead exceeds 50ms sustained 5m.
+#     REQ-NFR-latency-sql-proxy: P95 < 50ms target.
+#
+#   - SqlProxyP99Breach  (severity=page) →
+#     pagerduty per the same severity-tier routing.
+#     Fires when P99 proxy overhead exceeds 150ms sustained 5m.
+#     REQ-NFR-latency-sql-proxy: P99 < 150ms target.
+#
+# Both alerts measure ONLY the SQL proxy overhead (time in proxy minus
+# upstream SQL engine execution time), NOT end-to-end query latency.
+# High overhead indicates: cache miss on CompiledPolicy lookup,
+# large result set in column-mask phase, or complex row-filter SQL.
+#
+# Runbook: runbooks/sql-proxy-deploy.md §SqlProxyP95Breach / SqlProxyP99Breach Alert Response.
+# Verified by: go test -tags integration tests/integration/sqlproxy_trino_test.go
+#   (Plan 02-05 integration test asserts overhead histogram has samples).
+#
+# prometheus.yml inclusion: this file is referenced from
+# observability/prometheus.yml rule_files list (Plan 02-08 Task 2).
+
+groups:
+  - name: phase2.sql_proxy_latency
+    interval: 30s
+    rules:
+      # ----------------------------------------------------------------
+      # SqlProxyP95Breach — P95 overhead > 50ms (REQ-NFR-latency-sql-proxy).
+      #
+      # The `sql_proxy_overhead_ms` histogram is emitted per-request by
+      # the SQL proxy component (internal/sqlproxy/middleware.go). The
+      # metric measures: time from receiving the client query to completing
+      # the row-filter injection + column-mask application + forwarding to
+      # the upstream engine. Does NOT include upstream engine execution time.
+      #
+      # Threshold: 50ms (REQ-NFR-latency-sql-proxy P95 requirement).
+      # Window: 5m rate ([5m] avoids false-positives from transient spikes).
+      # For: 5m — sustained breach across two consecutive evaluation intervals.
+      #
+      # severity=page: P95 latency breach blocks real-time Spark/Trino
+      # queries; SRE must investigate within 5 minutes. The overhead budget
+      # for the proxy (50ms P95) is tight — breach typically indicates:
+      #   - CompiledPolicy cache miss (policy_lookup phase)
+      #   - Very large result set going through column masking
+      #   - DB connectivity issue (CompiledPolicy re-fetch)
+      #
+      # Follow runbooks/sql-proxy-deploy.md §Alert Response for the
+      # phase-breakdown PromQL query that identifies the slow phase.
+      # ----------------------------------------------------------------
+      - alert: SqlProxyP95Breach
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(sql_proxy_overhead_ms_bucket[5m])) by (le)
+          ) > 50
+        for: 5m
+        labels:
+          severity: page
+          phase: "2"
+          component: sql-proxy
+          contract: REQ-NFR-latency-sql-proxy
+        annotations:
+          summary: "Neksur SQL proxy P95 overhead exceeds 50ms (REQ-NFR-latency-sql-proxy breach)"
+          description: |
+            sql_proxy_overhead_ms P95 is > 50ms sustained 5m.
+            This is the PROXY overhead only (row-filter injection +
+            column-mask + CompiledPolicy lookup) — upstream SQL engine
+            execution time is NOT included.
+
+            Typical causes:
+              - CompiledPolicy cache miss (policy_lookup phase > 5ms)
+              - Large result set in column-mask phase (> 10,000 rows)
+              - DB connectivity degradation (CompiledPolicy re-fetch from Postgres)
+
+            Diagnosis (phase breakdown):
+              histogram_quantile(0.95, sum by (phase, le) (
+                rate(sql_proxy_overhead_ms_bucket[5m])
+              ))
+
+            Follow: runbooks/sql-proxy-deploy.md §SqlProxyP95Breach / SqlProxyP99Breach Alert Response
+
+            REQ-NFR-latency-sql-proxy: P95 target < 50ms; P99 target < 150ms.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/sql-proxy-deploy.md"
+
+      # ----------------------------------------------------------------
+      # SqlProxyP99Breach — P99 overhead > 150ms (REQ-NFR-latency-sql-proxy).
+      #
+      # P99 is a separate alert from P95 because the remediation differs:
+      #   - P95 breach → typically a cache warm-up or policy update issue.
+      #   - P99 breach → typically an outlier query with a very large result
+      #     set or a particularly complex row-filter SQL expression that
+      #     the Trino planner is struggling to optimize.
+      #
+      # Threshold: 150ms (REQ-NFR-latency-sql-proxy P99 requirement).
+      # Window: 5m rate.
+      # For: 5m — same sustained criterion as P95.
+      #
+      # severity=page: P99 breach means 1% of queries are >150ms;
+      # for a high-throughput Spark deployment this could be thousands
+      # of slow queries per hour.
+      # ----------------------------------------------------------------
+      - alert: SqlProxyP99Breach
+        expr: >
+          histogram_quantile(0.99,
+            sum(rate(sql_proxy_overhead_ms_bucket[5m])) by (le)
+          ) > 150
+        for: 5m
+        labels:
+          severity: page
+          phase: "2"
+          component: sql-proxy
+          contract: REQ-NFR-latency-sql-proxy
+        annotations:
+          summary: "Neksur SQL proxy P99 overhead exceeds 150ms (REQ-NFR-latency-sql-proxy breach)"
+          description: |
+            sql_proxy_overhead_ms P99 is > 150ms sustained 5m.
+            P99 breach typically indicates outlier queries with very large
+            result sets going through column masking, OR complex row-filter
+            SQL expressions that Trino's planner is struggling to optimize.
+
+            Diagnosis (identify slowest queries by tenant):
+              topk(10, sum by (tenant_id) (
+                rate(sql_proxy_overhead_ms_sum[5m]) /
+                rate(sql_proxy_overhead_ms_count[5m])
+              ))
+
+            If the P95 alert is NOT also firing: this is a tail-latency
+            issue affecting only the slowest queries. Investigate per-query
+            row-filter SQL (use neksur-cli policy compiled-status to see
+            the transpiled SQL for the affected tenant).
+
+            Follow: runbooks/sql-proxy-deploy.md §SqlProxyP95Breach / SqlProxyP99Breach Alert Response
+
+            REQ-NFR-latency-sql-proxy: P95 target < 50ms; P99 target < 150ms.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/sql-proxy-deploy.md"

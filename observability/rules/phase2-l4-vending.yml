@@ -1,0 +1,149 @@
+# Phase 2 L4 credential vending alert rules — Phase 2 Plan 02-08 Task 2.
+#
+# Two rules cover the L4 STS credential vending failure rates emitted by
+# `internal/credvend/metrics.go::l4_token_failures_total` (counter) and
+# `internal/credvend/metrics.go::kms_generate_data_key_total` (counter):
+#
+#   - L4VendingFailureSpike   (severity=page) →
+#     pagerduty per Phase 0.5 alertmanager severity-tier routing.
+#     Fires when l4_token_failures_total rate > 5/s for 5m.
+#     D-2.09: STS vending failure = Spark executors cannot get creds →
+#     data pipeline blocked.
+#
+#   - KMSThrottlingWarn       (severity=warn) →
+#     slack #oncall-warn per the same severity-tier routing.
+#     Fires when kms_generate_data_key_total{cache_status="error"} increases
+#     more than 10 times in 5m (Pitfall 10 early warning).
+#
+# Runbook: runbooks/sts-vending-incident.md.
+# Verified by: TestL4VendingMetrics in
+#   tests/integration/credvend_polaris_sts_test.go (Plan 02-07).
+#
+# prometheus.yml inclusion: this file is referenced from
+# observability/prometheus.yml rule_files list (Plan 02-08 Task 2).
+
+groups:
+  - name: phase2.l4_vending
+    interval: 30s
+    rules:
+      # ----------------------------------------------------------------
+      # L4VendingFailureSpike — STS credential vending failures > 5/s.
+      #
+      # The `l4_token_failures_total` counter is incremented by
+      # `internal/credvend/handler.go` on every failed `/v1/credvend/sts`
+      # request. The `error_type` label distinguishes the failure path:
+      #   - session_policy_malformed  → Pitfall 1 (Resource string-vs-array)
+      #   - polaris_config_key_not_found → Pitfall 7 (Polaris key mismatch)
+      #   - kms_throttle              → Pitfall 10 (KMS rate exhaustion)
+      #   - sts_assume_role_denied    → IAM misconfiguration
+      #   - table_not_found           → Polaris catalog error
+      #   - mtls_cert_expired         → mTLS cert rotation needed
+      #
+      # Threshold: > 5/s (five failures per second) sustained 5m.
+      # Even one `session_policy_malformed` failure per second (Pitfall 1)
+      # blocks ALL Spark executors for the affected tenant from getting
+      # credentials — they cannot write to ANY governed table.
+      #
+      # severity=page: STS failure = data pipeline blocked.
+      # Spark jobs fail with CredentialVendingException and do not retry
+      # (fail-secure per D-2.09). SRE must investigate within 5 minutes.
+      # ----------------------------------------------------------------
+      - alert: L4VendingFailureSpike
+        expr: sum(rate(l4_token_failures_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: page
+          phase: "2"
+          component: credvend
+          contract: D-2.09
+        annotations:
+          summary: "Neksur L4 STS credential vending failures > 5/s sustained 5m (D-2.09 — Spark executors blocked)"
+          description: |
+            l4_token_failures_total rate is > 5/s sustained 5m.
+            Spark executors are receiving HTTP 500 from /v1/credvend/sts
+            and cannot obtain STS credentials for governed tables.
+            Data pipelines are BLOCKED (fail-secure per D-2.09).
+
+            Identify failure type by error_type label:
+              topk(10, sum by (tenant_id, error_type) (
+                rate(l4_token_failures_total[5m])
+              ))
+
+            Common error_type → runbook section:
+              session_policy_malformed   → §2 Pitfall 1 (Resource string-vs-array)
+              polaris_config_key_not_found → §3 Pitfall 7 (Polaris key mismatch)
+              kms_throttle               → §4 Pitfall 10 (KMS rate exhaustion)
+              sts_assume_role_denied     → §5 IAM / STS AssumeRole Failures
+              mtls_cert_expired          → §6 + runbooks/mtls-cert-rotation.md
+
+            Check NEKSUR_POLARIS_VENDING_ENABLED env var:
+              If false, Polaris vending is disabled (stub path) — failures
+              indicate the stub is also failing (unexpected).
+
+            Follow: runbooks/sts-vending-incident.md §1 Identify the Failure Type
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/sts-vending-incident.md"
+
+      # ----------------------------------------------------------------
+      # KMSThrottlingWarn — KMS GenerateDataKey throttle errors increasing.
+      #
+      # The `kms_generate_data_key_total` counter is incremented by
+      # `internal/credvend/kms_cache.go` on every KMS GenerateDataKey call.
+      # The `cache_status` label:
+      #   - "hit"   : served from BatchCache (no KMS call)
+      #   - "miss"  : cache miss, KMS call succeeded
+      #   - "error" : KMS call failed (includes ThrottlingException)
+      #
+      # Threshold: increase(kms_generate_data_key_total{cache_status="error"}[5m]) > 10
+      # `increase()` is appropriate here (not `rate()`) because we want to
+      # detect absolute counts of KMS errors in a 5-minute window. A KMS
+      # throttle typically manifests as bursts, not a sustained rate —
+      # `increase()` is more sensitive to burst patterns.
+      #
+      # severity=warn: KMS throttling is an early warning of impending
+      # L4VendingFailureSpike. If KMS errors are building, the BatchCache
+      # TTL should be raised (immediate mitigation — see runbook §4)
+      # before the spike crosses the page threshold.
+      #
+      # This is a WARN (not page) because the BatchCache absorbs most
+      # KMS throttling — the cached credentials serve Spark executors
+      # while KMS throttle resolves. Only when the cache miss rate rises
+      # will vending actually fail.
+      # ----------------------------------------------------------------
+      - alert: KMSThrottlingWarn
+        expr: increase(kms_generate_data_key_total{cache_status="error"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: warn
+          phase: "2"
+          component: credvend
+          contract: Pitfall-10
+        annotations:
+          summary: "Neksur KMS GenerateDataKey throttling detected (Pitfall 10 — > 10 errors in 5m)"
+          description: |
+            kms_generate_data_key_total{cache_status="error"} increased by
+            more than 10 in the last 5 minutes. This indicates KMS
+            GenerateDataKey is being throttled (ThrottlingException from AWS).
+
+            The BatchCache in internal/credvend/kms_cache.go is absorbing
+            the throttle — cached credentials are still being served.
+            However, if the throttle persists, cache misses will start
+            resulting in L4VendingFailureSpike.
+
+            Immediate mitigation — raise BatchCache TTL to 30min:
+              kubectl set env deployment/neksur-server -n neksur-system \
+                NEKSUR_KMS_CACHE_TTL_SECONDS=1800
+              kubectl rollout restart deployment/neksur-server -n neksur-system
+
+            Medium-term mitigation — request KMS quota increase:
+              aws service-quotas request-service-quota-increase \
+                --service-code kms \
+                --quota-code L-2AC2B0B4 \
+                --desired-value 10000 \
+                --region us-east-1
+
+            Check current quota:
+              aws service-quotas get-service-quota \
+                --service-code kms --quota-code L-2AC2B0B4 --region us-east-1
+
+            Follow: runbooks/sts-vending-incident.md §4 Pitfall 10 — KMS Rate Exhaustion
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/sts-vending-incident.md"

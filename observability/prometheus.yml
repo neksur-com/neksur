@@ -36,7 +36,10 @@ global:
 rule_files:
   - /etc/prometheus/alerts/cypher-latency.yaml         # Phase 0 (Plan 00-05)
   - /etc/prometheus/alerts/clock-skew.yaml             # Phase 0 (Plan 00-05)
-  - rules/phase1-commit-rejected.yml                   # Phase 1 (Plan 01-09 — NEW)
+  - rules/phase1-commit-rejected.yml                   # Phase 1 (Plan 01-09)
+  - rules/phase2-sql-proxy-latency.yml                 # Phase 2 (Plan 02-08 — SqlProxyP95Breach + SqlProxyP99Breach)
+  - rules/phase2-policy-compile.yml                    # Phase 2 (Plan 02-08 — PolicyCompileFailureRate)
+  - rules/phase2-l4-vending.yml                        # Phase 2 (Plan 02-08 — L4VendingFailureSpike + KMSThrottlingWarn)
 
 alerting:
   alertmanagers:

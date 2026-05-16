@@ -1,0 +1,88 @@
+# Phase 2 policy compile failure alert rules — Phase 2 Plan 02-08 Task 2.
+#
+# One rule covers the compile + probe failure rate emitted by
+# `internal/compiler/metrics.go::policy_compile_total` (counter):
+#
+#   - PolicyCompileFailureRate  (severity=page) →
+#     pagerduty per Phase 0.5 alertmanager severity-tier routing.
+#     Fires when compile_failed OR probe_failed rate exceeds 0.1/s for 5m.
+#     D-1.09 carryover: compiler failures mean policies are not activated;
+#     the fail-open state (no access control for the affected engine) is
+#     equivalent to the fail-closed risk from the L1 gateway perspective.
+#
+# The metric `policy_compile_total` has two status labels:
+#   - status="compile_failed"  : CEL or engine-specific transpilation error.
+#   - status="probe_failed"    : Compiled successfully but dry-run panicked.
+#   - status="active"          : Compiled and activated. (NOT covered by this alert.)
+#
+# Runbook: runbooks/policy-compile-debug.md.
+# Verified by: TestPolicyCompileFailureMetric in
+#   tests/integration/policy_compile_test.go (Plan 02-03).
+#
+# prometheus.yml inclusion: this file is referenced from
+# observability/prometheus.yml rule_files list (Plan 02-08 Task 2).
+
+groups:
+  - name: phase2.policy_compile
+    interval: 30s
+    rules:
+      # ----------------------------------------------------------------
+      # PolicyCompileFailureRate — compile_failed OR probe_failed sustained 5m.
+      #
+      # The `policy_compile_total` counter is incremented by the Phase 2
+      # cross-engine policy compiler (internal/compiler/compiler.go) after
+      # each compile attempt. The `status` label distinguishes the outcome.
+      #
+      # Threshold: > 0.1/s (one failure per 10 seconds sustained 5m).
+      # This threshold is intentionally low — even a single repeated compile
+      # failure on the same policy is a signal worth paging about, because
+      # the fail-open consequence (access control inactive for that engine)
+      # is a security risk, not just a performance issue.
+      #
+      # Window: rate([5m]) — 5 minute sliding window.
+      # For: 5m — sustained breach; filters out transient single failures.
+      #
+      # severity=page: see D-1.09 carryover — compile failures leave
+      # policies fail-open (no access control for affected engine).
+      # SRE must investigate which policy + engine + which tenants are
+      # exposed before escalating to security team (see runbook §2).
+      #
+      # Two status labels are OR'd together in one rule to avoid alert
+      # cardinality explosion; the runbook distinguishes the two paths.
+      # ----------------------------------------------------------------
+      - alert: PolicyCompileFailureRate
+        expr: >
+          sum(rate(policy_compile_total{status=~"compile_failed|probe_failed"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: page
+          phase: "2"
+          component: policy-compiler
+          contract: D-1.09
+        annotations:
+          summary: "Neksur policy compiler is failing: compile_failed or probe_failed rate > 0.1/s (D-1.09 fail-open state)"
+          description: |
+            policy_compile_total{status=~"compile_failed|probe_failed"} rate
+            is > 0.1/s sustained 5m. This means one or more policies are NOT
+            being compiled and activated — affected (policy_id, engine_kind)
+            tuples are in fail-open state (no access control for that engine).
+
+            Distinguish compile_failed vs probe_failed:
+              topk(10, sum by (policy_id, engine_kind, status) (
+                rate(policy_compile_total{status=~"compile_failed|probe_failed"}[5m])
+              ))
+
+            - compile_failed: CEL syntax error or engine transpilation error.
+              Check the policy CEL expression and engine binding availability.
+            - probe_failed: passes compile but panics on dry-run.
+              MOST LIKELY CAUSE: Pitfall 8 ABAC null-safety — missing has()
+              macro before principal.attribute() dereference.
+
+            Fail-open impact: if the affected policy covers high-value tables
+            (orders, payments, customers) and the engine is Trino or Spark,
+            escalate to security team IMMEDIATELY — access control is INACTIVE
+            for those tables on that engine.
+
+            Follow: runbooks/policy-compile-debug.md §1 Identify the Affected Policies
+            then §2 Diagnose by Failure Type.
+          runbook_url: "https://github.com/neksur-com/neksur-core/blob/main/runbooks/policy-compile-debug.md"

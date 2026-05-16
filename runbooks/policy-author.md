@@ -383,6 +383,187 @@ request to the Phase 1 platform engineer.
 
 ---
 
+## 7. Phase 2 Policy Classes — P4, P5, P7, and ABAC
+
+Phase 2 adds four new policy classes and new CEL bindings. These are evaluated by the
+cross-engine compiler (Plan 02-03) and applied by the SQL proxy (Plan 02-05) for
+read-path enforcement.
+
+### 7.1 P4 — Data Residency
+
+Ensures data from a specific table is only accessible from the declared region.
+
+**CEL binding:** `location.region(snapshot)` — returns the AWS region of the S3 bucket
+where the Iceberg snapshot data files reside.
+
+```cel
+// P4 — residency: only allow commits to tables whose data is in us-east-1.
+// Returns TRUE if the snapshot is stored in us-east-1; FALSE otherwise.
+location.region(snapshot) == 'us-east-1'
+```
+
+For multi-region allowlists:
+
+```cel
+location.region(snapshot) in ['us-east-1', 'us-west-2']
+```
+
+### 7.2 P5 — Column Classification
+
+Ensures encrypted classification is present on PII columns before the commit is accepted.
+
+**CEL binding:** `manifest.classification_satisfied(table, column_pattern, tag)` — returns
+TRUE if all columns matching `column_pattern` have a classification tag of `tag` or higher.
+
+```cel
+// P5 — classification: all columns matching *_ssn must be tagged ENCRYPTED.
+manifest.classification_satisfied(table, '.*_ssn', 'ENCRYPTED')
+```
+
+Combined P4 + P5 (both must be satisfied):
+
+```cel
+location.region(snapshot) == 'us-east-1' &&
+manifest.classification_satisfied(table, '.*_ssn', 'ENCRYPTED')
+```
+
+**Availability:** P5 binding (`manifest.classification_satisfied`) is NOT available on
+Dremio engine (Pitfall 11 — compile_failed expected for Dremio, use policy-compile-debug.md).
+
+### 7.3 P7 — Partition Spec Enforcement
+
+Ensures the Iceberg table uses an approved partition spec (e.g., must be partitioned by
+`region` for residency compliance).
+
+**CEL binding:** `manifest.partition_spec(table, spec_name)` — returns TRUE if the table's
+active partition spec includes a field named `spec_name`.
+
+```cel
+// P7 — partition spec: table must be partitioned by 'region' (residency enforcement).
+manifest.partition_spec(table, 'region')
+```
+
+**Availability:** P7 binding is Trino-only in Phase 2. Spark support deferred.
+
+### 7.4 ABAC — Attribute-Based Access Control
+
+**CEL binding:** `principal.attribute(key)` — returns the value of an attribute on the
+authenticated principal. Attributes come from the OIDC token claims or the mTLS cert SAN
+extensions, depending on the authentication path.
+
+```cel
+// ABAC — only principals with 'clearance' = 'top-secret' may access.
+// See Pitfall 8 for the mandatory null-safety pattern.
+has(principal.attribute('clearance')) && principal.attribute('clearance') == 'top-secret'
+```
+
+### 7.5 Row-Filter and Column-Mask Grammar
+
+Phase 2 adds SQL-side enforcement via the SQL proxy. The CEL policy can specify a
+row-filter (SQL WHERE fragment) and a column-mask (SQL CASE expression).
+
+**Row-filter example** (only show rows where region matches principal's region):
+
+```cel
+// Row-filter: injected as SQL WHERE clause by the SQL proxy.
+// principal.attribute('region') is resolved server-side for each query.
+principal.attribute('region') == row.region
+```
+
+Transpiled to SQL (Trino syntax):
+
+```sql
+WHERE region = 'us-east-1'  -- principal.attribute('region') resolved at query time
+```
+
+**Column-mask example** (mask SSN to last 4 digits):
+
+```cel
+// Column-mask: SSN column masked to 'XXX-XX-LAST4' for principals without clearance.
+// The mask is applied per-column in the SELECT result.
+has(principal.attribute('clearance')) && principal.attribute('clearance') == 'top-secret'
+  ? column.value
+  : concat('XXX-XX-', substring(column.value, -4))
+```
+
+---
+
+## 8. Pitfall 8 — ABAC Null-Safety (CRITICAL — D-2.10)
+
+**This is the single most critical Phase 2 authoring trap.** Incorrect ABAC expressions
+cause `probe_failed` compilation + 503 policy engine unavailable for all requests.
+
+### 8.1 The unsafe pattern (DO NOT USE)
+
+```cel
+// UNSAFE — panics on null receiver if 'clearance' attribute is absent on the principal:
+principal.attribute('clearance').contains('secret')
+```
+
+If the authenticated principal has no `clearance` attribute (e.g., a Spark executor using
+an STS-vended credential without the claim), `principal.attribute('clearance')` returns `nil`,
+and `.contains('secret')` on a nil receiver panics → `probe_failed` compilation → policy
+stays inactive → fail-open state (no access control for that engine).
+
+### 8.2 The safe pattern (ALWAYS USE)
+
+```cel
+// SAFE — has() macro checks existence before dereference (D-2.10 mandate):
+has(principal.attribute('clearance')) && principal.attribute('clearance').contains('secret')
+
+// Also safe for equality comparisons:
+has(principal.attribute('clearance')) && principal.attribute('clearance') == 'top-secret'
+
+// Also safe for multi-value attributes (attribute is a list):
+has(principal.attribute('groups')) && 'data-engineers' in principal.attribute('groups')
+```
+
+The `has()` macro short-circuits — if the attribute is absent, `has()` returns `false` and
+the right-hand side of `&&` is never evaluated. No panic, no probe failure.
+
+### 8.3 Rule: has() before every principal.attribute() dereference
+
+**Every** `principal.attribute('key')` usage must be preceded by `has(principal.attribute('key'))`:
+
+```cel
+// WRONG — no has() check:
+principal.attribute('department') == 'engineering'
+
+// CORRECT:
+has(principal.attribute('department')) && principal.attribute('department') == 'engineering'
+```
+
+**Compile-test first:**
+
+```bash
+neksur-cli policy compile my-abac-policy.cel
+# If the policy has a null-unsafe pattern, the probe will catch it:
+# "probe: eval error: attribute 'clearance' not found on principal map: <nil>.contains"
+```
+
+### 8.4 Why this happened (design rationale)
+
+`principal.attribute(key)` is bound as `MapType(StringType, DynType)` — any key access
+returns `dyn`. When the key is absent, cel-go returns a `types.NullValue` (not an error at
+compile time). The `.contains()` call on a null receiver is a runtime panic.
+
+The `has()` macro is cel-go's built-in idiomatic null guard for map access. The Phase 2
+compiler probes each ABAC policy with a synthetic principal that has NO attributes — this is
+the canonical way to catch unsafe patterns before they reach production.
+
+---
+
+## References
+
+- **D-2.01** — Row-filter + column-mask grammar + SQL proxy enforcement path.
+- **D-2.10** — ABAC null-safety mandate (Pitfall 8 — `has()` macro required).
+- **Plan 02-03 SUMMARY** — cross-engine policy compiler; P4/P5/P7/ABAC binding registration.
+- **Plan 02-05 SUMMARY** — SQL proxy + row-filter injection + column-mask application.
+- **runbooks/policy-compile-debug.md** — diagnosing `probe_failed` compilation errors.
+- **CEL spec § has() macro** — https://cel.dev/spec.html#macros
+
+---
+
 ## References
 
 - **ADR-005** — Cypher hardening contract (Phase 5 ratification gate
