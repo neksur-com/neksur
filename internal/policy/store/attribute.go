@@ -23,10 +23,19 @@
 //
 // Layer 2 (graph) reuses the same ExecuteInTenant + AGE wrapper pattern
 // as LoadPoliciesForTable in age.go: the Cypher body is built with
-// fmt.Sprintf around graph.MustSanitizeCypherLiteral-sanitised literals
+// fmt.Sprintf around assertSafeCypherLiteral-sanitised literals
 // (parameter binding into the Cypher body is not supported by AGE 1.6),
 // and the agtype scalar result is unwrapped via stripAgtypeQuotes (also
 // in age.go — same package, no re-export needed).
+//
+// WR-A1: the previous implementation called graph.MustSanitizeCypherLiteral
+// directly, which PANICS on bytes outside the ASCII allowlist. The
+// fail-soft contract at this layer (errors → "" → next layer consulted)
+// is incompatible with a panic — a single malformed input would have
+// crashed the gateway process. The refactor routes both splice inputs
+// through the non-panicking assertSafeCypherLiteral helper; rejection
+// emits a slog.WarnContext audit event and returns "" so Layer 3 takes
+// over (Pitfall 8).
 //
 // Layer 3 (admin pool) hits the catalog `tenants` row directly. The
 // admin pool is the SAME pool used for tenant lifecycle (repo.go,
@@ -39,6 +48,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -131,13 +141,14 @@ func (r *AttributeResolver) Resolve(
 //	MATCH (p:Principal {sub: $sub})-[:HAS_ATTRIBUTE]->(a:Attribute {name: $name})
 //	RETURN a.value LIMIT 1
 //
-// Both string literals are sanitised through graph.MustSanitizeCypherLiteral
-// (Phase 1 CR-01 mitigation) BEFORE being spliced into the Cypher body
-// — AGE 1.6 does not bind parameters into the Cypher body, so this is
-// the only safe way to interpolate user-controlled strings. The
-// principalSub originates from the request principal's `sub` OIDC
-// claim, which the gateway already validates against a strict regexp
-// before any policy code runs; defence-in-depth.
+// Both string literals are sanitised through assertSafeCypherLiteral
+// (Phase 1 CR-01 mitigation; WR-A1 closure replaces the previous
+// panic-on-reject MustSanitizeCypherLiteral routing) BEFORE being
+// spliced into the Cypher body — AGE 1.6 does not bind parameters into
+// the Cypher body, so this is the only safe way to interpolate
+// user-controlled strings. The principalSub originates from the request
+// principal's `sub` OIDC claim, which the gateway already validates
+// against a strict regexp before any policy code runs; defence-in-depth.
 //
 // A LIMIT 1 caps the cost at a single row even if the graph schema
 // drifts to allow multiple Attribute nodes per (Principal, name). The
@@ -146,13 +157,31 @@ func (r *AttributeResolver) Resolve(
 // a later migration).
 //
 // Errors are swallowed: a transient query failure returns "" and lets
-// Layer 3 take over.
+// Layer 3 take over (Pitfall 8 fail-soft contract). Unsafe-input
+// rejections from assertSafeCypherLiteral are logged via
+// slog.WarnContext so the audit trail still records the rejected input
+// without crashing the gateway process.
 func (r *AttributeResolver) layer2Graph(
 	ctx context.Context,
 	tenantID, principalSub, name string,
 ) string {
-	safeSub := graph.MustSanitizeCypherLiteral(principalSub)
-	safeName := graph.MustSanitizeCypherLiteral(name)
+	safeSub, err := assertSafeCypherLiteral(principalSub)
+	if err != nil {
+		slog.WarnContext(ctx, "attribute resolver: layer2Graph: unsafe principal sub",
+			"err", err,
+			"tenant_id", tenantID,
+		)
+		return ""
+	}
+	safeName, err := assertSafeCypherLiteral(name)
+	if err != nil {
+		slog.WarnContext(ctx, "attribute resolver: layer2Graph: unsafe attribute name",
+			"err", err,
+			"tenant_id", tenantID,
+			"name", name,
+		)
+		return ""
+	}
 	cypher := fmt.Sprintf(
 		`MATCH (p:Principal {sub: '%s'})-[:HAS_ATTRIBUTE]->(a:Attribute {name: '%s'}) RETURN a.value LIMIT 1`,
 		safeSub, safeName,
@@ -163,7 +192,7 @@ func (r *AttributeResolver) layer2Graph(
 	)
 
 	var value string
-	err := r.gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
+	err = r.gc.ExecuteInTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, qErr := tx.Query(ctx, query)
 		if qErr != nil {
 			return qErr

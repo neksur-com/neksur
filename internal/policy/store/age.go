@@ -108,11 +108,30 @@ func (s *AGEStore) LoadPoliciesForTable(ctx context.Context, ref iceberg.TableRe
 	var policies []cel.Policy
 
 	err := s.gc.ExecuteInTenant(ctx, tenantID.String(), func(ctx context.Context, tx pgx.Tx) error {
+		// WR-A1 closure: sanitise the two caller-supplied identifiers
+		// ONCE before the loop + P3 block, instead of re-running the
+		// allowlist check on every iteration. Errors propagate up the
+		// ExecuteInTenant boundary so the gateway's fail-closed Evaluate
+		// path emits 503 + audit-log (rather than the previous behaviour
+		// where the deleted helper routed to graph's panicking variant
+		// on a bypass of the upstream identifier validator).
+		safeName, err := assertSafeCypherLiteral(ref.Name)
+		if err != nil {
+			return fmt.Errorf("policy/store: load policies: sanitize table name: %w", err)
+		}
+		safeNamespace, err := assertSafeCypherLiteral(ns)
+		if err != nil {
+			return fmt.Errorf("policy/store: load policies: sanitize namespace: %w", err)
+		}
+
 		// P1 + P2 — generic Policy nodes.
 		// AGE 1.6 quirks (Plan 01-04 lessons applied):
 		//   - parameter binding into the Cypher body is NOT directly
 		//     supported — we splice the values via fmt.Sprintf with
-		//     escapeCypher to defend against quote injection.
+		//     pre-validated safeName + safeNamespace locals (the
+		//     assertSafeCypherLiteral allowlist rejects quote / brace /
+		//     dollar / backslash / control / non-ASCII so the inner
+		//     single-quoted Cypher literal cannot be broken out of).
 		//   - the disjunction edge label syntax `:A|B` is in the openCypher
 		//     spec but AGE 1.6 rejects `:SCHEMA_GOVERNS|WRITE_GOVERNS`
 		//     with `syntax error at or near "|"` (SQLSTATE 42601). We work
@@ -136,8 +155,8 @@ func (s *AGEStore) LoadPoliciesForTable(ctx context.Context, ref iceberg.TableRe
 			policyCypher := fmt.Sprintf(
 				`MATCH (p:Policy)-[:%s]->(t:Table {name: '%s', namespace: '%s'}) RETURN p.id, p.kind, p.definition_cel`,
 				edgeLabel,
-				escapeCypher(ref.Name),
-				escapeCypher(ns),
+				safeName,
+				safeNamespace,
 			)
 			policyQuery := fmt.Sprintf(
 				"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (id ag_catalog.agtype, kind ag_catalog.agtype, text ag_catalog.agtype)",
@@ -167,10 +186,12 @@ func (s *AGEStore) LoadPoliciesForTable(ctx context.Context, ref iceberg.TableRe
 		}
 
 		// P3 — RetentionPolicy nodes per ADR-010 (CONTEXT line 86 override).
+		// Reuses the hoisted safeName / safeNamespace locals — no need
+		// to re-sanitise the same inputs a second time.
 		retentionCypher := fmt.Sprintf(
 			`MATCH (rp:RetentionPolicy)-[:RETAINS]->(t:Table {name: '%s', namespace: '%s'}) RETURN rp.id, rp.definition_cel`,
-			escapeCypher(ref.Name),
-			escapeCypher(ns),
+			safeName,
+			safeNamespace,
 		)
 		retentionQuery := fmt.Sprintf(
 			"SELECT * FROM ag_catalog.cypher('neksur', $$ %s $$) AS (id ag_catalog.agtype, text ag_catalog.agtype)",
@@ -214,21 +235,6 @@ func (s *AGEStore) LoadPoliciesForTable(ctx context.Context, ref iceberg.TableRe
 // Example: joinNamespace([]string{"prod", "sales"}) == "prod.sales".
 func joinNamespace(parts []string) string {
 	return strings.Join(parts, ".")
-}
-
-// escapeCypher validates a caller-supplied string for safe inlining
-// into a Cypher single-quoted string literal inside an AGE
-// `cypher('graph', $$ ... $$)` dollar-quoted block.
-//
-// CR-01 mitigation: routes through graph.MustSanitizeCypherLiteral
-// (strict allowlist of ASCII letters/digits/URI-safe punctuation;
-// rejects `'`, `"`, `\`, `$`, `{`, `}`, `;`, CR/LF, NUL, tab,
-// non-ASCII). Inputs are ref.Name + joinNamespace(ref.Namespace),
-// both gated by the gateway's identifierRegex
-// `^[a-zA-Z0-9_-]+$` before reaching this package — a panic here
-// surfaces a programming bug: an entry-point validator was bypassed.
-func escapeCypher(s string) string {
-	return graph.MustSanitizeCypherLiteral(s)
 }
 
 // stripAgtypeQuotes removes the JSON-style surrounding quotes, any AGE
