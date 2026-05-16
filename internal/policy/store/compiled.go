@@ -108,7 +108,39 @@ type CompiledPolicy struct {
 	Status         CompiledPolicyStatus
 	SourceChecksum string
 	ArtifactBody   string
+	// ArtifactKind discriminates how the ArtifactBody should be spliced
+	// into a runtime query — one of KindRowFilter, KindColumnMask, or
+	// KindPredicate. Per D-2.04 the discriminator is carried on the
+	// CompiledPolicy node so the runtime splicer (sqlproxy/dialect/
+	// splice.go) does not have to re-parse the body to learn its shape.
+	// Empty string is tolerated as a backwards-compat default and is
+	// interpreted by callers as KindRowFilter (the Phase 2 default
+	// produced by every existing compiler dialect emitter).
+	ArtifactKind string
 }
+
+// Phase 2 ArtifactKind discriminator values. Stored on CompiledPolicy
+// nodes via the ArtifactKind field; consumed by the runtime splicer
+// in internal/sqlproxy/dialect/splice.go.
+//
+//   - KindRowFilter: ArtifactBody is a boolean predicate (e.g.
+//     `region = 'us-east-1'`). The sqlproxy splicer appends or
+//     AND-conjoins it into the WHERE clause of the user's SELECT.
+//
+//   - KindColumnMask: ArtifactBody is a comma-separated list of
+//     `col AS expr` projections (e.g. `ssn AS '***', email AS 'redacted'`).
+//     The sqlproxy splicer substitutes each masked column in the
+//     user's projection list.
+//
+//   - KindPredicate: ArtifactBody is a Layer-1 predicate (P4 / P5 / P7 /
+//     ABAC) evaluated at the L1 catalog gateway — these artifacts MUST
+//     NOT reach the sqlproxy path; callers in dialect/{trino,spark}.go
+//     filter them out.
+const (
+	KindRowFilter  = "row-filter"
+	KindColumnMask = "column-mask"
+	KindPredicate  = "predicate"
+)
 
 // ErrCompiledPolicyNotFound is returned by LoadCompiledForTable when
 // no CompiledPolicy exists for the requested (table, engine) pair.

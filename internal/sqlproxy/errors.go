@@ -36,3 +36,21 @@ var ErrEngineNotSupported = errors.New("sqlproxy: engine not supported")
 // Distinct from ErrPolicyEngineUnavailable so SREs can tell "policy
 // store outage" from "client sent un-rewritable SQL" on the dashboard.
 var ErrInjectionFailed = errors.New("sqlproxy: policy injection failed")
+
+// ErrUnsupportedQueryShape signals the splicer recognized the query
+// as well-formed SQL but rejected it because it falls outside the
+// Phase 2 single-table SELECT grammar (JOIN, subquery, CTE,
+// multi-table comma, set operation, non-SELECT DML). Distinct from
+// ErrInjectionFailed so SREs can distinguish "policy author wrote
+// a query shape we don't support yet" (Phase 3 extension surface)
+// from "client sent un-parsable SQL" (likely a bug or attack).
+// HTTP 422 + sql_proxy_inject_failures_total{reason="unsupported_query_shape"}.
+var ErrUnsupportedQueryShape = errors.New("sqlproxy: unsupported query shape (Phase 2: single-table SELECT only)")
+
+// ErrSpliceMismatch signals the column-mask splicer cannot apply the
+// artifact: either the user's SELECT used `*` (Phase 2 cannot expand
+// schema-less projections — Plan 02-13 / Phase 3 lifts this) OR the
+// masked column is not present in the projection list (the policy
+// author referenced a column the query does not select). HTTP 422 +
+// sql_proxy_inject_failures_total{reason="splice_mismatch"}.
+var ErrSpliceMismatch = errors.New("sqlproxy: splice mismatch (column-mask requires explicit column projection)")
