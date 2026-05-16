@@ -131,7 +131,10 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 	// We wrap a fresh clone of http.DefaultTransport rather than passing
 	// &http.Transport{} so the runtime's Proxy/TLS defaults are preserved —
 	// matches iceberg-go's own default at rest.go:535.
-	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	var baseTransport http.RoundTripper = http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.BaseTransportWrap != nil {
+		baseTransport = cfg.BaseTransportWrap(baseTransport)
+	}
 	customTransport := &sessionPolicyTransport{next: baseTransport}
 
 	cat, err := rest.NewCatalog(ctx, "polaris", cfg.Endpoint,

@@ -12,6 +12,7 @@ package polaris
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -63,6 +64,27 @@ type Config struct {
 	ClientSecret   string
 	Scope          string
 	CredentialMode string
+
+	// BaseTransportWrap is an OPTIONAL hook that wraps the underlying
+	// http.Transport before the sessionPolicyTransport composes over it.
+	// The composition order at New() time is:
+	//
+	//   iceberg-go.sessionTransport
+	//      → sessionPolicyTransport (injects X-Iceberg-Session-Policy)
+	//          → BaseTransportWrap(http.DefaultTransport.Clone())  ← THIS
+	//
+	// Production callers leave this nil — the adapter then uses a fresh
+	// http.DefaultTransport.Clone() as the base. Integration tests use
+	// this hook to inject a recording RoundTripper that captures the
+	// outbound request headers reaching Polaris, so the test can assert
+	// the X-Iceberg-Session-Policy + X-Iceberg-Access-Delegation values
+	// without depending on Polaris debug log format.
+	//
+	// The hook is on Config (declarative) rather than a functional-option
+	// per D-1.03 — every field of the adapter surface is visible on the
+	// struct at construction time. Production-runtime nil is the default;
+	// no behavior change for non-test callers.
+	BaseTransportWrap func(http.RoundTripper) http.RoundTripper
 }
 
 // Validate checks the four required fields are non-empty. Defaults
