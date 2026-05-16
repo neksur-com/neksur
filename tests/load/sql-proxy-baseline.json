@@ -1,0 +1,11 @@
+{
+  "status": "PENDING_FIRST_RUN",
+  "measured_at": "0001-01-01T00:00:00Z",
+  "baseline_p95_ms": 0,
+  "instrumented_p95_ms": 0,
+  "p99_ms": 0,
+  "overhead_ratio": 0,
+  "samples_per_trial": 0,
+  "assert_p95_under_ms": 50,
+  "assert_p99_under_ms": 150
+}
