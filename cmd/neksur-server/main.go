@@ -486,6 +486,12 @@ func runWithSaasAuth(ctx context.Context) error {
 		workosauth.TenantMiddleware(workosClient, tenantRepo)(credvend.Handler(credvend.Deps{
 			Service:   credService,
 			CredStore: gatewayDeps.CredStore,
+			// WR-13: surface the AdapterBuilder explicitly. Without the
+			// field set the handler falls back to iceberggw.BuildAdapter
+			// internally, but the dependency was invisible from the wiring
+			// layer. Making it explicit lets the wire-layer review
+			// catch a future caller that wants to inject an alternative.
+			AdapterBuilder: iceberggw.BuildAdapter,
 		})))
 
 	// Phase 1 L3 detection (Plan 01-07) — goroutine pool + 3 trigger
