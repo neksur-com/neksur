@@ -15,7 +15,11 @@
 //     because the struct-typed policy ensures correct shape).
 package credvend
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/neksur-com/neksur/internal/credvend/sessionpolicy"
+)
 
 // ErrCredVendUnavailable mirrors ErrPolicyEngineUnavailable from Phase 1
 // D-1.09: the credential vending service is fail-closed — any upstream
@@ -42,4 +46,8 @@ var ErrEngineNotSupported = errors.New("credvend: engine does not support STS cr
 // practice this should not be reachable with valid configuration; it
 // exists so callers can errors.Is on the specific policy construction
 // failure without catching the broader ErrCredVendUnavailable.
-var ErrSessionPolicyMalformed = errors.New("credvend: session policy is malformed")
+//
+// Plan 02-13: this is an alias of sessionpolicy.ErrMalformed (the actual
+// sentinel lives in the leaf subpackage to break the would-be import
+// cycle through polaris). errors.Is works through either name.
+var ErrSessionPolicyMalformed = sessionpolicy.ErrMalformed

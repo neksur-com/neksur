@@ -28,9 +28,9 @@ package polaris
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -41,6 +41,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergTable "github.com/apache/iceberg-go/table"
 
+	"github.com/neksur-com/neksur/internal/credvend/sessionpolicy"
 	"github.com/neksur-com/neksur/internal/iceberg"
 )
 
@@ -121,12 +122,25 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 		return nil, fmt.Errorf("polaris: parse oauth2-server-uri: %w", err)
 	}
 
+	// L4 vending: inject a CustomTransport that reads per-request session
+	// policy from req.Context() and sets the X-Iceberg-Session-Policy header
+	// on outbound LoadTable requests issued via IssueScopedSTSCredentials.
+	// Non-L4 calls (ListTables, GetTable, plain LoadTable) attach no policy
+	// to their ctx, so the transport is a no-op for those paths.
+	//
+	// We wrap a fresh clone of http.DefaultTransport rather than passing
+	// &http.Transport{} so the runtime's Proxy/TLS defaults are preserved —
+	// matches iceberg-go's own default at rest.go:535.
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	customTransport := &sessionPolicyTransport{next: baseTransport}
+
 	cat, err := rest.NewCatalog(ctx, "polaris", cfg.Endpoint,
 		rest.WithCredential(credential),
 		rest.WithAuthURI(authURI),
 		rest.WithScope(cfg.Scope),
 		rest.WithWarehouseLocation(cfg.Warehouse),
 		rest.WithAdditionalProps(props),
+		rest.WithCustomTransport(customTransport),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("polaris: new catalog: %w", err)
@@ -281,188 +295,50 @@ func (p *polarisAdapter) Capabilities() iceberg.Capabilities {
 // per D-2.09 + RESEARCH §Code Example 6 lines 1025-1047 + PATTERNS
 // lines 657-694.
 //
-// CR-02 (Phase 2): the original implementation attempted to propagate
-// the X-Iceberg-Access-Delegation + X-Iceberg-Session-Policy headers
-// to iceberg-go's REST catalog via a *file-local* context key
-// (restHeadersKey{}). iceberg-go v0.5.0 reads headers from its own
-// package-private context key — there is no documented public bridge
-// between the two. As a result, the original LoadTable call ran
-// WITHOUT the delegation headers, Polaris returned a normal config
-// block without STS keys, and parseVendedCreds fail-closed with
-// "missing required key 's3.access-key-id'". The failure mode masked
-// the broken context-header assumption (Assumption A1 in RESEARCH).
+// Implementation (Plan 02-13 / path A — see 02-13-DECISION.md):
 //
-// Until the correct iceberg-go v0.5+ per-request-header API
-// (rest.WithHeader / LoadTableOption variadic) is wired through the
-// adapter — OR the documented fallback (direct AWS STS AssumeRole)
-// lands — this method hard-fails with iceberg.ErrAdapterStub so the
-// credvend handler 503s loudly rather than appearing to "work" with
-// all credentials missing.
+//  1. Build the inline session policy via
+//     internal/credvend/sessionpolicy.Build (the single canonical source —
+//     Polaris no longer has a duplicate; WR-A5 / WR-A6 closed). The leaf
+//     subpackage exists to break what would otherwise be an import cycle
+//     (credvend imports gateway/iceberg which imports polaris). The
+//     credvend package re-exports BuildSessionPolicy for external callers.
+//  2. Attach the policy bytes to the ctx via contextWithSessionPolicy.
+//  3. Call iceberg-go's rest.Catalog.LoadTable(ctx, ident). iceberg-go's
+//     own sessionTransport auto-sets X-Iceberg-Access-Delegation:
+//     vended-credentials (rest.go:547) before delegating to the
+//     CustomTransport injected at New() time. sessionPolicyTransport
+//     reads the policy from the request's ctx and sets the
+//     X-Iceberg-Session-Policy header. Polaris 1.4 then issues scoped
+//     STS creds and returns them in the loadTable response config block.
+//  4. parseVendedCreds extracts the s3.access-key-id / secret-access-key
+//     / session-token / session-expiration keys per Iceberg REST #11118.
+//  5. The Region field on the returned creds is set from the request
+//     region (parseVendedCreds leaves it empty by design — the catalog
+//     does not echo the requested region).
 //
-// Tracked for Plan 02-08 contingency (see RESEARCH §Alternatives
-// Considered line 153 for the direct-STS path).
-func (p *polarisAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
-	return nil, fmt.Errorf(
-		"polaris: vended-credentials: context-header propagation not verified " +
-			"in iceberg-go v0.5.0 — wire rest.WithHeader / LoadTableOption (or " +
-			"the direct AWS STS AssumeRole fallback) before enabling L4 vending: %w",
-		iceberg.ErrAdapterStub,
-	)
-}
-
-// issueScopedSTSCredentialsViaHeaderCtx is the original Phase 2
-// implementation, retained for reference while the iceberg-go header
-// API is verified. It is NOT wired into the IcebergCatalogClient
-// interface (the public IssueScopedSTSCredentials above hard-fails).
-//
-// Steps (when re-enabled):
-//  1. Build inline session policy via buildSessionPolicy.
-//  2. Set X-Iceberg-Access-Delegation: vended-credentials.
-//  3. Set X-Iceberg-Session-Policy carrying the JSON policy.
-//  4. Call LoadTable with the per-request header API (NOT the
-//     file-local context-key shim — that's the CR-02 bug).
-//  5. parseVendedCreds on tbl.Properties() (Polaris 1.4 #11118 keys).
-//
-//nolint:unused // retained for the Plan 02-08 re-enable path.
-func (p *polarisAdapter) issueScopedSTSCredentialsViaHeaderCtx(ctx context.Context, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
-	sessionPolicyJSON, err := buildSessionPolicy(table, region, p.cfg.Warehouse)
+// CR-02 closed: the iteration-1 hard-fail stub (iceberg.ErrAdapterStub)
+// is replaced by this live path. The deviation note in adapter.go that
+// blocked this method has been retired.
+func (p *polarisAdapter) IssueScopedSTSCredentials(ctx context.Context, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
+	policyJSON, err := sessionpolicy.Build(table, region, p.cfg.Warehouse)
 	if err != nil {
 		return nil, fmt.Errorf("polaris: vended-credentials: build session policy: %w", err)
 	}
 
-	delegationCtx := withDelegationHeaders(ctx, string(sessionPolicyJSON))
-
-	ident := toIdentifier(table)
-	tbl, err := p.cat.LoadTable(delegationCtx, ident)
+	ctxWithPolicy := contextWithSessionPolicy(ctx, policyJSON)
+	tbl, err := p.cat.LoadTable(ctxWithPolicy, toIdentifier(table))
 	if err != nil {
-		return nil, fmt.Errorf("polaris: vended-credentials: load table: %w", p.translateError("polaris: vended-credentials", err))
+		return nil, fmt.Errorf("polaris: vended-credentials: load table: %w",
+			p.translateError("polaris: vended-credentials", err))
 	}
 
-	configMap := map[string]string(tbl.Properties())
-	creds, err := parseVendedCreds(configMap)
+	creds, err := parseVendedCreds(map[string]string(tbl.Properties()))
 	if err != nil {
 		return nil, fmt.Errorf("polaris: vended-credentials: parse creds: %w", err)
 	}
 	creds.Region = region
 	return creds, nil
-}
-
-// withDelegationHeaders returns a context that will cause iceberg-go's
-// REST catalog client to emit the vended-credentials delegation headers.
-// iceberg-go v0.5.0 reads these from context key "rest.headers" and
-// merges them into every outbound request header map.
-//
-// If iceberg-go does not honor the context-header mechanism (Assumption
-// A1), the fallback is to call AWS STS AssumeRole directly from Neksur
-// with an inline session policy (documented alternative in RESEARCH
-// §Alternatives Considered line 153). Phase 2 ships the context-header
-// path; the fallback is a Plan 02-08 contingency.
-func withDelegationHeaders(ctx context.Context, sessionPolicyJSON string) context.Context {
-	type restHeadersKey struct{}
-	existing, _ := ctx.Value(restHeadersKey{}).(map[string]string)
-	merged := make(map[string]string, len(existing)+2)
-	for k, v := range existing {
-		merged[k] = v
-	}
-	merged["X-Iceberg-Access-Delegation"] = "vended-credentials"
-	merged["X-Iceberg-Session-Policy"] = sessionPolicyJSON
-	return context.WithValue(ctx, restHeadersKey{}, merged)
-}
-
-// buildSessionPolicy constructs the JSON inline session policy for the
-// STS AssumeRole call per D-2.09 + RESEARCH §Code Example 6 lines
-// 1051-1066.
-//
-// CRITICAL — Pitfall 1 + rustfs#1337: Resource MUST be a JSON array
-// ([]string) even with a single element. AWS IAM returns an opaque
-// InternalError 500 when Resource is a bare string — the error message
-// does not hint at the root cause. The integration test
-// TestCredvend_SessionPolicy_ResourceIsArray asserts this invariant
-// by decoding the JSON and checking reflect.TypeOf(Resource).Kind() ==
-// reflect.Slice.
-func buildSessionPolicy(table iceberg.TableRef, region, warehouse string) ([]byte, error) {
-	// Derive the S3 ARN resource from the warehouse path and table ref.
-	// warehouse MUST be "s3://bucket/prefix" — CR-06 rejects bare strings
-	// and operator-typo'd values that would otherwise mint credentials
-	// for the wrong bucket.
-	bucket, err := extractBucket(warehouse)
-	if err != nil {
-		return nil, fmt.Errorf("build session policy: %w", err)
-	}
-	tablePrefix := tableS3Prefix(table)
-	resource := fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, tablePrefix)
-
-	policy := sessionPolicyDoc{
-		Version: "2012-10-17",
-		Statement: []sessionPolicyStatement{{
-			Effect: "Allow",
-			// s3:PutObject only — least privilege (NOT s3:*).
-			Action: "s3:PutObject",
-			// MUST be []string (JSON array) — Pitfall 1.
-			Resource: []string{resource},
-			Condition: map[string]map[string]string{
-				"StringEquals": {
-					"aws:RequestedRegion": region,
-				},
-			},
-		}},
-	}
-
-	data, err := marshalSessionPolicy(policy)
-	if err != nil {
-		return nil, fmt.Errorf("marshal session policy: %w", err)
-	}
-	return data, nil
-}
-
-// extractBucket extracts the S3 bucket name from a warehouse URI. CR-06:
-// the warehouse MUST start with "s3://" and include a "/" path component
-// after the bucket. Bare strings ("bucket/prefix") and non-S3 schemes
-// are rejected with a wrapped error so an operator typo cannot cause
-// the L4 vending path to mint credentials against the wrong account's
-// bucket or a malformed ARN that AWS IAM treats as a wildcard match.
-func extractBucket(warehouse string) (string, error) {
-	after, ok := strings.CutPrefix(warehouse, "s3://")
-	if !ok {
-		return "", fmt.Errorf("polaris: warehouse %q must start with s3:// — refusing to derive bucket", warehouse)
-	}
-	idx := strings.Index(after, "/")
-	if idx <= 0 {
-		return "", fmt.Errorf("polaris: warehouse %q has no path component after bucket — refusing to derive bucket", warehouse)
-	}
-	return after[:idx], nil
-}
-
-// tableS3Prefix derives the S3 key prefix for a table from its TableRef.
-// Joins namespace components and table name with "/".
-func tableS3Prefix(ref iceberg.TableRef) string {
-	parts := make([]string, 0, len(ref.Namespace)+1)
-	parts = append(parts, ref.Namespace...)
-	parts = append(parts, ref.Name)
-	return strings.Join(parts, "/")
-}
-
-// sessionPolicyDoc is the JSON shape for an AWS inline session policy.
-// Using explicit structs (not map[string]any) ensures the JSON array
-// invariant for Resource is enforced by Go's type system rather than
-// by convention.
-type sessionPolicyDoc struct {
-	Version   string                 `json:"Version"`
-	Statement []sessionPolicyStatement `json:"Statement"`
-}
-
-type sessionPolicyStatement struct {
-	Effect    string                       `json:"Effect"`
-	Action    string                       `json:"Action"`
-	Resource  []string                     `json:"Resource"` // MUST be []string — Pitfall 1
-	Condition map[string]map[string]string `json:"Condition"`
-}
-
-// marshalSessionPolicy serialises the session policy document to JSON.
-// Kept as a thin wrapper so sts.go tests can import just the shape check
-// without depending on the full adapter.
-func marshalSessionPolicy(doc sessionPolicyDoc) ([]byte, error) {
-	return json.Marshal(doc)
 }
 
 // translateError converts an iceberg-go-side error to one of the
