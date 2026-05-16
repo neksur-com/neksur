@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -42,6 +43,13 @@ import (
 
 	"github.com/neksur-com/neksur/internal/iceberg"
 )
+
+// authErrRE matches "401", "403", "Unauthorized", "Forbidden" at WORD
+// BOUNDARIES so a body containing "4031" or "User account 4030 not
+// found" is NOT misclassified as ErrCredentialsExpired (WR-12). The
+// bare-substring match the previous translateError used was the
+// dangerous one: "403" is a substring of "4031", "4030", "4032", etc.
+var authErrRE = regexp.MustCompile(`\b(?:401|403|Unauthorized|Forbidden)\b`)
 
 // polarisAdapter wraps iceberg-go's *rest.Catalog and translates
 // between the Phase 1 IcebergCatalogClient surface and iceberg-go's
@@ -470,9 +478,11 @@ func (p *polarisAdapter) translateError(prefix string, err error) error {
 	if errors.Is(err, icebergCatalog.ErrNoSuchTable) {
 		return fmt.Errorf("%s: %w", prefix, iceberg.ErrTableNotFound)
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "401") || strings.Contains(msg, "403") ||
-		strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "Forbidden") {
+	// WR-12: word-boundary regex so a 404 body like "User account 4030
+	// not found" or "code:4031" is not misclassified as
+	// ErrCredentialsExpired. The previous bare strings.Contains
+	// (msg, "403") matched any 4-digit number starting with 403.
+	if authErrRE.MatchString(err.Error()) {
 		return fmt.Errorf("%s: %w", prefix, iceberg.ErrCredentialsExpired)
 	}
 	return fmt.Errorf("%s: %w", prefix, err)
