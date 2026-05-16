@@ -273,46 +273,63 @@ func (p *polarisAdapter) Capabilities() iceberg.Capabilities {
 // per D-2.09 + RESEARCH §Code Example 6 lines 1025-1047 + PATTERNS
 // lines 657-694.
 //
-// The method:
-//  1. Builds an inline session policy via buildSessionPolicy (Pitfall 1:
-//     Resource must be []string, not bare string) scoped to s3:PutObject
-//     on the table's S3 prefix in the allowed region.
-//  2. Sets X-Iceberg-Access-Delegation: vended-credentials header so
-//     Polaris invokes AWS STS AssumeRole with the inline session policy.
-//  3. Sets X-Iceberg-Session-Policy header carrying the JSON policy.
-//  4. Calls LoadTable with these headers in the context (iceberg-go
-//     v0.5.0 honors custom headers via context).
-//  5. Parses the STS creds from the loadTable response config block via
-//     parseVendedCreds (Pitfall 7: Polaris 1.4 uses s3.access-key-id etc.).
+// CR-02 (Phase 2): the original implementation attempted to propagate
+// the X-Iceberg-Access-Delegation + X-Iceberg-Session-Policy headers
+// to iceberg-go's REST catalog via a *file-local* context key
+// (restHeadersKey{}). iceberg-go v0.5.0 reads headers from its own
+// package-private context key — there is no documented public bridge
+// between the two. As a result, the original LoadTable call ran
+// WITHOUT the delegation headers, Polaris returned a normal config
+// block without STS keys, and parseVendedCreds fail-closed with
+// "missing required key 's3.access-key-id'". The failure mode masked
+// the broken context-header assumption (Assumption A1 in RESEARCH).
 //
-// Returns ErrCredentialsExpired on auth failure; generic wrapped errors
-// on transport / parse failure. Never returns nil creds with nil error.
-func (p *polarisAdapter) IssueScopedSTSCredentials(ctx context.Context, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
-	// Step 1 — build inline session policy. The bucket and table prefix
-	// are derived from the Polaris warehouse config and the table ref.
-	// In Phase 2 we use the warehouse as the S3 bucket root and the
-	// table's namespace + name as the prefix path.
+// Until the correct iceberg-go v0.5+ per-request-header API
+// (rest.WithHeader / LoadTableOption variadic) is wired through the
+// adapter — OR the documented fallback (direct AWS STS AssumeRole)
+// lands — this method hard-fails with iceberg.ErrAdapterStub so the
+// credvend handler 503s loudly rather than appearing to "work" with
+// all credentials missing.
+//
+// Tracked for Plan 02-08 contingency (see RESEARCH §Alternatives
+// Considered line 153 for the direct-STS path).
+func (p *polarisAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	return nil, fmt.Errorf(
+		"polaris: vended-credentials: context-header propagation not verified " +
+			"in iceberg-go v0.5.0 — wire rest.WithHeader / LoadTableOption (or " +
+			"the direct AWS STS AssumeRole fallback) before enabling L4 vending: %w",
+		iceberg.ErrAdapterStub,
+	)
+}
+
+// issueScopedSTSCredentialsViaHeaderCtx is the original Phase 2
+// implementation, retained for reference while the iceberg-go header
+// API is verified. It is NOT wired into the IcebergCatalogClient
+// interface (the public IssueScopedSTSCredentials above hard-fails).
+//
+// Steps (when re-enabled):
+//  1. Build inline session policy via buildSessionPolicy.
+//  2. Set X-Iceberg-Access-Delegation: vended-credentials.
+//  3. Set X-Iceberg-Session-Policy carrying the JSON policy.
+//  4. Call LoadTable with the per-request header API (NOT the
+//     file-local context-key shim — that's the CR-02 bug).
+//  5. parseVendedCreds on tbl.Properties() (Polaris 1.4 #11118 keys).
+//
+//nolint:unused // retained for the Plan 02-08 re-enable path.
+func (p *polarisAdapter) issueScopedSTSCredentialsViaHeaderCtx(ctx context.Context, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
 	sessionPolicyJSON, err := buildSessionPolicy(table, region, p.cfg.Warehouse)
 	if err != nil {
 		return nil, fmt.Errorf("polaris: vended-credentials: build session policy: %w", err)
 	}
 
-	// Step 2+3 — attach delegation headers to the context so iceberg-go's
-	// REST client propagates them on the loadTable wire call.
-	// iceberg-go v0.5.0 exposes rest.WithHeader for per-request headers;
-	// we attach them via context per Assumption A1 in RESEARCH.
 	delegationCtx := withDelegationHeaders(ctx, string(sessionPolicyJSON))
 
-	// Step 4 — call LoadTable with the delegation context.
 	ident := toIdentifier(table)
 	tbl, err := p.cat.LoadTable(delegationCtx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("polaris: vended-credentials: load table: %w", p.translateError("polaris: vended-credentials", err))
 	}
 
-	// Step 5 — parse vended creds from the response config block.
-	// Polaris 1.4 returns STS credentials in tbl.Properties() (the
-	// loadTable response config block per Iceberg REST #11118).
 	configMap := map[string]string(tbl.Properties())
 	creds, err := parseVendedCreds(configMap)
 	if err != nil {
