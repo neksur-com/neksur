@@ -141,14 +141,25 @@ func NewTrigger(
 // fatal supervisor signal (the gateway's main goroutine should log
 // + restart the Listen, or the process should exit and let the
 // supervisor restart).
+//
+// CR-03 fix: backoff + lastSuccess are reset whenever listenOnce ran
+// for long enough to count as a healthy LISTEN (>= reconnectHealthy).
+// Without the reset a single transient failure escalated backoff to
+// backoffMax permanently and pushed the fallback poller "on" forever,
+// so the 5-min pollerFallbackThreshold became a poll-forever sentinel.
 func (t *Trigger) Listen(ctx context.Context) error {
 	backoff := time.Second
 	lastSuccess := time.Now()
+	// listenStart records the wall-clock when listenOnce begins; on
+	// return, if listenOnce ran for >= reconnectHealthy (30s), we
+	// treat the call as proof of a healthy connection that later
+	// dropped and reset backoff / lastSuccess.
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		listenStart := time.Now()
 		err := t.listenOnce(ctx)
 		if err == nil {
 			// listenOnce returns nil only on ctx.Done() — propagate.
@@ -156,6 +167,18 @@ func (t *Trigger) Listen(ctx context.Context) error {
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
+		}
+
+		// CR-03 fix: if listenOnce ran for a non-trivial duration before
+		// failing, the LISTEN was healthy — treat the failure as a
+		// transient reconnect event and reset both trackers so the next
+		// attempt starts at backoff=1s and the fallback poller turns OFF.
+		// A failure within the first reconnectHealthy window is a true
+		// reconnect storm and keeps the escalating-backoff posture.
+		const reconnectHealthy = 30 * time.Second
+		if time.Since(listenStart) >= reconnectHealthy {
+			backoff = time.Second
+			lastSuccess = time.Now()
 		}
 
 		slog.Error("policy/compiler/trigger: listen error",
@@ -179,9 +202,6 @@ func (t *Trigger) Listen(ctx context.Context) error {
 		if backoff > backoffMax {
 			backoff = backoffMax
 		}
-		// Reset on the NEXT successful listenOnce — see the success
-		// branch below where we re-set lastSuccess.
-		_ = lastSuccess
 	}
 }
 
