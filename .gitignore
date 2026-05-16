@@ -13,6 +13,8 @@ dist/
 *.out
 # Locally-built CLI (root-level go build ./cmd/neksur-cli produces ./neksur-cli)
 /neksur-cli
+# Locally-built server (root-level go build ./cmd/neksur-server produces ./neksur-server)
+/neksur-server
 coverage.out
 coverage.html
 profile.out

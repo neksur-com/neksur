@@ -6,6 +6,19 @@
 # minimum that lets `make migrate DB_URL=...` + `go test ./tests/...`
 # work end-to-end against a real DB.
 
+# ───────────────────────────────────────────────────────────────────────
+# Dev cold-start quick reference (full recipe: runbooks/dev-cold-start.md)
+#
+#   docker compose up -d postgres
+#   cp .env.example .env
+#   set -a; source .env; set +a
+#   go run ./cmd/migrate
+#   go run ./cmd/neksur-server --help   # to see the env-flag matrix
+#
+# Canonical DSN aligned to the postgres service below:
+#   DATABASE_URL=postgres://neksur:neksur_dev@localhost:5432/neksur?sslmode=disable
+# ───────────────────────────────────────────────────────────────────────
+
 services:
   postgres:
     # The image is built from infra/postgres/Dockerfile, which extends
