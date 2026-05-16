@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -75,10 +76,13 @@ func NewService(
 // adapter is the per-tenant IcebergCatalogClient built by the handler
 // from the credential store (same pattern as gateway/handler.go's adapterFor).
 func (s *Service) Issue(ctx context.Context, tenantID string, adapter iceberg.IcebergCatalogClient, table iceberg.TableRef, region string) (*iceberg.STSCredentials, error) {
-	namespace := ""
-	if len(table.Namespace) > 0 {
-		namespace = table.Namespace[0]
-	}
+	// CR-05 fix: use the FULL joined namespace path as the cache key.
+	// Iceberg REST allows up to 100-deep namespaces (Polaris caps); the
+	// previous `namespace := table.Namespace[0]` collapsed
+	// ["sales","us","orders"] and ["sales","eu","orders"] to the same
+	// cache entry, causing a second-request hit to serve STS scoped to
+	// the wrong region/prefix.
+	namespace := strings.Join(table.Namespace, ".")
 
 	caps := adapter.Capabilities()
 	engineName := caps.Name

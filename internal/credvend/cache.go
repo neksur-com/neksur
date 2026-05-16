@@ -35,7 +35,10 @@ const defaultCacheSize = 4096
 // are comparable (string) so lru.Cache's generic K constraint is satisfied.
 //
 // TenantID — isolates tenants (cross-tenant reuse impossible by construction).
-// Namespace — first namespace segment of the Iceberg table.
+// Namespace — FULL dot-joined namespace path (CR-05). Iceberg REST allows
+//   up to 100-deep namespaces per Polaris caps; using only the first segment
+//   collapsed distinct deep paths to the same cache entry, leaking STS
+//   scoped to the wrong region/prefix on a second-request hit.
 // TableName — table name.
 // Region    — AWS region (different STS tokens per region for P4 residency).
 type cacheKey struct {
