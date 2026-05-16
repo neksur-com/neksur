@@ -254,6 +254,19 @@ func (t *Trigger) handleNotification(ctx context.Context, notif *pgconn.Notifica
 			"payload", payload)
 		return
 	}
+	// WR-03: PolicyID must be a UUID — the downstream loader path
+	// splices it into Cypher via the gateway's identifierRegex-validated
+	// escapeCypher (which routes to graph.MustSanitizeCypherLiteral and
+	// panics on non-allowlist bytes). Operator-issued ad-hoc
+	// `pg_notify('policy_changed', '{"tenant_id":"…","policy_id":"…"}')`
+	// is the documented threat model — without this check a forged
+	// payload could crash the consumer goroutine. UUIDs match the
+	// allowlist regex by construction.
+	if _, err := uuid.Parse(payload.PolicyID); err != nil {
+		slog.Error("policy/compiler/trigger: invalid policy uuid (skipping)",
+			"err", err, "policy_id", payload.PolicyID)
+		return
+	}
 
 	// Defence-in-depth: validate tenant exists before constructing a
 	// tenant-scoped context. A forged or stale payload here is fail-safe
