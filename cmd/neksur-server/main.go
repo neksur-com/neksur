@@ -54,12 +54,15 @@ import (
 	"github.com/neksur-com/neksur/internal/alerts"
 	"github.com/neksur-com/neksur/internal/billing"
 	"github.com/neksur-com/neksur/internal/catalog"
+	"github.com/neksur-com/neksur/internal/credvend"
+	"github.com/neksur-com/neksur/internal/crypto/kms"
 	"github.com/neksur-com/neksur/internal/detect/dispatch"
 	iceberggw "github.com/neksur-com/neksur/internal/gateway/iceberg"
 	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/iceberg"
 	"github.com/neksur-com/neksur/internal/ingest"
 	lineagehttp "github.com/neksur-com/neksur/internal/lineage/http"
+	"github.com/neksur-com/neksur/internal/observability"
 	celpolicy "github.com/neksur-com/neksur/internal/policy/cel"
 	"github.com/neksur-com/neksur/internal/policy/compiler"
 	"github.com/neksur-com/neksur/internal/policy/compiler/dialect"
@@ -389,6 +392,38 @@ func runWithSaasAuth(ctx context.Context) error {
 		}
 	}
 
+	// Wave 3 (Plan 02-07) — L4 credential vending service wiring.
+	//
+	// credvend.Service wraps the STS LRU cache + Prometheus counters.
+	// The handler builds a per-tenant adapter per-request from CredStore
+	// (same pattern as gateway/handler.go's adapterFor method).
+	// kms.Client and kms.BatchCache support the Go-side KMS path (Pitfall 10
+	// mitigation; Phase 4 encryption surface — not used in the current write path).
+	//
+	// CC3: reuse the existing awsConfig (when available) — DO NOT construct a
+	// second AWS session. The KMS client uses the same config that SQS uses.
+	//
+	// The credvend cache is constructed unconditionally; if no AWS config is
+	// available (local dev without NEKSUR_S3_EVENTS_QUEUE_URL), kmsClient is nil
+	// and the KMS path is inactive. credvend.Service does NOT depend on KMS.
+	credCache, err := credvend.NewCache(0) // 0 → defaultCacheSize 4096
+	if err != nil {
+		return fmt.Errorf("credvend cache: %w", err)
+	}
+	credService := credvend.NewService(
+		credCache,
+		observability.L4TokenIssuedTotal,
+		observability.L4TokenRefreshTotal,
+	)
+
+	// KMS batch cache for Go-side DEK derivation (Pitfall 10 mitigation).
+	// 10-minute TTL mirrors the JVM-side KmsKeyProvider batch lifetime.
+	kmsBatchCache, err := kms.NewBatchCache(0, 10*time.Minute) // 0 → defaultCacheSize 4096
+	if err != nil {
+		return fmt.Errorf("kms batch cache: %w", err)
+	}
+	_ = kmsBatchCache // reserved for Phase 4 Go-side encryption path
+
 	// CR-03 fail-fast startup guard: refuse to boot if any active
 	// tenant is configured for a Phase-1-unsupported catalog kind
 	// (glue, unity). The V0060 CHECK constraint permits these kinds
@@ -436,6 +471,17 @@ func runWithSaasAuth(ctx context.Context) error {
 	// same TenantMiddleware enforcement as the gateway endpoints.
 	mux.Handle("POST /v1/lineage",
 		workosauth.TenantMiddleware(workosClient, tenantRepo)(lineagehttp.Handler(pool, gatewayDeps.IngestSvc)))
+
+	// Plan 02-07 Wave 3 — L4 credential vending endpoint.
+	// POST /v1/credvend/sts — behind workosauth.TenantMiddleware (D-2.09).
+	// Request: {catalog_nickname, table_namespace, table_name, region}.
+	// Response: {access_key_id, secret_access_key, session_token, expiration, region}.
+	// Fail-closed to 503 on any Polaris error (D-1.09 carryover).
+	mux.Handle("POST /v1/credvend/sts",
+		workosauth.TenantMiddleware(workosClient, tenantRepo)(credvend.Handler(credvend.Deps{
+			Service:   credService,
+			CredStore: gatewayDeps.CredStore,
+		})))
 
 	// Phase 1 L3 detection (Plan 01-07) — goroutine pool + 3 trigger
 	// sources (30s poller / Polaris webhook / S3 ObjectCreated SNS+SQS).

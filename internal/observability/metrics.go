@@ -175,3 +175,68 @@ var SqlProxyInjectFailuresTotal = promauto.NewCounterVec(
 	},
 	[]string{"engine", "reason"},
 )
+
+// ---------------------------------------------------------------------
+// Wave 3 / Plan 02-07 L4 credential vending metrics.
+//
+// Three metrics let SREs dashboard the L4 STS vending gate independently
+// of the sqlproxy and L1 gateway metrics:
+//
+//   - L4TokenIssuedTotal (counter, labeled by engine + region) — counts
+//     successful STS issuances on the cache-miss path. engine is the
+//     catalog name (e.g. "polaris"); region is the AWS region. A high
+//     rate indicates cache churn (check TTL/2 refresh threshold).
+//   - L4TokenRefreshTotal (counter, labeled by engine) — counts cache-miss
+//     events that trigger an upstream IssueScopedSTSCredentials call. This
+//     is a superset of L4TokenIssuedTotal (includes failures).
+//   - KmsGenerateDataKeyTotal (counter, labeled by cache_status) — counts
+//     Go-side GenerateDataKey calls. cache_status ∈ {hit, miss, error}.
+//     A high miss rate indicates batch IDs are not being reused correctly
+//     (Pitfall 10 metric).
+//   - L4TokenFailuresTotal (counter, labeled by engine + reason) — counts
+//     errors on the Issue path. reason is free-form but bounded (e.g.
+//     "issue_failed", "engine_not_supported").
+// ---------------------------------------------------------------------
+
+// L4TokenIssuedTotal counts successful L4 STS credential issuances on the
+// cache-miss path. Labels: engine (catalog name), region (AWS region).
+var L4TokenIssuedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "l4_token_issued_total",
+		Help: "Successful L4 STS credential issuances by catalog engine " +
+			"and AWS region (cache-miss path only).",
+	},
+	[]string{"engine", "region"},
+)
+
+// L4TokenRefreshTotal counts cache-miss events that trigger an upstream
+// IssueScopedSTSCredentials call. Label: engine (catalog name).
+var L4TokenRefreshTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "l4_token_refresh_total",
+		Help: "L4 STS credential cache-miss events that trigger an upstream " +
+			"IssueScopedSTSCredentials call.",
+	},
+	[]string{"engine"},
+)
+
+// KmsGenerateDataKeyTotal counts Go-side GenerateDataKey calls.
+// cache_status ∈ {hit, miss, error}.
+var KmsGenerateDataKeyTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "kms_generate_data_key_total",
+		Help: "Go-side KMS GenerateDataKey calls by cache_status. " +
+			"Allowed cache_status: hit | miss | error.",
+	},
+	[]string{"cache_status"},
+)
+
+// L4TokenFailuresTotal counts errors on the credvend.Service.Issue path.
+// Labels: engine (catalog name), reason (short string describing failure).
+var L4TokenFailuresTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "l4_token_failures_total",
+		Help: "L4 STS credential issuance failures by engine + reason.",
+	},
+	[]string{"engine", "reason"},
+)
