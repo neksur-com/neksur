@@ -37,6 +37,32 @@ import (
 // extended to cover timeout).
 const EvalTimeout = 100 * time.Millisecond
 
+// AttributeResolver returns the value of an ABAC attribute for a
+// principal, per D-2.10's 3-layer fetch (OIDC claims → graph
+// HAS_ATTRIBUTE → tenant_default_attributes JSONB). The concrete
+// implementation lives in package `internal/policy/store`
+// (`store.AttributeResolver`); declaring the interface here — in the
+// CEL package — breaks what would otherwise be a `cel → store` import
+// cycle (store already imports cel for the Policy struct).
+//
+// Resolve MUST return "" (empty string) when all 3 layers are
+// exhausted, NEVER nil — D-2.10 null-safety contract (Pitfall 8):
+// policy authors compare `principal.attribute(principal, "region") ==
+// "us-east"` and a nil here would translate to a CEL evaluation error
+// (no-such-key) which our fail-closed Evaluate path would 503 on. The
+// "empty string sentinel" makes "attribute absent" expressible inside
+// the policy itself (`principal.attribute(...) == ""` is the canonical
+// "I don't have this attribute set" branch).
+//
+// The oidcClaims argument carries Layer-1 inputs already projected onto
+// a flat string map by the gateway — the resolver MUST short-circuit
+// on a non-empty hit there before reaching for the graph or admin
+// pool, both for correctness (Layer-1 wins by spec) and for latency
+// (avoids a graph round-trip for every claim-backed attribute).
+type AttributeResolver interface {
+	Resolve(ctx context.Context, principalSub, name string, oidcClaims map[string]string) string
+}
+
 // Action is the binary policy decision: allow or deny. The L1 gateway
 // translates ActionAllow to "proceed with commit" and ActionDeny to
 // HTTP 403 + `commit_rejected_total{reason="policy_denied"}`.
@@ -86,6 +112,20 @@ type Inputs struct {
 	// gateway forwards. P2 write-ACL policies read `principal.sub` and
 	// `principal.roles`.
 	Principal map[string]any
+
+	// AttributeResolver, when non-nil, is wired into the CEL activation
+	// under the reserved key `__resolver` so the principal.attribute
+	// binding (functions.go) can reach Layers 2+3 of D-2.10. nil-safe:
+	// when nil the binding falls back to Layer-1 only (OIDC claims
+	// already inlined into `principal["claims"]`).
+	//
+	// Cross-plan seam: Plan 02-03 (this plan) ships the type-level
+	// hook + Layer-1 path; Plan 02-04 wires the gateway-side
+	// construction of the concrete resolver and threads it through
+	// here. Keeping the field on Inputs (not on Evaluator) means a
+	// single Evaluator instance can serve calls with and without a
+	// resolver — used by the tests that exercise Layer-1-only flows.
+	AttributeResolver AttributeResolver
 }
 
 // Policy is the in-memory representation of a Policy graph node. ID is
@@ -161,6 +201,22 @@ func (e *Evaluator) Evaluate(ctx context.Context, p Policy, in *Inputs) (decisio
 		"table":     in.Table,
 		"commit":    in.Commit,
 		"principal": in.Principal,
+	}
+	// D-2.10 Layer 2/3 seam (Plan 02-03): inject the AttributeResolver
+	// + the calling context under reserved keys so the
+	// principal.attribute binding (functions.go) can reach beyond
+	// Layer 1 (OIDC claims). cel-go's UnaryBinding/BinaryBinding
+	// signature does not natively carry the cel.Activation, so we
+	// stash both behind reserved keys ("__resolver", "__ctx") that
+	// (a) start with double-underscore — a convention reserved for
+	// engine-internal slots, never declared as a CEL variable in
+	// env.go, so a policy author cannot accidentally collide; and
+	// (b) are nil-safe — when the gateway hasn't wired a resolver
+	// (e.g., unit tests, Plan 02-04 not yet integrated), the keys are
+	// simply absent and the binding falls back to Layer 1.
+	if in.AttributeResolver != nil {
+		activation["__resolver"] = in.AttributeResolver
+		activation["__ctx"] = ctx
 	}
 
 	// Pitfall 6 retrofit (Phase 2 RESEARCH line 776 + Plan 02-01):
