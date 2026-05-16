@@ -3,14 +3,17 @@
 // engine kind (Trino, Spark, BigQuery, Databricks in Plan 02-05;
 // Dremio + Snowflake light up in Phase 3).
 //
-// Concrete implementations live under internal/sqlproxy/dialect/ and
-// land in dispatch B. This file declares the contract only.
+// Concrete implementations live under internal/sqlproxy/dialect/.
+// The factory entry point is `dialect.BuildInjector(engineKind, deps)`
+// — it was hoisted out of this file in dispatch B to break the import
+// cycle that would form between `sqlproxy` (declaring the Injector
+// interface) and `dialect` (constructing concrete implementations).
+// This file declares the contract only.
 
 package sqlproxy
 
 import (
 	"context"
-	"fmt"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 
@@ -127,28 +130,10 @@ type InjectorDeps struct {
 	Cache *lru.Cache[CacheKey, []byte]
 }
 
-// BuildInjector is the factory the neksur-server wiring (dispatch C)
-// calls once per supported engine kind. Returns ErrEngineNotSupported
-// if the engineKind is not one of the four Plan 02-05 dialects
-// ("trino", "spark", "bigquery", "databricks") — Dremio + Snowflake
-// callers receive the sentinel and the wiring layer either skips the
-// registration (preferred) or registers a stub Injector that returns
-// ErrEngineNotSupported on every call.
-//
-// Dispatch boundary: the concrete dialect constructors land in
-// dispatch B. This factory's body is intentionally a stub until then
-// — it returns ErrEngineNotSupported for every kind so dispatch A
-// compiles standalone. Dispatch B replaces the switch body with the
-// per-dialect constructor calls (dialect.NewTrinoInjector(deps) etc.).
-func BuildInjector(engineKind string, _ InjectorDeps) (Injector, error) {
-	switch engineKind {
-	case "trino", "spark", "bigquery", "databricks":
-		// Dispatch B replaces this branch with the per-dialect
-		// constructor. Returning the sentinel here keeps dispatch A
-		// compilable on its own; the wiring layer (dispatch C) will
-		// not be wired until B lands.
-		return nil, fmt.Errorf("sqlproxy: BuildInjector(%q): dispatch B not yet landed: %w", engineKind, ErrEngineNotSupported)
-	default:
-		return nil, fmt.Errorf("sqlproxy: BuildInjector(%q): %w", engineKind, ErrEngineNotSupported)
-	}
-}
+// BuildInjector moved to internal/sqlproxy/dialect/builder.go in
+// dispatch B (Wave 2 Plan 02-05). Callers — primarily the neksur-server
+// wiring layer — should import `internal/sqlproxy/dialect` and call
+// `dialect.BuildInjector(engineKind, deps)` instead. The move was
+// required to break the import cycle that would form between this
+// package (declaring Injector + InjectorDeps) and the dialect package
+// (which imports both to construct concrete implementations).
