@@ -150,8 +150,26 @@ func (i *TrinoInjector) InjectPolicy(ctx context.Context, query string, table sq
 		return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/trino: load: %w", sqlproxy.ErrPolicyEngineUnavailable)
 	}
 
+	// Pre-pass: check for divergent_suspended rows before processing any
+	// active rows. A divergent_suspended row for "trino" wins over any
+	// active row regardless of slice order (T-3-16-stale-active-shadow).
+	// divergent_suspended is fail-closed (D-3.05 — Plan 03-11 verifier
+	// auto-suspend takes effect here). Plan 03-11 maps
+	// ErrPolicyEngineUnavailable to the
+	// sql_proxy_inject_failures_total{reason='policy_engine_divergent'} label.
 	for _, cp := range compiled {
-		if cp.EngineKind != "trino" || cp.Status != store.CompiledPolicyStatusActive {
+		if cp.EngineKind != "trino" {
+			continue
+		}
+		if cp.Status == store.CompiledPolicyStatusDivergentSuspended {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/trino: policy_engine_divergent: %w", sqlproxy.ErrPolicyEngineUnavailable)
+		}
+	}
+	for _, cp := range compiled {
+		if cp.EngineKind != "trino" {
+			continue
+		}
+		if cp.Status != store.CompiledPolicyStatusActive {
 			continue
 		}
 		// Predicate-kind artifacts are gateway-handled (Layer 1 commit
