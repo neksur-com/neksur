@@ -243,6 +243,19 @@ func (s *PinStore) UpsertSnapshotPin(ctx context.Context, pin SnapshotPin) error
 	tenantLit := graph.MustSanitizeCypherLiteral(tenantStr)
 
 	err := s.gc.ExecuteInTenant(ctx, tenantStr, func(ctx context.Context, tx pgx.Tx) error {
+		// B-4 (Plan 03-12): Acquire the per-table advisory lock BEFORE the MERGE
+		// statements to serialize the pin-write with ExtendIfActivePin in the L3
+		// compaction coordinator. Lock key matches the coordinator: "tenant_id|table_name".
+		// hashtext() is Postgres's built-in string-to-int32 hash.
+		// The lock is transaction-scoped — released automatically on COMMIT/ROLLBACK.
+		// This matches the lock ordering contract in retention_extend.go:
+		//   pin write: BEGIN; pg_advisory_xact_lock(id); MERGE; COMMIT
+		//   expire decide: BEGIN; pg_advisory_xact_lock(id); SELECT pins; COMMIT
+		lockID := tenantStr + "|" + pin.TableName
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", lockID); err != nil {
+			return fmt.Errorf("coordination/snapshot: UpsertSnapshotPin: advisory lock: %w", err)
+		}
+
 		// 1) MERGE SnapshotPin node (AGE 1.6 — one MERGE per cypher() call).
 		nodeCypher := fmt.Sprintf(
 			`MERGE (sp:SnapshotPin {tenant_id: '%s', pin_name: '%s'}) `+
