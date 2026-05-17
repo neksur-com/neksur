@@ -2,8 +2,8 @@
 // adapter satisfies — a tiny 6-method interface (D-1.01) plus the
 // shared types ingestion + the L1 gateway pass between adapter calls.
 //
-// Per-catalog adapters (sub-packages: polaris, nessie, glue_stub,
-// unity_stub) own their own Config struct (D-1.03 declarative; no
+// Per-catalog adapters (sub-packages: polaris, nessie, unity, glue_stub)
+// own their own Config struct (D-1.03 declarative; no
 // functional-options pattern, no runtime capability flags) and the
 // translation between iceberg-go's lower-level catalog client and
 // these shared types.
@@ -285,11 +285,12 @@ type Capabilities struct {
 //     so this should be rare; left as a sentinel for the case where
 //     the OAuth server itself is unreachable).
 //
-//   - ErrAdapterStub: returned by every state-mutating method on the
-//     glue_stub and unity_stub adapters (D-1.02 — live tests defer
-//     to Phase 3). Callers that detect this branch into "Phase 1
-//     deployment uses Polaris/Nessie only" — typically a startup
-//     sanity check at neksur-server boot.
+//   - ErrAdapterStub: returned by state-mutating methods on the
+//     glue_stub adapter (D-1.02 — live Glue tests defer to Plan 03-04).
+//     Also returned by the live unity adapter's IssueScopedSTSCredentials
+//     until Unity STS is wired (Plan 03-03 ships the Unity REST adapter
+//     live; STS vending is a follow-on). Callers detect this via
+//     errors.Is(err, ErrAdapterStub).
 var (
 	ErrTableNotFound      = errors.New("iceberg: table not found")
 	ErrCommitConflict     = errors.New("iceberg: commit conflict (rebase required)")

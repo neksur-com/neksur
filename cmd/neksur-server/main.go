@@ -39,7 +39,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -505,20 +504,13 @@ func runWithSaasAuth(ctx context.Context) error {
 	}
 	_ = kmsBatchCache // reserved for Phase 4 Go-side encryption path
 
-	// CR-03 fail-fast startup guard: refuse to boot if any active
-	// tenant is configured for a Phase-1-unsupported catalog kind
-	// (glue, unity). The V0060 CHECK constraint permits these kinds
-	// for future Phase 3 support, but BuildAdapter returns a stub
-	// that fails every state-mutating call with iceberg.ErrAdapterStub
-	// — leaving customers with a tenant on those kinds silently
-	// 502-ing every commit. Failing the boot surfaces the
-	// misconfiguration to operators immediately. The check is at the
-	// admin-pool level (no per-tenant schema visits needed); the
-	// query reads catalog_credentials rows from every tenant schema
-	// via information_schema discovery.
-	if err := assertNoUnsupportedCatalogs(ctx, pool); err != nil {
-		return fmt.Errorf("phase 1 catalog guard: %w", err)
-	}
+	// Plan 03-03: CR-03 boot guard (assertNoUnsupportedCatalogs) removed.
+	// The live Unity adapter (internal/iceberg/unity) ships in Plan 03-03;
+	// kind=unity now routes to a real adapter instead of ErrAdapterStub.
+	// kind=glue still routes to glue_stub until Plan 03-04 ships the live
+	// Glue adapter — tenants with kind=glue will see ErrAdapterStub at
+	// runtime on state-mutating calls, not at boot. The guard is no longer
+	// necessary because unity is live; the glue stub error is self-describing.
 
 	// HTTP router.
 	mux := http.NewServeMux()
@@ -704,109 +696,6 @@ func runWithSaasAuth(ctx context.Context) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil
-}
-
-// assertNoUnsupportedCatalogs scans every active tenant's
-// `catalog_credentials` table looking for `catalog_kind IN ('glue',
-// 'unity')` — the Phase-1-stub kinds whose BuildAdapter returns
-// iceberg.ErrAdapterStub on every state-mutating call (REVIEW.md
-// CR-03). Returns an error that lists every offending
-// `(tenant_id, nickname, kind)` triple so operators can remediate
-// before retry.
-//
-// Implementation: enumerate `tenant_*` schemas via
-// information_schema.tables (one round-trip), then SELECT from
-// each schema's catalog_credentials. Each tenant query runs as the
-// admin pool — no per-tenant role / GUC dance needed because we
-// are only checking config metadata.
-//
-// Phase 3 will lift this guard when the live Glue + Unity adapters
-// ship (the BuildAdapter dispatch in
-// internal/gateway/iceberg/forwarder.go will return a real adapter
-// instead of the stub).
-func assertNoUnsupportedCatalogs(ctx context.Context, adminPool *pgxpool.Pool) error {
-	// Step 1 — discover tenant schemas via information_schema. The
-	// canonical name shape is `tenant_<uuid-with-dashes-replaced>`
-	// per internal/tenant/id.go::SchemaName.
-	schemaRows, err := adminPool.Query(ctx, `
-		SELECT schema_name
-		FROM information_schema.schemata
-		WHERE schema_name LIKE 'tenant\_%' ESCAPE '\'
-	`)
-	if err != nil {
-		return fmt.Errorf("discover tenant schemas: %w", err)
-	}
-	var schemas []string
-	for schemaRows.Next() {
-		var s string
-		if err := schemaRows.Scan(&s); err != nil {
-			schemaRows.Close()
-			return fmt.Errorf("scan schema row: %w", err)
-		}
-		schemas = append(schemas, s)
-	}
-	schemaRows.Close()
-	if err := schemaRows.Err(); err != nil {
-		return fmt.Errorf("schemas rows.Err: %w", err)
-	}
-
-	// Step 2 — for each schema, look for unsupported catalog kinds.
-	// Schema names from information_schema are server-controlled but
-	// we still pgx.Identifier.Sanitize for defence-in-depth.
-	type offender struct {
-		schema   string
-		nickname string
-		kind     string
-	}
-	var offenders []offender
-	for _, schema := range schemas {
-		qSchema := pgx.Identifier{schema}.Sanitize()
-		// catalog_credentials may not exist on schemas that haven't
-		// been migrated through Plan 01-06 (V0060). Use to_regclass
-		// to check first; missing tables are NOT an error here (they
-		// indicate an old / partial tenant, which the relational
-		// migrate path handles separately).
-		var hasTable bool
-		err := adminPool.QueryRow(ctx, fmt.Sprintf(
-			"SELECT to_regclass('%s.catalog_credentials') IS NOT NULL", schema,
-		)).Scan(&hasTable)
-		if err != nil || !hasTable {
-			continue
-		}
-		rows, err := adminPool.Query(ctx, fmt.Sprintf(
-			"SELECT nickname, catalog_kind FROM %s.catalog_credentials WHERE catalog_kind IN ('glue','unity')",
-			qSchema,
-		))
-		if err != nil {
-			return fmt.Errorf("query %s.catalog_credentials: %w", schema, err)
-		}
-		for rows.Next() {
-			var nick, kind string
-			if err := rows.Scan(&nick, &kind); err != nil {
-				rows.Close()
-				return fmt.Errorf("scan %s row: %w", schema, err)
-			}
-			offenders = append(offenders, offender{schema: schema, nickname: nick, kind: kind})
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("%s rows.Err: %w", schema, err)
-		}
-	}
-
-	if len(offenders) == 0 {
-		return nil
-	}
-	var msg strings.Builder
-	msg.WriteString("Phase 1 only supports catalog_kind IN ('polaris','nessie'). ")
-	msg.WriteString("The following tenant catalog_credentials rows are configured for a stub kind ")
-	msg.WriteString("whose adapter returns iceberg.ErrAdapterStub on every commit:\n")
-	for _, o := range offenders {
-		fmt.Fprintf(&msg, "  - schema=%s nickname=%q kind=%s\n", o.schema, o.nickname, o.kind)
-	}
-	msg.WriteString("Remediation: UPDATE catalog_credentials SET catalog_kind = 'polaris' (or 'nessie') ")
-	msg.WriteString("and re-supply config_json. Glue + Unity adapters arrive in Phase 3.")
-	return errors.New(msg.String())
 }
 
 // tenantExistsAdapter satisfies compiler.TenantValidator. The lookup

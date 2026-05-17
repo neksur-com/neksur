@@ -21,6 +21,17 @@
 // per-request cost is the JSON unmarshal + adapter constructor only.
 // Phase 2 may add an LRU-cached `(tenantID, nickname) → adapter` map at
 // the gateway boundary if profiling shows the construction cost matters.
+//
+// B-3 pre-allocation (Plan 03-03): both the "unity" arm (live, Plan 03-03)
+// and the "glue" arm (still glue_stub, Plan 03-04 flips it to live glue.New
+// WITHOUT re-touching this file — Plan 03-04 creates internal/iceberg/glue/
+// and the glue_stub import is the only thing 03-04 replaces here) are written
+// in this single edit. This eliminates the Wave 1 intra-wave overlap on
+// forwarder.go between Plans 03-03 and 03-04.
+//
+// Phase 02 CR-03 boot guard (assertNoUnsupportedCatalogs) removed in Plan
+// 03-03 main.go edit — tenants with kind=unity now route to the live adapter;
+// kind=glue routes to glue_stub until Plan 03-04 ships.
 
 package iceberg
 
@@ -34,7 +45,7 @@ import (
 	"github.com/neksur-com/neksur/internal/iceberg/glue_stub"
 	"github.com/neksur-com/neksur/internal/iceberg/nessie"
 	"github.com/neksur-com/neksur/internal/iceberg/polaris"
-	"github.com/neksur-com/neksur/internal/iceberg/unity_stub"
+	"github.com/neksur-com/neksur/internal/iceberg/unity"
 )
 
 // polarisCfg is the JSON-tagged shape stored in V0060.config_json for
@@ -66,10 +77,21 @@ type glueCfg struct {
 	CatalogID string `json:"catalogId,omitempty"`
 }
 
-// unityCfg matches unity_stub.Config — same Phase 1 stub rationale.
+// unityCfg is the JSON-tagged shape stored in V0060.config_json for
+// kind=unity. Field names match the Phase 3 live unity.Config (D-1.03). The
+// AccessToken field is retained for backward compat with any Phase 1/2 tenant
+// rows that used workspaceUrl+accessToken; the live unity.New now requires
+// OAuth M2M credentials (oauthClientId + oauthClientSecret) and workspace
+// context (workspaceHost + workspaceId).
+//
+// Plan 03-03 D-3.02: live adapter wired; stub deleted.
 type unityCfg struct {
-	WorkspaceURL string `json:"workspaceUrl,omitempty"`
-	AccessToken  string `json:"accessToken,omitempty"`
+	WorkspaceHost     string `json:"workspaceHost,omitempty"`
+	WorkspaceID       string `json:"workspaceId,omitempty"`
+	OAuthClientID     string `json:"oauthClientId,omitempty"`
+	OAuthClientSecret string `json:"oauthClientSecret,omitempty"`
+	CatalogName       string `json:"catalogName,omitempty"`
+	CredentialMode    string `json:"credentialMode,omitempty"`
 }
 
 // BuildAdapter dispatches on creds.Kind to construct the matching
@@ -130,15 +152,21 @@ func BuildAdapter(ctx context.Context, creds *catalog.Credentials) (iceberg.Iceb
 		return glue_stub.New(ctx, cfg)
 
 	case "unity":
+		// Plan 03-03 D-3.02: live Unity adapter wired; unity_stub deleted.
+		// B-3 absorption: this arm is in the same edit as the glue arm below.
 		var uc unityCfg
 		if err := json.Unmarshal(creds.ConfigJSON, &uc); err != nil {
 			return nil, fmt.Errorf("gateway: %w: unity: %v", catalog.ErrConfigUnmarshal, err)
 		}
-		cfg := unity_stub.Config{
-			WorkspaceURL: uc.WorkspaceURL,
-			AccessToken:  uc.AccessToken,
+		cfg := unity.Config{
+			WorkspaceHost:     uc.WorkspaceHost,
+			WorkspaceID:       uc.WorkspaceID,
+			OAuthClientID:     uc.OAuthClientID,
+			OAuthClientSecret: uc.OAuthClientSecret,
+			CatalogName:       uc.CatalogName,
+			CredentialMode:    uc.CredentialMode,
 		}
-		return unity_stub.New(ctx, cfg)
+		return unity.New(ctx, cfg)
 
 	default:
 		return nil, fmt.Errorf("gateway: %w: %s", catalog.ErrCatalogKindUnsupported, creds.Kind)

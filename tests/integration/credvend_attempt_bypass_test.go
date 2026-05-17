@@ -25,6 +25,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -33,15 +34,18 @@ import (
 	"github.com/neksur-com/neksur/internal/credvend"
 	"github.com/neksur-com/neksur/internal/iceberg"
 	gluestub "github.com/neksur-com/neksur/internal/iceberg/glue_stub"
-	unitystub "github.com/neksur-com/neksur/internal/iceberg/unity_stub"
 )
 
 // TestCredvend_AttemptBypass validates the fail-closed credential vending
 // gate per D-2.09 + ROADMAP §7.
 //
 // Subtests:
-//  1. unity_stub_blocked — unity adapter returns ErrAdapterStub →
+//  1. unity_adapter_stubsts_blocked — unity adapter with SupportsCredVend=true
+//     but IssueScopedSTSCredentials returning ErrAdapterStub (mirrors the
+//     live unity adapter which stubs IssueScopedSTSCredentials in Phase 3) →
 //     Service returns ErrEngineNotSupported → no STS creds issued.
+//     Plan 03-03: unity_stub/ deleted; this subtest uses a local credVendStubAdapter
+//     (see below) to preserve the bypass-prevention contract test.
 //  2. glue_stub_blocked — same for glue stub.
 //  3. unsupported_engine_no_credvend — adapter with SupportsCredVend=false
 //     returns ErrEngineNotSupported before even calling IssueScopedSTSCredentials.
@@ -79,14 +83,16 @@ func TestCredvend_AttemptBypass(t *testing.T) {
 		return credvend.NewService(cache, issued, refresh)
 	}
 
-	t.Run("unity_stub_blocked", func(t *testing.T) {
+	t.Run("unity_adapter_stubsts_blocked", func(t *testing.T) {
 		t.Parallel()
 
+		// Plan 03-03 deviation: unity_stub/ deleted; use a local
+		// credVendStubAdapter that mirrors the live unity adapter's
+		// IssueScopedSTSCredentials=ErrAdapterStub behavior. The live
+		// unity.New requires a real Databricks endpoint, so we simulate
+		// the same Capabilities()+IssueScopedSTSCredentials contract here.
 		svc := newSvc(t)
-		adapter, err := unitystub.New(ctx, unitystub.Config{})
-		if err != nil {
-			t.Fatalf("unitystub.New: %v", err)
-		}
+		adapter := &credVendStubAdapter{name: "unity"}
 
 		creds, err := svc.Issue(ctx, tenantID, adapter, tableRef, region)
 
@@ -266,9 +272,46 @@ func (a *failingCredVendAdapter) IssueScopedSTSCredentials(_ context.Context, _ 
 	return nil, a.err
 }
 
+// credVendStubAdapter is a minimal IcebergCatalogClient with
+// SupportsCredVend=true but IssueScopedSTSCredentials returning ErrAdapterStub.
+// Mirrors the live unity adapter's behavior in Phase 3 (IssueScopedSTSCredentials
+// is not yet wired for Unity STS). Used as a replacement for unity_stub.New in
+// this test after Plan 03-03 deleted the unity_stub/ package.
+type credVendStubAdapter struct {
+	name string
+}
+
+func (a *credVendStubAdapter) Capabilities() iceberg.Capabilities {
+	return iceberg.Capabilities{
+		Name:              a.name,
+		SupportsCredVend:  true,
+		SupportsWebhooks:  true,
+		MaxNamespaceDepth: 1,
+	}
+}
+func (a *credVendStubAdapter) GetTable(_ context.Context, _ iceberg.TableRef) (*iceberg.TableMetadata, error) {
+	return nil, iceberg.ErrAdapterStub
+}
+func (a *credVendStubAdapter) LoadTable(_ context.Context, _ iceberg.TableRef) (*iceberg.TableMetadata, error) {
+	return nil, iceberg.ErrAdapterStub
+}
+func (a *credVendStubAdapter) ListTables(_ context.Context, _ string) ([]iceberg.TableRef, error) {
+	return nil, iceberg.ErrAdapterStub
+}
+func (a *credVendStubAdapter) CommitTable(_ context.Context, _ iceberg.TableRef, _ iceberg.CommitRequest) (*iceberg.CommitResult, error) {
+	return nil, iceberg.ErrAdapterStub
+}
+func (a *credVendStubAdapter) ExpireSnapshots(_ context.Context, _ iceberg.TableRef, _ time.Time) error {
+	return iceberg.ErrAdapterStub
+}
+func (a *credVendStubAdapter) IssueScopedSTSCredentials(_ context.Context, _ iceberg.TableRef, _ string) (*iceberg.STSCredentials, error) {
+	return nil, fmt.Errorf("unity: IssueScopedSTSCredentials: %w", iceberg.ErrAdapterStub)
+}
+
 // Compile-time assertion: stub adapters implement the interface.
 var _ iceberg.IcebergCatalogClient = (*noCredVendAdapter)(nil)
 var _ iceberg.IcebergCatalogClient = (*failingCredVendAdapter)(nil)
+var _ iceberg.IcebergCatalogClient = (*credVendStubAdapter)(nil)
 
 // Ensure time is imported (used by time.Duration in newSvc comments).
 var _ = time.Second

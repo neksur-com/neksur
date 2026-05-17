@@ -108,7 +108,7 @@ var identifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // AdapterBuilder is the per-request adapter construction surface. The
 // production wiring uses BuildAdapter (forwarder.go) which dispatches
-// V0060 creds to polaris/nessie/glue_stub/unity_stub. Tests can inject
+// V0060 creds to polaris/nessie/unity (live)/glue_stub. Tests can inject
 // a fake builder returning a stub iceberg.IcebergCatalogClient so the
 // gateway's 10-step pipeline can be exercised end-to-end without a
 // live Polaris testcontainer + working STS infrastructure (Plan 01-02

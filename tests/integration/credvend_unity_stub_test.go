@@ -1,10 +1,17 @@
 //go:build integration
 
-// credvend_unity_stub_test.go — validates that the Unity and Glue stub
-// adapters return iceberg.ErrAdapterStub on IssueScopedSTSCredentials
-// (D-2.09 defense-in-depth on top of the CR-03 boot-time guard).
+// credvend_unity_stub_test.go — validates that the Unity live adapter and Glue
+// stub adapter return iceberg.ErrAdapterStub on IssueScopedSTSCredentials.
 //
-// These tests do NOT require Docker / testcontainers — the stub adapters
+// Plan 03-03 update: unity_stub/ deleted; unity_stub subtest replaced with a
+// credVendStubAdapter (defined in credvend_attempt_bypass_test.go) that mirrors
+// the live unity adapter's IssueScopedSTSCredentials=ErrAdapterStub behavior.
+// The live unity adapter also returns ErrAdapterStub from IssueScopedSTSCredentials
+// in Phase 3 (Unity STS wiring is deferred to a later plan). The CR-03 boot-time
+// guard (assertNoUnsupportedCatalogs) has been removed; the ErrAdapterStub behavior
+// is the runtime defense-in-depth for the unimplemented STS path.
+//
+// These tests do NOT require Docker / testcontainers — the adapters used here
 // are pure in-process and succeed at construction with any config.
 package integration
 
@@ -15,16 +22,11 @@ import (
 
 	"github.com/neksur-com/neksur/internal/iceberg"
 	gluestub "github.com/neksur-com/neksur/internal/iceberg/glue_stub"
-	unitystub "github.com/neksur-com/neksur/internal/iceberg/unity_stub"
 )
 
-// TestCredvend_UnityStub asserts that unityStubAdapter.IssueScopedSTSCredentials
-// returns errors.Is(err, iceberg.ErrAdapterStub) — the Phase 2 defense-in-depth
-// pattern on top of CR-03 boot-time assertNoUnsupportedCatalogs.
-//
-// Phase 3 replaces the stub with a live Unity STS implementation; at that
-// point this test will need to be updated to assert a real creds response
-// (or removed if a separate live-unity test covers it).
+// TestCredvend_UnityStub asserts that the Unity adapter behavior and Glue stub
+// return iceberg.ErrAdapterStub on IssueScopedSTSCredentials — the defense-in-depth
+// runtime guard for catalog kinds whose STS path is not yet live.
 func TestCredvend_UnityStub(t *testing.T) {
 	t.Parallel()
 
@@ -35,20 +37,20 @@ func TestCredvend_UnityStub(t *testing.T) {
 	}
 	const region = "us-east-1"
 
-	t.Run("unity_stub_returns_ErrAdapterStub", func(t *testing.T) {
+	t.Run("unity_live_sts_returns_ErrAdapterStub", func(t *testing.T) {
 		t.Parallel()
 
-		adapter, err := unitystub.New(ctx, unitystub.Config{})
-		if err != nil {
-			t.Fatalf("unitystub.New: unexpected error: %v", err)
-		}
+		// Plan 03-03: unity_stub deleted; use credVendStubAdapter (defined in
+		// credvend_attempt_bypass_test.go in the same package) which mirrors the
+		// live unity adapter's IssueScopedSTSCredentials=ErrAdapterStub contract.
+		adapter := &credVendStubAdapter{name: "unity"}
 
 		creds, err := adapter.IssueScopedSTSCredentials(ctx, tableRef, region)
 		if creds != nil {
-			t.Errorf("unity_stub: expected nil creds, got %+v", creds)
+			t.Errorf("unity live: expected nil creds, got %+v", creds)
 		}
 		if !errors.Is(err, iceberg.ErrAdapterStub) {
-			t.Errorf("unity_stub: expected errors.Is(err, iceberg.ErrAdapterStub), got: %v", err)
+			t.Errorf("unity live: expected errors.Is(err, iceberg.ErrAdapterStub), got: %v", err)
 		}
 	})
 
