@@ -44,6 +44,43 @@
 -- per V0073 precedent).
 -- =====================================================================
 
+-- Create the per-tenant snapshots table if it does not exist. The snapshots
+-- table tracks Iceberg snapshot commits for this tenant's tables — it is the
+-- canonical event source for the schema-cache broadcaster (D-3.05). The table
+-- is per-tenant (lives in the tenant's schema via search_path = current_schema).
+--
+-- Column semantics (Iceberg snapshot metadata):
+--   tenant_id   — foreign key to public.tenants; used in pg_notify payload
+--   table_id    — Iceberg table UUID (references catalog_credentials or Tables graph node)
+--   snapshot_id — Iceberg snapshot ID (text; Iceberg spec uses long/string)
+--   operation   — Iceberg snapshot operation type per Iceberg spec §snapshot
+--                 (append, overwrite, replace, delete, compaction,
+--                  schema_change, add_partition_spec, replace_partition_spec)
+--   committed_at — UTC timestamp when the snapshot was committed
+--
+-- The trigger on this table is the V0080 schema_changed NOTIFY producer.
+-- Downstream plans (03-03 write-coordinator, 03-06 pin.go, 03-08 partitionspec)
+-- write rows here when they process Iceberg REST commit requests.
+CREATE TABLE IF NOT EXISTS snapshots (
+    id            bigserial    PRIMARY KEY,
+    tenant_id     uuid         NOT NULL,
+    table_id      uuid         NOT NULL,
+    snapshot_id   text         NOT NULL,
+    operation     text         NOT NULL,
+    committed_at  timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT snapshots_operation_valid CHECK (
+        operation IN (
+            'append', 'overwrite', 'replace', 'delete', 'compaction',
+            'schema_change', 'add_partition_spec', 'replace_partition_spec'
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_tenant_table
+    ON snapshots (tenant_id, table_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_committed_at
+    ON snapshots (committed_at DESC);
+
 CREATE OR REPLACE FUNCTION notify_schema_changed() RETURNS trigger AS $$
 DECLARE
     payload text;
