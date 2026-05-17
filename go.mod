@@ -8,6 +8,12 @@ module github.com/neksur-com/neksur
 go 1.25.0
 
 require (
+	// L2/L3 private modules — used only under -tags='commercial enterprise'.
+	// LOCAL DEVELOPMENT: replace directives below map to sibling directories.
+	// CI/PRODUCTION: comment out replace directives; use GOPROXY (Plan 03-15 runbook).
+	github.com/neksur-com/neksur-commercial v0.0.0
+	github.com/neksur-com/neksur-enterprise v0.0.0
+
 	github.com/PagerDuty/go-pagerduty v1.8.0
 	github.com/apache/iceberg-go v0.5.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
@@ -166,4 +172,13 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+)
+
+// LOCAL DEVELOPMENT replace directives for private modules.
+// These map the private repos to local sibling directories.
+// MUST be commented out in CI/production — use GOPROXY instead.
+// See Plan 03-15 runbook for the CI/production GOPROXY configuration.
+replace (
+	github.com/neksur-com/neksur-commercial => ../neksur-commercial
+	github.com/neksur-com/neksur-enterprise => ../neksur-enterprise
 )
