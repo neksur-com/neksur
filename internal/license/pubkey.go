@@ -31,8 +31,16 @@ var publicKeyPEM []byte
 // loadEmbeddedPublicKey parses the compile-time-embedded ECDSA P-256 public key.
 // Returns an error if the PEM is malformed or the key is not ECDSA.
 // Per 03-RESEARCH Example 4 lines 494-505.
+//
+// When a test override is active (via SetTestPublicKeyPEM), that PEM is used instead.
+// This allows cmd/license-gen tests and integration tests to inject ephemeral keys.
 func loadEmbeddedPublicKey() (*ecdsa.PublicKey, error) {
-	block, _ := pem.Decode(publicKeyPEM)
+	keyPEM := publicKeyPEM
+	if override := testPublicKeyOverride.Load(); override != nil {
+		keyPEM = *override
+	}
+
+	block, _ := pem.Decode(keyPEM)
 	if block == nil {
 		return nil, errors.New("license: embedded key PEM is malformed or missing")
 	}
