@@ -1,0 +1,114 @@
+name: Three-Binary Build Matrix
+
+# Plan 03-13: D-3.04 three-binary-build CI gate.
+#
+# Builds all three binary tiers (core / commercial / enterprise) and
+# verifies Pitfall 7 (build-tag drift): the L1 (core) binary must NOT
+# contain any private coordination-module symbols.
+#
+# L2 (commercial) and L3 (enterprise) jobs require access to the private
+# modules (neksur-commercial, neksur-enterprise). In CI these are fetched
+# via GOPROXY with a GitHub PAT. Local development uses the go.mod replace
+# directives that map to sibling directories (Plan 03-14 runbook).
+#
+# See: runbooks/dev-cold-start.md §8 for the local build matrix guide.
+# See: Plan 03-15 for the GOPROXY / CI production runbook.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-matrix:
+    name: Build ${{ matrix.tier }} binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: core
+            build_tags: ""
+            output: bin/neksur-server
+            needs_private_modules: false
+            run_symbol_check: true
+
+          - tier: commercial
+            build_tags: commercial
+            output: bin/neksur-server-commercial
+            needs_private_modules: true
+            run_symbol_check: false
+
+          - tier: enterprise
+            build_tags: commercial enterprise
+            output: bin/neksur-server-enterprise
+            needs_private_modules: true
+            run_symbol_check: false
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      # Private module checkout — only needed for commercial and enterprise builds.
+      # The PRIVATE_REPO_TOKEN secret grants read access to the private repos.
+      # When building core (no private modules), these steps are skipped.
+      - name: Checkout neksur-commercial
+        if: matrix.needs_private_modules
+        uses: actions/checkout@v4
+        with:
+          repository: neksur-com/neksur-commercial
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: ../neksur-commercial
+
+      - name: Checkout neksur-enterprise
+        if: matrix.needs_private_modules
+        uses: actions/checkout@v4
+        with:
+          repository: neksur-com/neksur-enterprise
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: ../neksur-enterprise
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go version (diagnostic)
+        run: go version
+
+      - name: Build ${{ matrix.tier }} binary
+        run: |
+          mkdir -p bin
+          if [[ -z "${{ matrix.build_tags }}" ]]; then
+            go build -tags='' -o '${{ matrix.output }}' ./cmd/neksur-server
+          else
+            go build -tags='${{ matrix.build_tags }}' -o '${{ matrix.output }}' ./cmd/neksur-server
+          fi
+          echo "Build complete: ${{ matrix.output }}"
+          ls -lh '${{ matrix.output }}'
+
+      # Pitfall 7 (build-tag drift) gate: run ONLY on the core binary.
+      # The L1 binary must NOT contain private module symbols.
+      - name: Verify tier isolation (Pitfall 7)
+        if: matrix.run_symbol_check
+        run: |
+          chmod +x scripts/ci/binary-symbol-check.sh
+          ./scripts/ci/binary-symbol-check.sh '${{ matrix.output }}'
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neksur-server-${{ matrix.tier }}
+          path: ${{ matrix.output }}
+          retention-days: 7
