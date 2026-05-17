@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -58,8 +59,9 @@ var authErrRE = regexp.MustCompile(`\b(?:401|403|Unauthorized|Forbidden)\b`)
 // constructor is New); callers obtain an iceberg.IcebergCatalogClient
 // interface, never a typed pointer to this struct.
 type polarisAdapter struct {
-	cfg Config
-	cat *rest.Catalog
+	cfg                  Config
+	cat                  *rest.Catalog
+	compactionCoordinator iceberg.CompactionCoordinator // nilable; L3 only
 }
 
 // New constructs a Polaris-flavored IcebergCatalogClient. Validates
@@ -148,7 +150,11 @@ func New(ctx context.Context, cfg Config) (iceberg.IcebergCatalogClient, error) 
 	if err != nil {
 		return nil, fmt.Errorf("polaris: new catalog: %w", err)
 	}
-	return &polarisAdapter{cfg: cfg, cat: cat}, nil
+	return &polarisAdapter{
+		cfg:                  cfg,
+		cat:                  cat,
+		compactionCoordinator: cfg.CompactionCoordinator,
+	}, nil
 }
 
 // ListTables enumerates tables under namespace via the Polaris REST
@@ -252,6 +258,16 @@ func (p *polarisAdapter) CommitTable(ctx context.Context, ref iceberg.TableRef, 
 // matching snapshot IDs. Pitfall 9 — this is the canonical expire
 // path through the REST catalog; direct file-rewrite paths bypass
 // the gateway entirely (Plan 01-07 L3 detection backstops that).
+//
+// When p.compactionCoordinator is non-nil (L3 tier): the coordinator's
+// GuardExpireSnapshots is called BEFORE the iceberg-go expiration call.
+// Only the allowed (non-pinned) snapshot IDs are expired; blocked IDs
+// (retained by an active SnapshotPin) are skipped. The count of blocked
+// snapshots is logged at slog.Info level (no IDs — Pitfall 11).
+//
+// When p.compactionCoordinator is nil (L1/L2): all candidate snapshots
+// are expired without consulting any pin store (no false protection for
+// tiers that don't have the compaction_coordination license feature).
 func (p *polarisAdapter) ExpireSnapshots(ctx context.Context, ref iceberg.TableRef, olderThan time.Time) error {
 	tbl, err := p.cat.LoadTable(ctx, toIdentifier(ref))
 	if err != nil {
@@ -267,6 +283,40 @@ func (p *polarisAdapter) ExpireSnapshots(ctx context.Context, ref iceberg.TableR
 	if len(doomed) == 0 {
 		return nil
 	}
+
+	// Build string candidate list for the coordinator.
+	candidates := make([]string, len(doomed))
+	for i, id := range doomed {
+		candidates[i] = fmt.Sprintf("%d", id)
+	}
+
+	// L3 compaction guard: filter out pinned snapshots before expiration.
+	// When coordinator is nil (L1/L2 binary), expire all candidates as before.
+	if p.compactionCoordinator != nil {
+		allowed, blocked, err := p.compactionCoordinator.GuardExpireSnapshots(ctx, ref, candidates)
+		if err != nil {
+			return fmt.Errorf("polaris: expire snapshots: compaction guard: %w", err)
+		}
+		// Per Pitfall 11: log only counts, never snapshot IDs or pin bodies.
+		if len(blocked) > 0 {
+			slog.InfoContext(ctx, "polaris: expire snapshots: coordinator blocked snapshots",
+				"blocked_count", len(blocked),
+				"allowed_count", len(allowed),
+			)
+		}
+		if len(allowed) == 0 {
+			return nil // all candidates blocked — nothing to expire
+		}
+		// Reconstruct the int64 doomed list from the allowed string IDs.
+		doomed = doomed[:0]
+		for _, s := range allowed {
+			var id int64
+			if _, scanErr := fmt.Sscanf(s, "%d", &id); scanErr == nil {
+				doomed = append(doomed, id)
+			}
+		}
+	}
+
 	updates := []icebergTable.Update{icebergTable.NewRemoveSnapshotsUpdate(doomed)}
 	if _, _, err := p.cat.CommitTable(ctx, toIdentifier(ref), nil, updates); err != nil {
 		if IsCommitConflict(err) {

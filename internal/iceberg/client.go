@@ -310,3 +310,27 @@ var (
 	// have already migrated to the new spec.
 	ErrPartitionSpecMismatch = errors.New("iceberg: partition spec mismatch")
 )
+
+// CompactionCoordinator is the narrow interface the polaris adapter uses to
+// consult the L3 compaction coordinator before expiring Iceberg snapshots.
+//
+// Production wiring (Plan 03-13) injects an adapter that wraps
+// *compaction.Coordinator (from neksur-enterprise) which satisfies this
+// interface. L1+L2 binaries pass nil — the adapter skips the guard entirely
+// and runs ExpireSnapshots unmodified (no false sense of protection for tiers
+// that don't have the compaction_coordination license feature).
+//
+// Interface defined here (internal/iceberg/) rather than in the polaris
+// sub-package to keep it accessible from multiple catalog adapters and from
+// the gateway that wires the Deps struct.
+type CompactionCoordinator interface {
+	// GuardExpireSnapshots partitions candidates into allowed and blocked
+	// based on whether any active SnapshotPin retains each candidate.
+	// The caller MUST only expire snapshots in the allowed slice.
+	// candidateIDs are snapshot ID strings (decimal int64 representations).
+	GuardExpireSnapshots(
+		ctx context.Context,
+		ref TableRef,
+		candidateIDs []string,
+	) (allowed, blocked []string, err error)
+}
