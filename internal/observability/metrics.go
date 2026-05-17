@@ -197,6 +197,190 @@ var SqlProxyInjectFailuresTotal = promauto.NewCounterVec(
 	[]string{"engine", "reason"},
 )
 
+// ==========================================================================
+// Phase 3 metric / label declarations — B-1 intra-wave overlap mitigation.
+//
+// All Phase 3 downstream Prometheus metric symbols are pre-declared here
+// in a SINGLE Wave-0 edit so Plans 03-09, 03-11, and 03-12 (all in Wave 3)
+// can run in parallel without metrics.go file-write contention.
+//
+// Plans 03-09/11/12 list metrics.go in their read_first ONLY — they do NOT
+// modify this file. They reference the symbols declared below verbatim.
+//
+// Cardinality discipline (Pitfall 11): the `table` / `table_id_short`
+// labels on 03-11 + 03-12 metrics MUST be populated via TableIDShort()
+// to bound cardinality to 8-char prefixes. See TableIDShort below.
+// ==========================================================================
+
+// ---- Phase 3 reason-label string constants (consumed by Plan 03-09 gateway) ----
+
+const (
+	// ReasonPolicyPartitionSpecMismatch is the commit_rejected_total reason
+	// when the write-coordinator rejects a commit because the engine's
+	// partition spec does not match the table's canonical spec (P7 policy,
+	// D-3.05). Maps to HTTP 403.
+	ReasonPolicyPartitionSpecMismatch = "policy_partition_spec_mismatch"
+
+	// ReasonPolicyWriteConflict is the commit_rejected_total reason
+	// when the write-coordinator rejects a commit due to a write-conflict
+	// policy (D-3.05 lww/abort/retry-with-backoff; abort path maps HTTP 409).
+	ReasonPolicyWriteConflict = "policy_write_conflict"
+
+	// ReasonPolicyEngineDivergent is the commit_rejected_total reason
+	// when the SQL proxy or L1 gateway rejects a request because the engine's
+	// CompiledPolicy.status = divergent_suspended (D-3.05). Maps to HTTP 503.
+	// Distinct from ReasonPolicyEngineUnavailable so SREs can page on
+	// divergence separately from engine-down events.
+	ReasonPolicyEngineDivergent = "policy_engine_divergent"
+
+	// ReasonPolicyEngineUnavailable is an alias for the Phase 1 constant
+	// ReasonPolicyEngineUnavailable defined above, re-exported in the Phase 3
+	// const block so Plan 03-09 can import a single contiguous block. The
+	// value is identical — this is NOT a new label value, only a new alias
+	// for the same string so code using the Phase 3 block stays consistent.
+	// NOTE: the original const already exists in this file; this is a
+	// documentation alias only — do NOT redeclare. Plan 03-09 MUST use
+	// observability.ReasonPolicyEngineUnavailable (the original const above).
+	// ReasonPolicyEngineUnavailable = "policy_engine_unavailable" -- ALREADY DECLARED ABOVE
+)
+
+// ---- Plan 03-11: continuous cross-engine consistency verifier metrics ----
+
+// CrossEngineDivergenceTotal counts detected cross-engine policy
+// divergences, labeled by {engine, table, severity}. Severity is one of
+// "mismatch" (result differs) or "timeout" (probe did not complete in
+// budget). The `table` label MUST be populated via TableIDShort() to
+// bound cardinality (Pitfall 11).
+//
+// Plan 03-11 (verifier/sampler.go + verifier/mirror.go) increments this
+// counter from the divergence detection path. SREs page on
+// cross_engine_divergence_total{severity="mismatch"} > 0.
+var CrossEngineDivergenceTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "cross_engine_divergence_total",
+		Help: "Cross-engine policy divergences detected by the continuous " +
+			"consistency verifier (D-3.05). Labels: engine, table (8-char prefix), " +
+			"severity={mismatch,timeout}.",
+	},
+	[]string{"engine", "table", "severity"},
+)
+
+// EngineProbeQueueDepth is the current depth of the verifier's probe
+// queue, labeled by engine. A rising queue indicates the verifier is
+// falling behind its 5-minute coverage budget.
+//
+// Plan 03-11 (verifier/sampler.go) sets this gauge from the probe
+// scheduler goroutine.
+var EngineProbeQueueDepth = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "engine_probe_queue_depth",
+		Help: "Current depth of the cross-engine consistency verifier's " +
+			"probe queue per engine. Rising queue = verifier falling behind " +
+			"5-min coverage budget (D-3.05).",
+	},
+	[]string{"engine"},
+)
+
+// EngineProbeDurationSeconds is the histogram of per-probe round-trip
+// latency, labeled by engine. Standard DefBuckets cover the sub-second
+// warm-path; buckets above 10s surface timeout-adjacent probes.
+//
+// Plan 03-11 (verifier/sampler.go) observes this histogram per probe
+// completion (success or failure).
+var EngineProbeDurationSeconds = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "engine_probe_duration_seconds",
+		Help:    "Cross-engine consistency probe round-trip latency in seconds, " +
+			"by engine. Buckets cover sub-second warm-path + 10s timeout detection.",
+		Buckets: prometheus.DefBuckets,
+	},
+	[]string{"engine"},
+)
+
+// VerifierCoveragePairsPerCycle is the number of {table, policy} pairs
+// probed in the most recent verifier cycle. Reported as a Gauge (not a
+// counter) so SREs can spot a cycle where coverage dropped (e.g., probe
+// budget exhausted).
+//
+// Plan 03-11 (verifier/sampler.go) sets this gauge at the end of each
+// 5-minute coverage cycle.
+var VerifierCoveragePairsPerCycle = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "verifier_coverage_pairs_per_cycle",
+		Help: "Number of {table, policy} pairs probed by the continuous " +
+			"verifier in the most recent 5-min cycle (D-3.05 24h budget).",
+	},
+)
+
+// VerifierUncoveredPairs is the number of {table, policy} pairs that
+// were NOT probed in the most recent cycle due to budget exhaustion. A
+// non-zero value means coverage is incomplete — SREs should alert if
+// this remains non-zero for more than one cycle.
+//
+// Plan 03-11 (verifier/sampler.go) sets this gauge alongside
+// VerifierCoveragePairsPerCycle.
+var VerifierUncoveredPairs = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "verifier_uncovered_pairs",
+		Help: "Number of {table, policy} pairs skipped in the most recent " +
+			"verifier cycle due to budget exhaustion. Non-zero = incomplete coverage.",
+	},
+)
+
+// VerifierMirrorDroppedTotal counts differential-mirroring probe results
+// that were dropped (e.g., queue full, non-deterministic query excluded,
+// result too large to diff). A rising counter indicates the 1% mirror
+// sample is being shed — SREs should investigate queue sizing.
+//
+// Plan 03-11 (verifier/mirror.go) increments this counter from the
+// mirror probe result handler.
+var VerifierMirrorDroppedTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "verifier_mirror_dropped_total",
+		Help: "Differential-mirroring probe results dropped (queue full, " +
+			"non-deterministic query, or result-size limit exceeded). " +
+			"Rising counter = mirror shed rate increasing.",
+	},
+)
+
+// ---- Plan 03-12: compaction coordinator metrics ----
+
+// CompactionBlockedTotal counts compaction operations blocked because
+// an active SnapshotPin prevented snapshot expiry, labeled by
+// {reason, tenant_id, table_id_short}. The `table_id_short` label
+// MUST be populated via TableIDShort() (Pitfall 11 cardinality discipline).
+//
+// Plan 03-12 (coordinator/coordinator.go) increments this counter from
+// the compaction guard when it detects an active pin on the target snapshot.
+var CompactionBlockedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "compaction_blocked_total",
+		Help: "Compaction operations blocked by an active SnapshotPin " +
+			"(Plan 03-12 snapshot-retention guard). Labels: reason, " +
+			"tenant_id, table_id_short (8-char prefix per Pitfall 11).",
+	},
+	[]string{"reason", "tenant_id", "table_id_short"},
+)
+
+// ---- Cardinality-clamp helper (Pitfall 11 discipline) ----
+
+// TableIDShort returns the first 8 characters of a table ID string for
+// use as a Prometheus label value. Iceberg table IDs are UUIDs (36 chars)
+// or arbitrary strings; including the full value as a label would cause
+// unbounded cardinality explosion (Pitfall 11). The 8-char prefix provides
+// enough entropy to identify a specific table in a dashboard query while
+// keeping the time-series count bounded.
+//
+// Callers MUST use this function for any `table`, `table_id_short`, or
+// similar label that would otherwise accept a raw table identifier.
+// Plans 03-11 and 03-12 use this helper verbatim.
+func TableIDShort(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
+
 // ---------------------------------------------------------------------
 // Wave 3 / Plan 02-07 L4 credential vending metrics.
 //
