@@ -34,6 +34,13 @@
 // instead of 30s because policy-changed events are operator-paced
 // (manual edits, terraform applies) rather than commit-frequency
 // (every Spark write).
+//
+// Plan 03-07 refactor (no behaviour change): the per-connection loop
+// (acquire + LISTEN + WaitForNotification) is now handled by the shared
+// listenOnce helper in listener.go so the schemacache Broadcaster can
+// reuse it without a second pool. Trigger.Listen adds the
+// policy_changed-specific pollOnceStub fallback on top of the shared loop.
+// The policy_changed behaviour is UNCHANGED — all existing tests still pass.
 
 package compiler
 
@@ -41,7 +48,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -142,25 +148,25 @@ func NewTrigger(
 // + restart the Listen, or the process should exit and let the
 // supervisor restart).
 //
-// CR-03 fix: backoff + lastSuccess are reset whenever listenOnce ran
-// for long enough to count as a healthy LISTEN (>= reconnectHealthy).
-// Without the reset a single transient failure escalated backoff to
-// backoffMax permanently and pushed the fallback poller "on" forever,
-// so the 5-min pollerFallbackThreshold became a poll-forever sentinel.
+// Plan 03-07 refactor: the per-connection inner loop (listenOnce) is now in
+// listener.go and shared with the schemacache Broadcaster. The outer
+// reconnect-backoff supervisor + pollOnceStub fallback remains here so that
+// the policy_changed-specific sustained-failure polling is preserved.
+// Behaviour is IDENTICAL to the pre-refactor implementation.
 func (t *Trigger) Listen(ctx context.Context) error {
 	backoff := time.Second
 	lastSuccess := time.Now()
-	// listenStart records the wall-clock when listenOnce begins; on
-	// return, if listenOnce ran for >= reconnectHealthy (30s), we
-	// treat the call as proof of a healthy connection that later
-	// dropped and reset backoff / lastSuccess.
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		listenStart := time.Now()
-		err := t.listenOnce(ctx)
+		// Use the shared per-connection loop from listener.go (Plan 03-07).
+		// listenOnce acquires ONE connection from the pool, runs LISTEN, and
+		// loops on WaitForNotification — no second pool introduced.
+		err := listenOnce(ctx, t.pool, notifyChannel, listenerFunc(t.handleNotification))
 		if err == nil {
 			// listenOnce returns nil only on ctx.Done() — propagate.
 			return ctx.Err()
@@ -209,34 +215,6 @@ func (t *Trigger) Listen(ctx context.Context) error {
 		if backoff > backoffMax {
 			backoff = backoffMax
 		}
-	}
-}
-
-// listenOnce acquires one connection, LISTENs, and loops on
-// WaitForNotification. Returns nil on ctx.Done(); a non-nil error on
-// connection drop / scan error / unrecoverable issue.
-func (t *Trigger) listenOnce(ctx context.Context) error {
-	conn, err := t.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire: %w", err)
-	}
-	defer conn.Release()
-
-	// pg LISTEN — the channel name is a Postgres identifier; we control
-	// it (notifyChannel constant) so no sanitisation needed.
-	if _, err := conn.Exec(ctx, "LISTEN "+notifyChannel); err != nil {
-		return fmt.Errorf("LISTEN %s: %w", notifyChannel, err)
-	}
-
-	for {
-		notif, err := conn.Conn().WaitForNotification(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
-			}
-			return fmt.Errorf("WaitForNotification: %w", err)
-		}
-		t.handleNotification(ctx, notif)
 	}
 }
 
