@@ -83,16 +83,36 @@ const (
 	// node exists only so the planner can answer "is this policy
 	// known for this engine?" with a deterministic graph query.
 	CompiledPolicyStatusCompileFailed CompiledPolicyStatus = "compile_failed"
+
+	// CompiledPolicyStatusDivergentSuspended indicates the continuous
+	// cross-engine consistency verifier (D-3.05 hybrid sampler +
+	// differential mirroring) detected a policy-enforcement divergence
+	// for this engine on this table. The SQL proxy + L1 gateway treat
+	// this status identically to probe_failed (fail-closed → HTTP 503)
+	// but with a distinct reason label: reason="policy_engine_divergent"
+	// so SREs can distinguish an engine-divergence page from a probe
+	// failure.
+	//
+	// Operator clears via runbook (divergence-clear.md): root-cause the
+	// divergence first, then `UPDATE CompiledPolicy SET status='active'
+	// WHERE ...` via a Cypher write inside ExecuteInTenant. The verifier
+	// does NOT auto-clear — human confirmation is required.
+	//
+	// Extended from Phase 02 enum (D-3.05); agtype is string so no
+	// graph migration is needed — only this const + IsValid() update.
+	CompiledPolicyStatusDivergentSuspended CompiledPolicyStatus = "divergent_suspended"
 )
 
-// IsValid reports whether s is one of the four documented statuses.
+// IsValid reports whether s is one of the five documented statuses.
 // Used by the AGE reader to reject corrupted rows defensively.
+// Extended in Phase 3 (D-3.05) with divergent_suspended.
 func (s CompiledPolicyStatus) IsValid() bool {
 	switch s {
 	case CompiledPolicyStatusPending,
 		CompiledPolicyStatusActive,
 		CompiledPolicyStatusProbeFailed,
-		CompiledPolicyStatusCompileFailed:
+		CompiledPolicyStatusCompileFailed,
+		CompiledPolicyStatusDivergentSuspended:
 		return true
 	}
 	return false

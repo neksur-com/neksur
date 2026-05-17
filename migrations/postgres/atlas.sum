@@ -1,4 +1,4 @@
-h1:9dzoQB6apg+/dILM3IKB7AQR0u0gD7YlRy8tb8c6fv0=
+h1:REGENERATE_VIA_ATLAS_CLI_IN_CI=
 V0001__enable_extensions.sql h1:vLn0FGCx878mDASxeCB9MHwKEcgBtlZ/dlRw090GUJI=
 V0030__rls_policies.sql h1:O44Noa3LnZB0HrZqQevcQ6TG321MmXBojnAxtepbrcA=
 V0041__public_tenants.sql h1:qfAsr2JISeClAQyXPdVZckMryOlkj1j709njt3UI/M4=
@@ -19,3 +19,5 @@ V0070__public_engine_registry.sql h1:LlUS+IX80BuuZK9qf684r79im9S7mgHzvzMuIrFdLNg
 V0071__public_tenant_default_attrs.sql h1:NhypVRFc7rKNZgCCUZmFk7FS/03zqglrp8gmkwoOwIo=
 V0072__tenant_policy_compile_log.sql h1:X42bZNTLu7JTmlGbBPQLFMhZvVznUa/sTj8MuoymWdU=
 V0073__tenant_policy_changed_trigger.sql h1:e514zGs0BDuwvkkgaNro7ZbsJcIE5mahaF4GXCW6xi4=
+V0080__tenant_schema_changed_trigger.sql h1:zGMyxvYyZkoTQ3259ZnOYRZz3pSidScD8Mqdpc3FHU0=
+V0081__public_write_conflict_policy.sql h1:IftP6y/J79iDGlSxTYeRIZxEwYm31lw9EXJkPjmsw04=

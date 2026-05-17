@@ -254,6 +254,33 @@ const Phase2MaxVersion = "0073"
 // V0042 — FORCE RLS + 4 policies + CHECK constraint per new label.
 const Phase2GraphMaxVersion = "0042"
 
+// Phase3MaxVersion is the highest expected version number for Phase 3
+// per-tenant relational migrations (V0080–V0081 added in Plan 03-01).
+// Used by tests and the cmd/migrate tenant-loop high-water-mark
+// assertion to confirm a successful tenant apply lands every Phase 3
+// migration — see tests/integration/phase3_migrations_applied_per_tenant_test.go.
+//
+// V0080 — per-tenant notify_schema_changed() trigger on snapshots table
+//         (D-3.05 LISTEN/NOTIFY substrate for schema-cache broadcaster).
+// V0081 — per-tenant policies.write_conflict_policy column
+//         (D-3.05 write-conflict semantics: lww|abort|retry-with-backoff).
+const Phase3MaxVersion = "0081"
+
+// Phase3GraphMaxVersion is the highest expected version number for the
+// per-tenant AGE graph migrations after Plan 03-01 (V0050–V0052). The
+// graph-migration runner ApplyTenantGraph (graph.go) walks
+// migrations/graph/V*.sql lexicographically; this constant lets tests
+// assert that the runner reached the end of the Phase 3 graph schema.
+//
+// V0050 — 3 new vlabels (SnapshotPin, PartitionSpec, DivergenceEvent)
+//         + 3 new elabels (PINS, USES_SPEC, DIVERGED_AT). Total: 28
+//         vlabels + 42 elabels across Phase 0+1+2+3.
+// V0051 — property + GC-01 structural indexes for the 3 new vlabels
+//         and 3 new elabels.
+// V0052 — ENABLE+FORCE RLS + 4 policies + CHECK constraint per new
+//         label (6 label tables = 3 vlabel + 3 elabel).
+const Phase3GraphMaxVersion = "0052"
+
 // ApplyTenant applies all pending tenant-tier migrations to the given
 // tenant schema. Composes a search_path-scoped DSN of the form
 //
