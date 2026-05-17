@@ -15,6 +15,8 @@ dist/
 /neksur-cli
 # Locally-built server (root-level go build ./cmd/neksur-server produces ./neksur-server)
 /neksur-server
+# Locally-built license generator CLI (root-level go build ./cmd/license-gen produces ./license-gen)
+/license-gen
 coverage.out
 coverage.html
 profile.out
