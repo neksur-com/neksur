@@ -19,13 +19,16 @@ import (
 )
 
 // BuildInjector returns a concrete sqlproxy.Injector for the given
-// engine kind. Wave 2 Plan 02-05 supports three kinds:
+// engine kind. Wave 2 Plan 02-05 introduced three kinds; Phase 3
+// D-3.02 (Plan 03-05) makes the dremio arm live:
 //
 //   - "trino"  → NewTrinoInjector(deps.Store, deps.Cache)
 //   - "spark"  → NewSparkInjector(deps.Store, deps.Cache)
-//   - "dremio" → NewDremioInjector() (Phase 2 fail-closed stub;
-//     returns 503 + sql_proxy_inject_failures_total{reason='policy_engine_unavailable'}
-//     at request time via sqlproxy.ErrPolicyEngineUnavailable — CR-09 + WR-A3)
+//   - "dremio" → NewDremioInjector(deps.Store, deps.Cache)
+//     dremio LIVE (Phase 3 D-3.02 + 03-05-PLAN): replaces Phase 2
+//     fail-closed stub with real splicer; honors divergent_suspended
+//     as fail-closed 503 per D-3.05. Metric: sql_proxy_inject_failures_total
+//     (NOT commit_rejected_total — WR-A3).
 //
 // Any other engine kind returns a wrapped sqlproxy.ErrEngineNotSupported
 // so callers can branch via errors.Is and the wiring layer can either
@@ -39,7 +42,7 @@ func BuildInjector(engineKind string, deps sqlproxy.InjectorDeps) (sqlproxy.Inje
 	case "spark":
 		return NewSparkInjector(deps.Store, deps.Cache), nil
 	case "dremio":
-		return NewDremioInjector(), nil
+		return NewDremioInjector(deps.Store, deps.Cache), nil
 	default:
 		return nil, fmt.Errorf("sqlproxy: BuildInjector(%q): %w", engineKind, sqlproxy.ErrEngineNotSupported)
 	}

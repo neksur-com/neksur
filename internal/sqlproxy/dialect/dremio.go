@@ -1,23 +1,36 @@
-// DremioInjector — sqlproxy.Injector stub for the Dremio dialect.
-// Wave 2 Plan 02-05 dispatch B. Dremio support lights up in Phase 3
-// (alongside Snowflake); Phase 2 ships a fail-closed stub.
+// DremioInjector — sqlproxy.Injector implementation for the Dremio
+// dialect. Phase 3 D-3.02 (Plan 03-05) makes it live by cloning the
+// TrinoInjector pattern from trino.go (per 03-PATTERNS §12).
 //
-// CR-09: previously this stub returned iceberg.ErrAdapterStub, which
-// the sqlproxy server.go error switch maps to HTTP 501 'engine not
-// supported'. 501 does NOT increment the policy-engine-unavailable
-// counter and does not page SREs — so a tenant configured for Dremio
-// would silently run queries with NO policy enforcement and zero
-// alerting. A fail-closed system must translate 'engine with no
-// emitter registered' to 503 + sql_proxy_inject_failures_total{
-// reason='policy_engine_unavailable'} so the dashboard surfaces the
-// rejection.
+// Phase 2 history:
+//   CR-09: Phase 2 stub returned sqlproxy.ErrPolicyEngineUnavailable
+//   (fail-closed, 503 + sql_proxy_inject_failures_total) to avoid the
+//   silent 501 / no-alert posture of an ErrEngineNotSupported return.
+//   WR-A3: counter family is sql_proxy_inject_failures_total (NOT
+//   commit_rejected_total — that is L1-catalog-gateway-only).
 //
-// WR-A3: the counter family is the Phase 2 sqlproxy-side
-// sql_proxy_inject_failures_total (NOT commit_rejected_total — that is
-// L1-catalog-gateway-only; the duplicate increment was removed from
-// server.go in plan 02-10). The injector returns
-// sqlproxy.ErrPolicyEngineUnavailable so the server maps the request
-// to 503 and the sqlproxy counter increments.
+// Phase 3 status: dremio LIVE (Phase 3 D-3.02 + 03-05-PLAN).
+//   The fail-closed stub is replaced with a real splicer that follows
+//   the same shape as TrinoInjector (trino.go lines 42-92):
+//   tenant.IDFromContext → cache lookup → SpliceArtifact dialect
+//   dispatch → cache populate on miss.
+//
+// Splice.go compatibility:
+//   Dremio uses ANSI SQL with double-quote identifier quoting — the
+//   same SELECT/WHERE/projection grammar as Trino. SpliceArtifact in
+//   splice.go is dialect-agnostic for the single-table SELECT shape;
+//   no Dremio-specific arm is needed in splice.go.
+//
+// divergent_suspended handling:
+//   Per D-3.05 and the threat model (T-3-dremio-divergent-bypass),
+//   a CompiledPolicy with status=divergent_suspended is treated
+//   identically to probe_failed: fail-closed 503 +
+//   sql_proxy_inject_failures_total{reason='policy_engine_unavailable'}.
+//   Plan 03-11 will add the distinct reason label; for now the same
+//   ErrPolicyEngineUnavailable sentinel is returned.
+//
+// Per Pitfall 11: this file never logs the query body or the artifact
+// body — error returns wrap sqlproxy sentinels only.
 
 package dialect
 
@@ -25,31 +38,115 @@ import (
 	"context"
 	"fmt"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+
+	"github.com/neksur-com/neksur/internal/iceberg"
+	"github.com/neksur-com/neksur/internal/policy/store"
 	"github.com/neksur-com/neksur/internal/sqlproxy"
+	"github.com/neksur-com/neksur/internal/tenant"
 )
 
-// DremioInjector is the Phase 2 fail-closed stub for the "dremio"
-// engine kind. Zero-field by design — every call short-circuits with
-// sqlproxy.ErrPolicyEngineUnavailable before touching the store or
-// cache. The struct exists (rather than a bare function) for parity
-// with the other dialects and so dispatch C's wiring layer can
-// register it through the same BuildInjector factory.
-type DremioInjector struct{}
-
-// NewDremioInjector constructs the stub. Takes no dependencies — see
-// the DremioInjector struct doc for the rationale.
-func NewDremioInjector() *DremioInjector {
-	return &DremioInjector{}
+// CompiledLoader is the narrow interface DremioInjector needs from the
+// CompiledStore. *store.CompiledStore satisfies this interface; tests
+// inject a fake implementation via NewDremioInjectorWithLoader.
+type CompiledLoader interface {
+	LoadCompiledForTable(ctx context.Context, ref iceberg.TableRef) ([]store.CompiledPolicy, error)
 }
 
-// InjectPolicy is a Phase 2 fail-closed stub: every call returns
-// sqlproxy.ErrPolicyEngineUnavailable wrapped with a per-dialect
-// prefix. The sqlproxy server's error switch maps this to HTTP 503
-// AND increments sql_proxy_inject_failures_total{reason='policy_engine_unavailable'},
-// so a tenant accidentally routed to a Dremio engine is fail-closed
-// AND visible on the SRE dashboard (CR-09 + WR-A3).
+// DremioInjector serves the "dremio" engine kind. Thread-safe: the
+// compiledForTableLoader and LRU cache are both safe for concurrent
+// use, and InjectPolicy holds no per-request mutable state.
 //
-// Per Pitfall 11: no query body is read or logged on this path.
-func (i *DremioInjector) InjectPolicy(_ context.Context, _ string, _ sqlproxy.TableRef, _ sqlproxy.Claims) (string, string, error) {
-	return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: Phase 2 stub — failing closed: %w", sqlproxy.ErrPolicyEngineUnavailable)
+// Phase 3 D-3.02: replaces the Phase 2 fail-closed stub with a live
+// splicer following the same shape as TrinoInjector (trino.go).
+type DremioInjector struct {
+	loader CompiledLoader
+	cache  *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
+}
+
+// NewDremioInjector constructs a live DremioInjector bound to the given
+// CompiledStore + LRU cache (shared across all dialect implementations
+// — the CacheKey carries the Engine field so per-dialect entries never
+// collide).
+func NewDremioInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *DremioInjector {
+	return &DremioInjector{loader: s, cache: cache}
+}
+
+// NewDremioInjectorWithLoader constructs a DremioInjector with a custom
+// CompiledLoader. This constructor exists for unit testing — the
+// production wiring layer calls NewDremioInjector with a *store.CompiledStore.
+func NewDremioInjectorWithLoader(loader CompiledLoader, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *DremioInjector {
+	return &DremioInjector{loader: loader, cache: cache}
+}
+
+// InjectPolicy fetches the active Dremio CompiledPolicy artifact for
+// (tenant=ctx, table) and splices it into `query` via
+// dialect.SpliceArtifact (Plan 02-12 — replaces the Phase 2 fail-closed
+// stub). The artifact kind discriminator drives row-filter
+// WHERE-conjunction vs column-mask projection rewriting.
+//
+// divergent_suspended status is treated as fail-closed (503) per
+// D-3.05 / T-3-dremio-divergent-bypass. Plan 03-11 adds the distinct
+// reason label; this plan returns ErrPolicyEngineUnavailable.
+//
+// Per Pitfall 11: this method never logs the query body or the
+// artifact body — error returns wrap sqlproxy sentinels only.
+func (i *DremioInjector) InjectPolicy(ctx context.Context, query string, table sqlproxy.TableRef, principal sqlproxy.Claims) (string, string, error) {
+	tid, ok := tenant.IDFromContext(ctx)
+	if !ok {
+		return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: tenant missing: %w", sqlproxy.ErrPolicyEngineUnavailable)
+	}
+
+	cacheKey := sqlproxy.CacheKey{
+		TenantID:  tid.String(),
+		Namespace: table.Namespace,
+		Table:     table.Name,
+		Engine:    "dremio",
+	}
+
+	if entry, hit := i.cache.Get(cacheKey); hit {
+		rewritten, rerr := SpliceArtifact(query, entry.Body, entry.Kind, principal)
+		if rerr != nil {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: %w", rerr)
+		}
+		return rewritten, sqlproxy.CacheStatusHit, nil
+	}
+
+	compiled, err := i.loader.LoadCompiledForTable(ctx, iceberg.TableRef{
+		Namespace: []string{table.Namespace},
+		Name:      table.Name,
+	})
+	if err != nil {
+		return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: load: %w", sqlproxy.ErrPolicyEngineUnavailable)
+	}
+
+	for _, cp := range compiled {
+		if cp.EngineKind != "dremio" {
+			continue
+		}
+		// divergent_suspended is treated identically to probe_failed:
+		// fail-closed 503. Plan 03-11 adds the distinct reason label.
+		if cp.Status == store.CompiledPolicyStatusDivergentSuspended {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: policy_engine_divergent: %w", sqlproxy.ErrPolicyEngineUnavailable)
+		}
+		if cp.Status != store.CompiledPolicyStatusActive {
+			continue
+		}
+		// Predicate-kind artifacts are gateway-handled (Layer 1 commit
+		// validation) — they must NOT reach the sqlproxy path. Skip
+		// silently so a tenant with mixed kinds gets enforcement on the
+		// splice-eligible artifacts and the gateway handles the rest.
+		if cp.ArtifactKind == store.KindPredicate {
+			continue
+		}
+		entry := sqlproxy.ArtifactEntry{Body: []byte(cp.ArtifactBody), Kind: cp.ArtifactKind}
+		i.cache.Add(cacheKey, entry)
+		rewritten, rerr := SpliceArtifact(query, entry.Body, entry.Kind, principal)
+		if rerr != nil {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: %w", rerr)
+		}
+		return rewritten, sqlproxy.CacheStatusMiss, nil
+	}
+
+	return "", sqlproxy.CacheStatusMiss, fmt.Errorf("dialect/dremio: no active policy: %w", sqlproxy.ErrPolicyEngineUnavailable)
 }

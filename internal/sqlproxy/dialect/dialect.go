@@ -1,7 +1,12 @@
 // Package dialect houses the per-engine sqlproxy.Injector implementations
-// (Trino, Spark, Dremio in Wave 2 Plan 02-05; BigQuery + Databricks +
-// Snowflake light up in Phase 3). The Injector interface itself lives
-// in the parent `sqlproxy` package — this package's types implement it.
+// (Trino, Spark, Dremio live in Phase 3 D-3.02 Plan 03-05; BigQuery +
+// Databricks + Snowflake light up in later Phase 3 plans). The Injector
+// interface itself lives in the parent `sqlproxy` package — this
+// package's types implement it.
+//
+// Dremio status: LIVE as of Phase 3 D-3.02 (Plan 03-05). The Phase 2
+// fail-closed stub is replaced with a real splicer (DremioInjector)
+// that follows the same pattern as TrinoInjector + SparkInjector.
 //
 // The factory entry point is dialect.BuildInjector (see builder.go),
 // which the neksur-server wiring layer calls once per supported engine

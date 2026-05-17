@@ -35,6 +35,9 @@ type fakeCompiledStore struct {
 	err      error
 }
 
+// Ensure fakeCompiledStore satisfies the dialect.CompiledLoader interface.
+var _ dialect.CompiledLoader = (*fakeCompiledStore)(nil)
+
 func (f *fakeCompiledStore) LoadCompiledForTable(_ context.Context, _ iceberg.TableRef) ([]store.CompiledPolicy, error) {
 	if f.err != nil {
 		return nil, f.err
