@@ -194,3 +194,11 @@ func WriteCoordinatorPreCommit(
 func isCommitConflictForTest(err error) bool {
 	return polaris.IsCommitConflict(err)
 }
+
+// DetectEngineKindForTest is an exported thin wrapper around detectEngineKind
+// for integration tests (in the tests/integration/ package) that need to
+// verify engine-kind extraction from HTTP requests without re-implementing the
+// logic. Production code in handler.go calls detectEngineKind directly.
+func DetectEngineKindForTest(r *http.Request) string {
+	return detectEngineKind(r)
+}

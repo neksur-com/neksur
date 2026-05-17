@@ -59,15 +59,23 @@ type CompiledLoader interface {
 //
 // Phase 3 D-3.02: replaces the Phase 2 fail-closed stub with a live
 // splicer following the same shape as TrinoInjector (trino.go).
+//
+// Plan 03-09 extension: pin-aware FROM rewrite using Dremio's native
+// `AT SNAPSHOT '<snapshot_id>'` time-travel syntax. When a named
+// snapshot pin is active for the table, InjectPolicy rewrites the FROM
+// clause to target the pinned snapshot BEFORE calling SpliceArtifact.
+// See SnapshotPinReader (defined in trino.go) for the tiebreaker rule.
 type DremioInjector struct {
-	loader CompiledLoader
-	cache  *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
+	loader   CompiledLoader
+	cache    *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
+	pinStore SnapshotPinReader // nil → pin rewrite skipped (L1 + no-pin path)
 }
 
 // NewDremioInjector constructs a live DremioInjector bound to the given
 // CompiledStore + LRU cache (shared across all dialect implementations
 // — the CacheKey carries the Engine field so per-dialect entries never
-// collide).
+// collide). The pinStore field defaults to nil (pin rewrite skipped).
+// Use NewDremioInjectorWithPin to enable pin-aware FROM rewriting.
 func NewDremioInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *DremioInjector {
 	return &DremioInjector{loader: s, cache: cache}
 }
@@ -79,11 +87,27 @@ func NewDremioInjectorWithLoader(loader CompiledLoader, cache *lru.Cache[sqlprox
 	return &DremioInjector{loader: loader, cache: cache}
 }
 
+// NewDremioInjectorWithPin constructs a DremioInjector with pin-aware FROM
+// rewriting enabled. The pinStore must satisfy SnapshotPinReader; when a
+// named snapshot pin is active for the table, InjectPolicy will rewrite
+// the FROM clause to `FROM <table> AT SNAPSHOT '<snapshot_id>'` before
+// applying the row-filter / column-mask splice.
+//
+// Passing nil for pinStore is equivalent to calling NewDremioInjector.
+func NewDremioInjectorWithPin(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry], pinStore SnapshotPinReader) *DremioInjector {
+	return &DremioInjector{loader: s, cache: cache, pinStore: pinStore}
+}
+
 // InjectPolicy fetches the active Dremio CompiledPolicy artifact for
 // (tenant=ctx, table) and splices it into `query` via
 // dialect.SpliceArtifact (Plan 02-12 — replaces the Phase 2 fail-closed
 // stub). The artifact kind discriminator drives row-filter
 // WHERE-conjunction vs column-mask projection rewriting.
+//
+// Plan 03-09 pin-aware pre-splice: when pinStore is non-nil and an
+// active snapshot pin exists for the table, the query's FROM clause is
+// rewritten to `FROM <table> AT SNAPSHOT '<snapshot_id>'` BEFORE
+// SpliceArtifact is called.
 //
 // divergent_suspended status is treated as fail-closed (503) per
 // D-3.05 / T-3-dremio-divergent-bypass. Plan 03-11 adds the distinct
@@ -95,6 +119,23 @@ func (i *DremioInjector) InjectPolicy(ctx context.Context, query string, table s
 	tid, ok := tenant.IDFromContext(ctx)
 	if !ok {
 		return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: tenant missing: %w", sqlproxy.ErrPolicyEngineUnavailable)
+	}
+
+	// Pin-aware FROM rewrite: applies BEFORE the artifact splice so row
+	// filters target the pinned snapshot. Skipped when pinStore is nil.
+	if i.pinStore != nil {
+		ref := iceberg.TableRef{Namespace: []string{table.Namespace}, Name: table.Name}
+		snapID, perr := i.pinStore.ActiveSnapshotIDForTable(ctx, ref)
+		if perr != nil {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: pin lookup: %w", sqlproxy.ErrPolicyEngineUnavailable)
+		}
+		if snapID != "" {
+			pinned, rerr := RewriteFromForSnapshotPin(query, snapID, PinDialectDremio)
+			if rerr != nil {
+				return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/dremio: pin rewrite: %w", rerr)
+			}
+			query = pinned
+		}
 	}
 
 	cacheKey := sqlproxy.CacheKey{

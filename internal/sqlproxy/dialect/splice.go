@@ -773,3 +773,111 @@ func isIdentStart(b byte) bool {
 func isWordChar(b byte) bool {
 	return isIdentStart(b) || (b >= '0' && b <= '9')
 }
+
+// -------------------- pin-aware FROM rewrite --------------------
+
+// PinFromDialect specifies the snapshot-time-travel syntax for a specific
+// query engine. Each engine has its own native syntax for reading a specific
+// Iceberg snapshot.
+type PinFromDialect int
+
+const (
+	// PinDialectTrino uses Trino's `FOR VERSION AS OF <snapshot_id>` syntax.
+	// snapshot_id is a numeric long literal — Trino's engine-side parser
+	// rejects non-numeric values, providing SQL-injection safety without
+	// string-quoting (T-3-pin-fromclause-injection mitigation).
+	PinDialectTrino PinFromDialect = iota
+
+	// PinDialectDremio uses Dremio's `AT SNAPSHOT '<snapshot_id>'` syntax.
+	// snapshot_id is wrapped in single-quotes. The value MUST be validated as
+	// a decimal integer string upstream (PinStore sanitizes via
+	// MustSanitizeCypherLiteral; the value arriving here is already safe for
+	// Cypher but is re-validated as a decimal digit string to avoid SQL
+	// injection in the Dremio wire format). T-3-pin-fromclause-injection.
+	PinDialectDremio
+)
+
+// RewriteFromForSnapshotPin rewrites `query` to target a specific Iceberg
+// snapshot. This is the pin-aware pre-splice step that MUST be called BEFORE
+// SpliceArtifact so the row filter applies to the pinned snapshot's data.
+//
+// The snapshotID must be a decimal integer string (Iceberg snapshot IDs are
+// int64 values). The function validates this before embedding it in the query
+// to prevent SQL injection (T-3-pin-fromclause-injection mitigation).
+//
+// Dialect-specific syntax:
+//   - PinDialectTrino: `SELECT … FROM table FOR VERSION AS OF <snapshotID> …`
+//   - PinDialectDremio: `SELECT … FROM table AT SNAPSHOT '<snapshotID>' …`
+//
+// Returns ErrInjectionFailed if snapshotID is not a valid decimal integer
+// string, or if the query cannot be parsed as a single-table SELECT.
+//
+// Per Pitfall 11: this function never logs the query body.
+func RewriteFromForSnapshotPin(query string, snapshotID string, dialect PinFromDialect) (string, error) {
+	// Validate snapshotID is a decimal integer (Iceberg snapshot IDs are int64).
+	// This is the T-3-pin-fromclause-injection mitigation: we only embed
+	// digits, never arbitrary strings.
+	if !isDecimalInt(snapshotID) {
+		return "", fmt.Errorf("sqlproxy/dialect: snapshot_id %q is not a decimal integer: %w",
+			snapshotID, sqlproxy.ErrInjectionFailed)
+	}
+
+	s, err := parseSelect(query)
+	if err != nil {
+		return "", err
+	}
+
+	// Build the engine-specific time-travel clause.
+	var pinClause string
+	switch dialect {
+	case PinDialectTrino:
+		// Trino: numeric literal — no quotes needed, engine parser enforces int.
+		pinClause = " FOR VERSION AS OF " + snapshotID
+	case PinDialectDremio:
+		// Dremio: single-quoted string. snapshotID is validated as decimal-only
+		// above so single-quoting is safe — no metacharacters possible.
+		pinClause = " AT SNAPSHOT '" + snapshotID + "'"
+	default:
+		return "", fmt.Errorf("sqlproxy/dialect: unknown PinFromDialect %d: %w",
+			dialect, sqlproxy.ErrInjectionFailed)
+	}
+
+	// Reconstruct the query: SELECT <proj> FROM <table><pinClause> [WHERE ...] [tail].
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	b.WriteString(s.projection)
+	b.WriteString(" FROM ")
+	b.WriteString(s.table)
+	b.WriteString(pinClause)
+	if w := strings.TrimSpace(s.where); w != "" {
+		b.WriteString(" WHERE ")
+		b.WriteString(w)
+	}
+	if t := strings.TrimSpace(s.tail); t != "" {
+		b.WriteByte(' ')
+		b.WriteString(t)
+	}
+	return b.String(), nil
+}
+
+// isDecimalInt reports whether s is a non-empty string of decimal digits
+// with an optional leading minus sign. Iceberg snapshot IDs are int64 values
+// (always positive in practice, but the spec doesn't prohibit negatives).
+func isDecimalInt(s string) bool {
+	if s == "" {
+		return false
+	}
+	start := 0
+	if s[0] == '-' {
+		start = 1
+	}
+	if start >= len(s) {
+		return false // bare "-" is not valid
+	}
+	for i := start; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
