@@ -297,4 +297,16 @@ var (
 	ErrCommitConflict     = errors.New("iceberg: commit conflict (rebase required)")
 	ErrCredentialsExpired = errors.New("iceberg: credentials expired")
 	ErrAdapterStub        = errors.New("iceberg: adapter is a stub (use Polaris or Nessie in Phase 1)")
+
+	// ErrPartitionSpecMismatch is returned by the write-coordinator
+	// (Plan 03-09 WriteCoordinatorPreCommit) when the commit's partition
+	// spec_id does not match the table's currently-active spec per the
+	// L3 PartitionSpecStore. The L1 gateway translates this to HTTP 403
+	// + commit_rejected_total{reason="policy_partition_spec_mismatch"}.
+	//
+	// T-3-partition-spec-downgrade mitigation: prevents an engine from
+	// committing against an old (now-superseded) partition layout, which
+	// would silently produce inconsistent scan results across engines that
+	// have already migrated to the new spec.
+	ErrPartitionSpecMismatch = errors.New("iceberg: partition spec mismatch")
 )

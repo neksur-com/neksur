@@ -147,6 +147,27 @@ type Deps struct {
 	// pre-Plan-02-03 callers leave this nil and the binding falls
 	// back to Layer-1 (OIDC claims).
 	AttributeResolver cel.AttributeResolver
+
+	// Phase 3 additions — all nilable per D-3.04 build-tag tier separation.
+	//
+	// PinStore is the L1 SnapshotPin store (BSL Core). Non-nil in all
+	// production builds; used by the POST /pin gateway endpoint to upsert
+	// named snapshot pins. Not consulted by the write-coordinator hook
+	// (pins are a read-path concern — the SQL proxy injectors consult
+	// PinStore.ActivePinsForTable before splicing).
+	PinStore interface{} // *snapshot.PinStore in practice; interface{} to avoid import cycle.
+
+	// WriteConflictStore is the L2 per-table write_conflict_policy store.
+	// nil in L1-only binaries (neksur-server OSS). When non-nil the
+	// write-coordinator attaches the policy to the request ctx so
+	// adapter.CommitTable (Plan 03-10 retry.go) can adjust retry behaviour.
+	WriteConflictStore WriteConflictStore
+
+	// PartitionSpecStore is the L3 enterprise partition-spec version store.
+	// nil in L1 and L2 binaries. When non-nil the write-coordinator
+	// rejects commits whose spec_id does not match the table's active spec
+	// (T-3-partition-spec-downgrade mitigation).
+	PartitionSpecStore PartitionSpecStore
 }
 
 // adapterFor resolves the per-request adapter — Deps.AdapterFactory if
@@ -292,6 +313,35 @@ func CommitHandler(deps Deps) http.HandlerFunc {
 				http.Error(w, "upstream load table failed", http.StatusBadGateway)
 				return
 			}
+		}
+
+		// Step 8.5 — write-coordinator pre-commit hook (D-3.03, Plan 03-09).
+		// Fires between LoadTable (Step 8) and policy fetch (Step 9) for
+		// Trino + Dremio commits only. Gated so L1-only binaries skip the call
+		// entirely when both Phase-3 stores are nil.
+		//
+		// Error mapping:
+		//   ErrPartitionSpecMismatch → 403 + ReasonPolicyPartitionSpecMismatch
+		//   other store errors       → 503 + ReasonPolicyEngineUnavailable
+		if deps.WriteConflictStore != nil || deps.PartitionSpecStore != nil {
+			engineKind := detectEngineKind(r)
+			newCtx, wcErr := WriteCoordinatorPreCommit(r.Context(), deps, engineKind, ref, currentMeta, commit)
+			if wcErr != nil {
+				if errors.Is(wcErr, iceberg.ErrPartitionSpecMismatch) {
+					observability.CommitRejectedTotal.WithLabelValues(
+						observability.ReasonPolicyPartitionSpecMismatch).Inc()
+					http.Error(w, "commit rejected: partition spec mismatch", http.StatusForbidden)
+					return
+				}
+				observability.CommitRejectedTotal.WithLabelValues(
+					observability.ReasonPolicyEngineUnavailable).Inc()
+				slog.Error("gateway: write-coordinator pre-commit failed (fail-closed)", "err", wcErr, "ref", ref)
+				http.Error(w, "policy-engine-unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// Replace the request context with the write-coordinator's enriched ctx
+			// (may carry withConflictPolicy for Plan 03-10 retry.go).
+			r = r.WithContext(newCtx)
 		}
 
 		// Step 9 — policy fetch — FAIL-CLOSED (D-1.09).

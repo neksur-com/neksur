@@ -231,7 +231,7 @@ func (p *polarisAdapter) CommitTable(ctx context.Context, ref iceberg.TableRef, 
 		// Translate commit-conflict shape — Polaris signals a
 		// rebase-required scenario as 409 / CommitFailedException;
 		// callers reload the table and reapply.
-		if isCommitConflict(err) {
+		if IsCommitConflict(err) {
 			return nil, fmt.Errorf("polaris: commit table: %w", iceberg.ErrCommitConflict)
 		}
 		return nil, p.translateError("polaris: commit table", err)
@@ -269,7 +269,7 @@ func (p *polarisAdapter) ExpireSnapshots(ctx context.Context, ref iceberg.TableR
 	}
 	updates := []icebergTable.Update{icebergTable.NewRemoveSnapshotsUpdate(doomed)}
 	if _, _, err := p.cat.CommitTable(ctx, toIdentifier(ref), nil, updates); err != nil {
-		if isCommitConflict(err) {
+		if IsCommitConflict(err) {
 			return fmt.Errorf("polaris: expire snapshots: %w", iceberg.ErrCommitConflict)
 		}
 		return p.translateError("polaris: expire snapshots", err)
@@ -367,12 +367,18 @@ func (p *polarisAdapter) translateError(prefix string, err error) error {
 	return fmt.Errorf("%s: %w", prefix, err)
 }
 
-// isCommitConflict pattern-matches the upstream commit-conflict
+// IsCommitConflict pattern-matches the upstream commit-conflict
 // shape. Polaris (and Iceberg REST in general) signals these as
 // HTTP 409 with a body containing "CommitFailedException" or
 // "commit conflict"; iceberg-go surfaces both verbatim in the
 // error message, so substring matches are the available shape.
-func isCommitConflict(err error) bool {
+//
+// Exported (B-2 absorption, Plan 03-09): Plan 03-10's retry.go
+// imports this helper to detect 409s from the polaris adapter and
+// decide whether to apply the per-table retry policy. Exporting
+// here prevents intra-wave file-overlap between Plans 03-09, 03-10,
+// and 03-12 on polaris/adapter.go.
+func IsCommitConflict(err error) bool {
 	if err == nil {
 		return false
 	}
