@@ -50,10 +50,13 @@ type SnapshotPinReader interface {
 }
 
 // TrinoInjector serves the "trino" engine kind. Thread-safe: the
-// CompiledStore and LRU cache are both safe for concurrent use, and
+// CompiledLoader and LRU cache are both safe for concurrent use, and
 // InjectPolicy holds no per-request mutable state.
+//
+// Plan 03-16: explicit fail-closed branch for CompiledPolicyStatusDivergentSuspended
+// (mirrors dremio.go:170-172; closes 03-VERIFICATION CR-02).
 type TrinoInjector struct {
-	store    *store.CompiledStore
+	loader   CompiledLoader
 	cache    *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
 	pinStore SnapshotPinReader // nil → pin rewrite skipped (L1 + no-pin path)
 }
@@ -64,7 +67,14 @@ type TrinoInjector struct {
 // collide). The pinStore field defaults to nil (pin rewrite skipped).
 // Use NewTrinoInjectorWithPin to enable pin-aware FROM rewriting.
 func NewTrinoInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *TrinoInjector {
-	return &TrinoInjector{store: s, cache: cache}
+	return &TrinoInjector{loader: s, cache: cache}
+}
+
+// NewTrinoInjectorWithLoader constructs a TrinoInjector with a custom
+// CompiledLoader. This constructor exists for unit testing — the
+// production wiring layer calls NewTrinoInjector with a *store.CompiledStore.
+func NewTrinoInjectorWithLoader(loader CompiledLoader, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *TrinoInjector {
+	return &TrinoInjector{loader: loader, cache: cache}
 }
 
 // NewTrinoInjectorWithPin constructs a TrinoInjector with pin-aware FROM
@@ -75,7 +85,7 @@ func NewTrinoInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey
 //
 // Passing nil for pinStore is equivalent to calling NewTrinoInjector.
 func NewTrinoInjectorWithPin(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry], pinStore SnapshotPinReader) *TrinoInjector {
-	return &TrinoInjector{store: s, cache: cache, pinStore: pinStore}
+	return &TrinoInjector{loader: s, cache: cache, pinStore: pinStore}
 }
 
 // InjectPolicy fetches the active Trino CompiledPolicy artifact for
@@ -92,6 +102,8 @@ func NewTrinoInjectorWithPin(s *store.CompiledStore, cache *lru.Cache[sqlproxy.C
 //
 // Per Pitfall 11: this method never logs the query body or the
 // artifact body — error returns wrap sqlproxy sentinels only.
+// divergent_suspended status is treated as fail-closed (503) per D-3.05;
+// Plan 03-11 owns the reason='policy_engine_divergent' metric label.
 func (i *TrinoInjector) InjectPolicy(ctx context.Context, query string, table sqlproxy.TableRef, principal sqlproxy.Claims) (string, string, error) {
 	tid, ok := tenant.IDFromContext(ctx)
 	if !ok {
@@ -130,7 +142,7 @@ func (i *TrinoInjector) InjectPolicy(ctx context.Context, query string, table sq
 		return rewritten, sqlproxy.CacheStatusHit, nil
 	}
 
-	compiled, err := i.store.LoadCompiledForTable(ctx, iceberg.TableRef{
+	compiled, err := i.loader.LoadCompiledForTable(ctx, iceberg.TableRef{
 		Namespace: []string{table.Namespace},
 		Name:      table.Name,
 	})
