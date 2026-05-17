@@ -22,12 +22,11 @@
 // Phase 2 may add an LRU-cached `(tenantID, nickname) → adapter` map at
 // the gateway boundary if profiling shows the construction cost matters.
 //
-// B-3 pre-allocation (Plan 03-03): both the "unity" arm (live, Plan 03-03)
-// and the "glue" arm (still glue_stub, Plan 03-04 flips it to live glue.New
-// WITHOUT re-touching this file — Plan 03-04 creates internal/iceberg/glue/
-// and the glue_stub import is the only thing 03-04 replaces here) are written
-// in this single edit. This eliminates the Wave 1 intra-wave overlap on
-// forwarder.go between Plans 03-03 and 03-04.
+// B-3 resolution (Plans 03-03 + 03-04): both the "unity" arm (live, Plan 03-03)
+// and the "glue" arm (live, Plan 03-04 — flipped from glue_stub to glue.New)
+// are in this single dispatch table. Plan 03-04 created internal/iceberg/glue/
+// and replaced the glue_stub import with the live glue import. This eliminates
+// the Wave 1 intra-wave overlap on forwarder.go between Plans 03-03 and 03-04.
 //
 // Phase 02 CR-03 boot guard (assertNoUnsupportedCatalogs) removed in Plan
 // 03-03 main.go edit — tenants with kind=unity now route to the live adapter;
@@ -42,7 +41,7 @@ import (
 
 	"github.com/neksur-com/neksur/internal/catalog"
 	"github.com/neksur-com/neksur/internal/iceberg"
-	"github.com/neksur-com/neksur/internal/iceberg/glue_stub"
+	"github.com/neksur-com/neksur/internal/iceberg/glue"
 	"github.com/neksur-com/neksur/internal/iceberg/nessie"
 	"github.com/neksur-com/neksur/internal/iceberg/polaris"
 	"github.com/neksur-com/neksur/internal/iceberg/unity"
@@ -70,11 +69,13 @@ type nessieCfg struct {
 	BearerToken   string `json:"bearerToken,omitempty"`
 }
 
-// glueCfg matches glue_stub.Config (no auth fields needed in Phase 1
-// because the stub returns ErrAdapterStub on every state-mutating call).
+// glueCfg matches glue.Config (Plan 03-04 live adapter). Region and
+// CatalogID are required by glue.Config.Validate(). IAMRoleARN is
+// optional metadata (credentials come from the AWS default chain).
 type glueCfg struct {
-	Region    string `json:"region,omitempty"`
-	CatalogID string `json:"catalogId,omitempty"`
+	Region     string `json:"region,omitempty"`
+	CatalogID  string `json:"catalogId,omitempty"`
+	IAMRoleARN string `json:"iamRoleArn,omitempty"`
 }
 
 // unityCfg is the JSON-tagged shape stored in V0060.config_json for
@@ -141,15 +142,19 @@ func BuildAdapter(ctx context.Context, creds *catalog.Credentials) (iceberg.Iceb
 		return nessie.New(ctx, cfg)
 
 	case "glue":
+		// Plan 03-04: live Glue Iceberg REST adapter. glue_stub/ deleted.
+		// B-3 contract satisfied: this arm was pre-allocated by Plan 03-03;
+		// Plan 03-04 creates internal/iceberg/glue/ and switches the import.
 		var gc glueCfg
 		if err := json.Unmarshal(creds.ConfigJSON, &gc); err != nil {
 			return nil, fmt.Errorf("gateway: %w: glue: %v", catalog.ErrConfigUnmarshal, err)
 		}
-		cfg := glue_stub.Config{
-			Region:    gc.Region,
-			CatalogID: gc.CatalogID,
+		cfg := glue.Config{
+			Region:     gc.Region,
+			CatalogID:  gc.CatalogID,
+			IAMRoleARN: gc.IAMRoleARN,
 		}
-		return glue_stub.New(ctx, cfg)
+		return glue.New(ctx, cfg)
 
 	case "unity":
 		// Plan 03-03 D-3.02: live Unity adapter wired; unity_stub deleted.

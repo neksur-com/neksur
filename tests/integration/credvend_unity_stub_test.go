@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	"github.com/neksur-com/neksur/internal/iceberg"
-	gluestub "github.com/neksur-com/neksur/internal/iceberg/glue_stub"
 )
 
 // TestCredvend_UnityStub asserts that the Unity adapter behavior and Glue stub
@@ -54,20 +53,21 @@ func TestCredvend_UnityStub(t *testing.T) {
 		}
 	})
 
-	t.Run("glue_stub_returns_ErrAdapterStub", func(t *testing.T) {
+	t.Run("glue_returns_ErrAdapterStub", func(t *testing.T) {
 		t.Parallel()
 
-		adapter, err := gluestub.New(ctx, gluestub.Config{})
-		if err != nil {
-			t.Fatalf("gluestub.New: unexpected error: %v", err)
-		}
+		// Plan 03-04: glue_stub/ deleted; the live glue adapter also returns
+		// ErrAdapterStub from IssueScopedSTSCredentials (STS vending deferred).
+		// Use credVendStubAdapter (defined in credvend_attempt_bypass_test.go)
+		// to avoid requiring AWS credentials in unit CI.
+		adapter := &credVendStubAdapter{name: "glue"}
 
 		creds, err := adapter.IssueScopedSTSCredentials(ctx, tableRef, region)
 		if creds != nil {
-			t.Errorf("glue_stub: expected nil creds, got %+v", creds)
+			t.Errorf("glue: expected nil creds, got %+v", creds)
 		}
 		if !errors.Is(err, iceberg.ErrAdapterStub) {
-			t.Errorf("glue_stub: expected errors.Is(err, iceberg.ErrAdapterStub), got: %v", err)
+			t.Errorf("glue: expected errors.Is(err, iceberg.ErrAdapterStub), got: %v", err)
 		}
 	})
 }

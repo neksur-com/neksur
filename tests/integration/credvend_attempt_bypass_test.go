@@ -33,7 +33,6 @@ import (
 
 	"github.com/neksur-com/neksur/internal/credvend"
 	"github.com/neksur-com/neksur/internal/iceberg"
-	gluestub "github.com/neksur-com/neksur/internal/iceberg/glue_stub"
 )
 
 // TestCredvend_AttemptBypass validates the fail-closed credential vending
@@ -115,14 +114,15 @@ func TestCredvend_AttemptBypass(t *testing.T) {
 		}
 	})
 
-	t.Run("glue_stub_blocked", func(t *testing.T) {
+	t.Run("glue_blocked", func(t *testing.T) {
 		t.Parallel()
 
+		// Plan 03-04: glue_stub/ deleted; the live glue adapter has
+		// SupportsCredVend=true but IssueScopedSTSCredentials returns
+		// ErrAdapterStub in Phase 3. Use a credVendStubAdapter (defined below)
+		// to mirror that behavior without requiring AWS credentials in unit CI.
 		svc := newSvc(t)
-		adapter, err := gluestub.New(ctx, gluestub.Config{})
-		if err != nil {
-			t.Fatalf("gluestub.New: %v", err)
-		}
+		adapter := &credVendStubAdapter{name: "glue"}
 
 		creds, err := svc.Issue(ctx, tenantID, adapter, tableRef, region)
 

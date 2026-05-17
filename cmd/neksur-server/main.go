@@ -507,10 +507,8 @@ func runWithSaasAuth(ctx context.Context) error {
 	// Plan 03-03: CR-03 boot guard (assertNoUnsupportedCatalogs) removed.
 	// The live Unity adapter (internal/iceberg/unity) ships in Plan 03-03;
 	// kind=unity now routes to a real adapter instead of ErrAdapterStub.
-	// kind=glue still routes to glue_stub until Plan 03-04 ships the live
-	// Glue adapter — tenants with kind=glue will see ErrAdapterStub at
-	// runtime on state-mutating calls, not at boot. The guard is no longer
-	// necessary because unity is live; the glue stub error is self-describing.
+	// Plan 03-04: the live Glue adapter (internal/iceberg/glue) ships;
+	// kind=glue now routes to glue.New with SigV4 transport — glue_stub deleted.
 
 	// HTTP router.
 	mux := http.NewServeMux()
