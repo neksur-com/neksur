@@ -1,0 +1,290 @@
+name: Nightly Cross-Engine Integration Suite (Phase 3)
+
+# Phase 3 Plan 03-15 — nightly CI workflow.
+#
+# Runs the full Phase 3 integration suite against a staging cluster with all
+# four engines configured (Spark + Trino + Dremio + Snowflake-via-Polaris).
+#
+# Per Phase 02 D-2-empirical-pass-deferral pattern:
+#   - PENDING_FIRST_RUN rows in 03-ACCEPTANCE.md §9 flip to PASS on first exit-0.
+#   - Snowflake leg enabled only when NEKSUR_SNOWFLAKE_ACCOUNT secret is set.
+#   - Dremio testcontainer integration tests use nightly build tags.
+#   - License signing roundtrip uses NEKSUR_LICENSE_STAGING_KEY secret.
+#
+# Requirements:
+#   - Staging cluster must be provisioned with Spark + Trino + Dremio + Snowflake
+#     configured as Iceberg REST clients against the Neksur L1 gateway endpoint.
+#     (See Plan 03-15 Task 2.5 checkpoint — staging cluster provisioning).
+#   - GitHub Actions secrets required (see §Secrets below).
+#   - On exit-0: opens a PR to flip PENDING_FIRST_RUN rows in 03-ACCEPTANCE.md.
+#     If staging cluster not yet provisioned: workflow exits non-0 and reports
+#     "PENDING_FIRST_RUN: staging cluster not available" — no PR opened.
+#
+# Secrets (configure in repository settings before first run):
+#   NEKSUR_STAGING_CLUSTER_URL  — Neksur L1 gateway URL on staging cluster
+#   NEKSUR_STAGING_SERVICE_KEY  — Service account key for staging (base64-encoded JSON)
+#   NEKSUR_SNOWFLAKE_ACCOUNT    — Snowflake account identifier (optional; enables Snowflake leg)
+#   NEKSUR_SNOWFLAKE_USER       — Snowflake user (required when ACCOUNT set)
+#   NEKSUR_SNOWFLAKE_PASSWORD   — Snowflake password (required when ACCOUNT set)
+#   NEKSUR_SNOWFLAKE_WAREHOUSE  — Snowflake warehouse (required when ACCOUNT set)
+#   NEKSUR_LICENSE_STAGING_KEY  — ECDSA P-256 private key for staging license signing (base64 PEM)
+#   GITHUB_ACCEPTANCE_PR_TOKEN  — Fine-grained PAT with contents:write for PR flip automation
+
+on:
+  schedule:
+    # 02:00 UTC — off-peak; matches Phase 02 nightly pattern.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_snowflake:
+        description: 'Skip Snowflake leg (true/false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-cross-engine
+  cancel-in-progress: false  # Never cancel in-progress nightly runs.
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Go integration suite (neksur-core) — nightly + integration tags
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-go:
+    name: Go integration suite (nightly + integration tags)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: Pre-pull container images (nightly cache warm)
+        run: |
+          docker pull apache/age:release_PG16_1.6.0
+          docker pull trinodb/trino:467
+          docker pull localstack/localstack:latest
+          # Dremio OSS is pulled on first use by the testcontainer fixture.
+          echo "Image pre-pull complete"
+
+      - name: Install Atlas CLI
+        run: |
+          curl -sSf https://atlasgo.sh | sh
+          atlas version
+
+      - name: Run full integration + nightly suite
+        # Build tags: integration (all Phase 0-2 tests) + nightly (Phase 3 nightly-gated tests)
+        # Timeout: 45min (TestCrossEngineRead4Way dominates at ~30min cold)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+          NEKSUR_STAGING_CLUSTER_URL: ${{ secrets.NEKSUR_STAGING_CLUSTER_URL }}
+          NEKSUR_STAGING_SERVICE_KEY: ${{ secrets.NEKSUR_STAGING_SERVICE_KEY }}
+          NEKSUR_SNOWFLAKE_ACCOUNT: ${{ secrets.NEKSUR_SNOWFLAKE_ACCOUNT }}
+          NEKSUR_SNOWFLAKE_USER: ${{ secrets.NEKSUR_SNOWFLAKE_USER }}
+          NEKSUR_SNOWFLAKE_PASSWORD: ${{ secrets.NEKSUR_SNOWFLAKE_PASSWORD }}
+          NEKSUR_SNOWFLAKE_WAREHOUSE: ${{ secrets.NEKSUR_SNOWFLAKE_WAREHOUSE }}
+          NEKSUR_LICENSE_STAGING_KEY: ${{ secrets.NEKSUR_LICENSE_STAGING_KEY }}
+        run: |
+          go test \
+            -tags=integration,nightly \
+            -timeout=45m \
+            -race \
+            -count=1 \
+            ./tests/integration/...
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-go-test-results
+          path: |
+            tests/load/*.json
+            tests/load/sql-proxy-baseline.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Commercial binary integration (neksur-server-commercial build)
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-commercial:
+    name: Commercial binary (L2 verifier + write-conflict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: integration-go
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build neksur-server-commercial
+        run: make build-commercial
+
+      - name: Run commercial integration tests
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+          NEKSUR_LICENSE_STAGING_KEY: ${{ secrets.NEKSUR_LICENSE_STAGING_KEY }}
+        run: |
+          go test \
+            -tags=integration,nightly,commercial \
+            -timeout=25m \
+            -count=1 \
+            ./tests/integration/...
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Enterprise binary integration (neksur-server-enterprise build)
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-enterprise:
+    name: Enterprise binary (L3 partition-spec + compaction)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: integration-go
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build neksur-server-enterprise
+        run: make build-enterprise
+
+      - name: Run enterprise integration tests
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+          NEKSUR_LICENSE_STAGING_KEY: ${{ secrets.NEKSUR_LICENSE_STAGING_KEY }}
+        run: |
+          go test \
+            -tags=integration,nightly,commercial,enterprise \
+            -timeout=25m \
+            -count=1 \
+            ./tests/integration/...
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 4: Tier isolation check (Pitfall 7 mitigation — Plan 03-13)
+  # ─────────────────────────────────────────────────────────────────────────
+  tier-isolation:
+    name: L1 binary tier isolation (Pitfall 7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: integration-go
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build all tiers
+        run: make build-all
+
+      - name: Verify L1 binary tier isolation
+        run: make verify-tier-isolation
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 5: Auto-suspend dry-run (D-3.05 divergent engine suspension)
+  # ─────────────────────────────────────────────────────────────────────────
+  auto-suspend-dryrun:
+    name: Auto-suspend dry-run (D-3.05)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: integration-commercial
+
+    steps:
+      - name: Checkout neksur-core
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run auto-suspend dry-run test
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+          NEKSUR_VERIFIER_DRY_RUN: "true"
+        run: |
+          go test \
+            -tags=integration,nightly,commercial \
+            -timeout=20m \
+            -run TestDivergenceVerifierAutoSuspend \
+            ./tests/integration/...
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 6: Flip PENDING_FIRST_RUN rows in 03-ACCEPTANCE.md (on all PASS)
+  # ─────────────────────────────────────────────────────────────────────────
+  flip-acceptance-rows:
+    name: Flip PENDING_FIRST_RUN rows in 03-ACCEPTANCE.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - integration-go
+      - integration-commercial
+      - integration-enterprise
+      - tier-isolation
+      - auto-suspend-dryrun
+    if: success()
+
+    steps:
+      - name: Checkout neksur planning repo
+        uses: actions/checkout@v4
+        with:
+          # The 03-ACCEPTANCE.md lives in the planning repo (neksur), not neksur-core.
+          # If this workflow lives only in neksur-core, the PR flip is done manually per
+          # runbooks/divergence-clear.md §Acceptance gate flip procedure.
+          # When the planning repo is configured as a target, uncomment:
+          # repository: neksur-com/neksur
+          # token: ${{ secrets.GITHUB_ACCEPTANCE_PR_TOKEN }}
+          # For now: log the required manual action.
+          token: ${{ github.token }}
+
+      - name: Record nightly CI exit-0 result
+        run: |
+          echo "Nightly cross-engine suite: ALL JOBS PASSED — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "PENDING_FIRST_RUN rows to flip in 03-ACCEPTANCE.md:"
+          echo "  - §9 4-way cross-engine read test (TestCrossEngineRead4Way)"
+          echo "  - §9 Dremio testcontainer integration tests"
+          echo "  - §9 License signing roundtrip in CI"
+          echo "  - §9 Auto-suspend divergent engine end-to-end"
+          echo "  - §9 Compaction snapshot-retention guard end-to-end"
+          echo ""
+          echo "Manual action required (if planning repo PR is not automated):"
+          echo "  Edit .planning/phases/03-multi-engine-adapters-coordination-spark-trino-snowflake-dre/03-ACCEPTANCE.md"
+          echo "  Replace PENDING_FIRST_RUN with PASS for the rows above."
+          echo "  Commit and merge the PR with the nightly CI run URL as evidence."
+
+      - name: Open PR to flip acceptance rows (requires GITHUB_ACCEPTANCE_PR_TOKEN)
+        # This step requires the planning repo to be checked out and the token
+        # configured. Until the staging cluster is provisioned (Plan 03-15 Task 2.5),
+        # this step will report the manual flip procedure and exit 0.
+        run: |
+          echo "Acceptance row flip: staging cluster provisioning required before automation."
+          echo "See runbooks/divergence-clear.md §Acceptance gate flip procedure."
+          echo "Manual flip: operator edits 03-ACCEPTANCE.md §9 and opens a PR referencing this run."
+          echo "Run URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
