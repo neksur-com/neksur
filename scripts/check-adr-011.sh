@@ -76,6 +76,9 @@ EXCLUDE_FILES=(
   ".check-adr-011.pattern"       # pattern file
   "nightly-cross-engine.yml"     # engineering CI: binary tier matrix
   "build-matrix.yml"             # engineering CI: tier-isolation tests
+  "neksur-spec-v0.7.md"             # SUPERSEDED predecessor (Phase 03.1 OQ#1): retained in base/ for cross-reference, body unchanged
+  "neksur-business-model-v0.5.md"   # SUPERSEDED predecessor (Phase 03.1 OQ#1): retained in base/ for cross-reference, body unchanged
+  "neksur-market-analysis-v0.4.md"  # SUPERSEDED predecessor (Phase 03.1 OQ#1): retained in base/ for cross-reference, body unchanged
 )
 
 # Build grep exclusion args.
