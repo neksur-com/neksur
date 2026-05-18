@@ -7,6 +7,9 @@
 // per-dialect compiler emits inside artifact bodies (already
 // handled by the Phase 2 internal/policy/compiler/dialect/
 // subdirectory).
+//
+// Plan 03-16: explicit fail-closed branch for CompiledPolicyStatusDivergentSuspended
+// (mirrors dremio.go:170-172 + trino.go post-Plan-03-16; closes 03-VERIFICATION CR-02).
 
 package dialect
 
@@ -25,14 +28,21 @@ import (
 // SparkInjector serves the "spark" engine kind. See TrinoInjector for
 // the per-field rationale — the two structs share an identical shape.
 type SparkInjector struct {
-	store *store.CompiledStore
-	cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
+	loader CompiledLoader
+	cache  *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]
 }
 
 // NewSparkInjector constructs a SparkInjector bound to the given
 // CompiledStore + shared LRU cache.
 func NewSparkInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *SparkInjector {
-	return &SparkInjector{store: s, cache: cache}
+	return &SparkInjector{loader: s, cache: cache}
+}
+
+// NewSparkInjectorWithLoader constructs a SparkInjector with a custom
+// CompiledLoader. This constructor exists for unit testing — the
+// production wiring layer calls NewSparkInjector with a *store.CompiledStore.
+func NewSparkInjectorWithLoader(loader CompiledLoader, cache *lru.Cache[sqlproxy.CacheKey, sqlproxy.ArtifactEntry]) *SparkInjector {
+	return &SparkInjector{loader: loader, cache: cache}
 }
 
 // InjectPolicy fetches the active Spark CompiledPolicy artifact for
@@ -41,6 +51,8 @@ func NewSparkInjector(s *store.CompiledStore, cache *lru.Cache[sqlproxy.CacheKey
 // comment-appending rewrite).
 //
 // Per Pitfall 11: no query body or artifact body is ever logged.
+// divergent_suspended status is treated as fail-closed (503) per D-3.05;
+// Plan 03-11 owns the reason='policy_engine_divergent' metric label.
 func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sqlproxy.TableRef, principal sqlproxy.Claims) (string, string, error) {
 	tid, ok := tenant.IDFromContext(ctx)
 	if !ok {
@@ -62,7 +74,7 @@ func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sq
 		return rewritten, sqlproxy.CacheStatusHit, nil
 	}
 
-	compiled, err := i.store.LoadCompiledForTable(ctx, iceberg.TableRef{
+	compiled, err := i.loader.LoadCompiledForTable(ctx, iceberg.TableRef{
 		Namespace: []string{table.Namespace},
 		Name:      table.Name,
 	})
@@ -70,8 +82,26 @@ func (i *SparkInjector) InjectPolicy(ctx context.Context, query string, table sq
 		return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/spark: load: %w", sqlproxy.ErrPolicyEngineUnavailable)
 	}
 
+	// Pre-pass: check for divergent_suspended rows before processing any
+	// active rows. A divergent_suspended row for "spark" wins over any
+	// active row regardless of slice order (T-3-16-stale-active-shadow).
+	// divergent_suspended is fail-closed (D-3.05 — Plan 03-11 verifier
+	// auto-suspend takes effect here). Plan 03-11 maps
+	// ErrPolicyEngineUnavailable to the
+	// sql_proxy_inject_failures_total{reason='policy_engine_divergent'} label.
 	for _, cp := range compiled {
-		if cp.EngineKind != "spark" || cp.Status != store.CompiledPolicyStatusActive {
+		if cp.EngineKind != "spark" {
+			continue
+		}
+		if cp.Status == store.CompiledPolicyStatusDivergentSuspended {
+			return "", sqlproxy.CacheStatusError, fmt.Errorf("dialect/spark: policy_engine_divergent: %w", sqlproxy.ErrPolicyEngineUnavailable)
+		}
+	}
+	for _, cp := range compiled {
+		if cp.EngineKind != "spark" {
+			continue
+		}
+		if cp.Status != store.CompiledPolicyStatusActive {
 			continue
 		}
 		if cp.ArtifactKind == store.KindPredicate {

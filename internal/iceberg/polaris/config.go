@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/neksur-com/neksur/internal/iceberg"
 )
 
 // ErrInvalidConfig is the package sentinel returned when Validate
@@ -85,6 +87,21 @@ type Config struct {
 	// struct at construction time. Production-runtime nil is the default;
 	// no behavior change for non-test callers.
 	BaseTransportWrap func(http.RoundTripper) http.RoundTripper
+
+	// CompactionCoordinator is an OPTIONAL L3 compaction coordinator that is
+	// consulted before executing ExpireSnapshots. When non-nil, the adapter
+	// calls GuardExpireSnapshots to partition candidate snapshot IDs into
+	// allowed (safe to expire) and blocked (retained by an active SnapshotPin).
+	// Only the allowed IDs are passed to iceberg-go's actual expiration call.
+	//
+	// When nil (L1+L2 binaries): ExpireSnapshots runs unmodified — full candidate
+	// set is expired without consulting any pin store (no false protection).
+	//
+	// This field is on Config (declarative per D-1.03) rather than a
+	// functional-option so all adapter configuration is visible at construction
+	// time. Production wiring (Plan 03-13) sets this when the neksur-enterprise
+	// module is present and the license permits "compaction_coordination".
+	CompactionCoordinator iceberg.CompactionCoordinator
 }
 
 // Validate checks the four required fields are non-empty. Defaults

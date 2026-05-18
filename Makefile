@@ -4,7 +4,7 @@
 # invocation; complex orchestration lives in the workflow / docker-compose
 # layer, not here.
 
-.PHONY: build test test-unit test-integration test-security lint tidy run-server run-worker run-cli migrate migrate-baseline migrate-apply migrate-status migrate-tenant clean
+.PHONY: build test test-unit test-integration test-security lint tidy run-server run-worker run-cli migrate migrate-baseline migrate-apply migrate-status migrate-tenant clean build-core build-commercial build-enterprise build-all verify-tier-isolation
 
 # Default — what `make` with no args does.
 all: build test
@@ -107,6 +107,45 @@ migrate-tenant:
 	@test -n "$$DATABASE_URL" || (echo "ERROR: DATABASE_URL is required" && exit 1)
 	@test -n "$(TENANT)" || (echo "ERROR: TENANT is required, e.g. TENANT=tenant_<uuid_underscored>" && exit 1)
 	go run ./cmd/migrate --tenant $(TENANT)
+
+# --- Three-binary tier builds (Plan 03-13) -----------------------------------
+# D-3.04 / ADR-002: three binary build matrix per deployment tier.
+# Each target produces a single artifact in ./bin/ with the correct tags.
+#
+# L1 (BSL Core): no private modules, no license required.
+# L2 (Commercial): includes neksur-commercial (schemacache, writeconflict, verifier).
+# L3 (Enterprise): includes neksur-commercial + neksur-enterprise (partitionspec, compaction).
+#
+# CI/PRODUCTION: private modules are fetched via GOPROXY (Plan 03-15 runbook).
+# LOCAL DEV: replace directives in go.mod map private modules to ../neksur-commercial
+# and ../neksur-enterprise.
+
+# L1 — BSL Core binary. No build tags. No license required.
+build-core:
+	mkdir -p bin
+	go build -tags='' -o ./bin/neksur-server ./cmd/neksur-server
+
+# L2 — Commercial binary. Includes schemacache + writeconflict + verifier.
+# Requires a valid "commercial" or "enterprise" tier license at boot.
+build-commercial:
+	mkdir -p bin
+	go build -tags='commercial' -o ./bin/neksur-server-commercial ./cmd/neksur-server
+
+# L3 — Enterprise binary. Includes all L2 features + partitionspec + compaction.
+# Requires a valid "enterprise" tier license at boot.
+build-enterprise:
+	mkdir -p bin
+	go build -tags='commercial enterprise' -o ./bin/neksur-server-enterprise ./cmd/neksur-server
+
+# Build all three binary tiers.
+build-all: build-core build-commercial build-enterprise
+
+# Pitfall 7 (build-tag drift) verification: confirms the L1 binary contains
+# NO private module symbols from the L2/L3 coordination packages. Runs
+# scripts/ci/binary-symbol-check.sh against ./bin/neksur-server.
+# CI runs this automatically after build-core in the build-matrix workflow.
+verify-tier-isolation: build-core
+	./scripts/ci/binary-symbol-check.sh ./bin/neksur-server
 
 # Wipe build artifacts.
 clean:

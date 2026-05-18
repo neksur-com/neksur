@@ -65,6 +65,7 @@ import (
 	"github.com/neksur-com/neksur/internal/graph"
 	"github.com/neksur-com/neksur/internal/iceberg"
 	"github.com/neksur-com/neksur/internal/ingest"
+	"github.com/neksur-com/neksur/internal/license"
 	lineagehttp "github.com/neksur-com/neksur/internal/lineage/http"
 	"github.com/neksur-com/neksur/internal/observability"
 	celpolicy "github.com/neksur-com/neksur/internal/policy/cel"
@@ -250,6 +251,68 @@ func runWithObservability(ctx context.Context) error {
 //   - The SaaS auth path is intentionally separate from the Phase 0
 //     observability/REST path so the two can be brought up independently.
 func runWithSaasAuth(ctx context.Context) error {
+	// Plan 03-13: License verification at boot.
+	//
+	// requiresLicense is a build-tag-gated package-level var:
+	//   - false in main_core.go   (L1 BSL Core binary — license optional)
+	//   - true  in main_commercial.go and main_enterprise.go (L2/L3 binaries)
+	//
+	// T-3-license-required-bypass: L2/L3 binaries log.Fatal without a valid
+	// license. L1 binary skips this block entirely.
+	const defaultLicensePath = "/etc/neksur/license.json"
+	licensePath := os.Getenv("NEKSUR_LICENSE_PATH")
+	if licensePath == "" {
+		licensePath = defaultLicensePath
+	}
+	if requiresLicense {
+		manifestBytes, err := os.ReadFile(licensePath)
+		if err != nil {
+			slog.Error("license: cannot read license file — refuse to boot",
+				"path", licensePath, "err", err)
+			os.Exit(1)
+		}
+		manifest, err := license.Verify(manifestBytes)
+		if err != nil {
+			slog.Error("license: verification failed — refuse to boot",
+				"path", licensePath, "err", err)
+			os.Exit(1)
+		}
+		// T-3-tier-license-mismatch: verify the manifest Tier matches the binary tier.
+		// L3 enterprise binary requires Tier="enterprise"; L2 commercial requires
+		// Tier="commercial" OR "enterprise" (enterprise license covers commercial).
+		// Checked here so the error is surfaced at boot rather than at first feature check.
+		// Determine required tier from binary build tags.
+		// The requiredLicenseTier() function is declared in each main_*.go file.
+		binaryTier := requiredLicenseTier()
+		if !tierCovers(manifest.Tier, binaryTier) {
+			slog.Error("license: tier mismatch — refuse to boot",
+				"license_tier", manifest.Tier,
+				"required_tier", binaryTier,
+			)
+			os.Exit(1)
+		}
+		license.SetManifest(manifest)
+		slog.Info("license: verified and loaded",
+			"license_id", manifest.LicenseID,
+			"tier", manifest.Tier,
+			"expiry_utc", manifest.ExpiryUTC,
+		)
+
+		// Start the fsnotify hot-reload watcher for the license file.
+		// On file rotation, the watcher calls license.SetManifest with the
+		// new manifest (or keeps the previous manifest on parse error — graceful degradation).
+		lw, lwErr := license.NewLicenseWatcher(licensePath)
+		if lwErr != nil {
+			slog.Error("license: failed to create watcher", "err", lwErr)
+		} else {
+			go func() {
+				if err := lw.Watch(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Error("license: watcher exited", "err", err)
+				}
+			}()
+		}
+	}
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return errors.New("DATABASE_URL must be set when NEKSUR_SAAS_AUTH=1")
@@ -324,6 +387,14 @@ func runWithSaasAuth(ctx context.Context) error {
 		IngestSvc:         ingest.NewService(graphClient),
 		AttributeResolver: attrResolver,
 	}
+
+	// Plan 03-13: start L2/L3 commercial/enterprise modules after gateway deps
+	// are built. Both calls are no-ops in the L1-only binary (main_core.go stubs).
+	// In the L2 binary (main_commercial.go) initCommercialModules wires
+	// schemacache + writeconflict + verifier. In the L3 binary
+	// (main_enterprise.go) both functions wire all five L2+L3 features.
+	initCommercialModules(gatewayDeps)
+	initEnterpriseModules(gatewayDeps)
 
 	// Dialect registry — per-engine SQL emitters. Each constructor is
 	// stateless; one instance per process is shared across all
@@ -694,6 +765,20 @@ func runWithSaasAuth(ctx context.Context) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil
+}
+
+// tierCovers reports whether the license tier covers the required binary tier.
+// An "enterprise" license covers "commercial" binary builds (enterprise is a superset).
+// A "commercial" license does NOT cover "enterprise" binary builds.
+func tierCovers(licTier, required string) bool {
+	switch required {
+	case "enterprise":
+		return licTier == "enterprise"
+	case "commercial":
+		return licTier == "commercial" || licTier == "enterprise"
+	default:
+		return true // L1 (core) has no tier requirement
+	}
 }
 
 // tenantExistsAdapter satisfies compiler.TenantValidator. The lookup

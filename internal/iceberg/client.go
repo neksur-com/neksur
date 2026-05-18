@@ -297,4 +297,40 @@ var (
 	ErrCommitConflict     = errors.New("iceberg: commit conflict (rebase required)")
 	ErrCredentialsExpired = errors.New("iceberg: credentials expired")
 	ErrAdapterStub        = errors.New("iceberg: adapter is a stub (use Polaris or Nessie in Phase 1)")
+
+	// ErrPartitionSpecMismatch is returned by the write-coordinator
+	// (Plan 03-09 WriteCoordinatorPreCommit) when the commit's partition
+	// spec_id does not match the table's currently-active spec per the
+	// L3 PartitionSpecStore. The L1 gateway translates this to HTTP 403
+	// + commit_rejected_total{reason="policy_partition_spec_mismatch"}.
+	//
+	// T-3-partition-spec-downgrade mitigation: prevents an engine from
+	// committing against an old (now-superseded) partition layout, which
+	// would silently produce inconsistent scan results across engines that
+	// have already migrated to the new spec.
+	ErrPartitionSpecMismatch = errors.New("iceberg: partition spec mismatch")
 )
+
+// CompactionCoordinator is the narrow interface the polaris adapter uses to
+// consult the L3 compaction coordinator before expiring Iceberg snapshots.
+//
+// Production wiring (Plan 03-13) injects an adapter that wraps
+// *compaction.Coordinator (from neksur-enterprise) which satisfies this
+// interface. L1+L2 binaries pass nil — the adapter skips the guard entirely
+// and runs ExpireSnapshots unmodified (no false sense of protection for tiers
+// that don't have the compaction_coordination license feature).
+//
+// Interface defined here (internal/iceberg/) rather than in the polaris
+// sub-package to keep it accessible from multiple catalog adapters and from
+// the gateway that wires the Deps struct.
+type CompactionCoordinator interface {
+	// GuardExpireSnapshots partitions candidates into allowed and blocked
+	// based on whether any active SnapshotPin retains each candidate.
+	// The caller MUST only expire snapshots in the allowed slice.
+	// candidateIDs are snapshot ID strings (decimal int64 representations).
+	GuardExpireSnapshots(
+		ctx context.Context,
+		ref TableRef,
+		candidateIDs []string,
+	) (allowed, blocked []string, err error)
+}

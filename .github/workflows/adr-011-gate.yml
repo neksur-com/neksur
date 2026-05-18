@@ -1,0 +1,15 @@
+name: ADR-011 grep-gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  check-adr-011:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ADR-011 retired-language gate
+        run: bash scripts/check-adr-011.sh

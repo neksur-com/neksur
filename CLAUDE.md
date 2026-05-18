@@ -2,9 +2,10 @@
 
 ## Project context
 
-Neksur — Open Lakehouse Governance Plane. Cross-engine policy enforcement
-для Apache Iceberg lakehouses. Per `docs/decisions/` ADRs and the
-authoritative Phase 0 constraint document `docs/phase-0-stack.md`.
+Neksur — Data Contract Plane for Open Lakehouses. Cross-engine enforcement
+of Data Contracts (Meaning, Access, State) on Apache Iceberg lakehouses.
+Per `docs/decisions/` ADRs and the authoritative Phase 0 constraint
+document `docs/phase-0-stack.md`.
 
 ## Phase scope (CRITICAL)
 

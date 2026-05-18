@@ -11,7 +11,7 @@ Neksur Core is licensed under the **Business Source License 1.1** (BSL 1.1), wit
 | Parameter | Value |
 |---|---|
 | **Licensor** | Neksur (legal entity to be formalized prior to first paying customer) |
-| **Licensed Work** | Neksur Core — the source-available core of the Neksur Open Lakehouse Control Plane for Apache Iceberg |
+| **Licensed Work** | Neksur Core — the source-available core of the Neksur Data Contract Plane for Open Lakehouses |
 | **Change Date** | 2030-05-10 (four years from ratification of ADR-002) |
 | **Change License** | Apache License, Version 2.0 |
 | **Additional Use Grant** | See below |
@@ -49,7 +49,7 @@ This is a one-way ratchet: the project becomes more open over time, never less.
 
 ## Why Not Just Use Apache 2.0 From the Start?
 
-The BSL approach lets us sustain commercial development of premium features (RLS enforcement, multi-engine L2/L3, compliance bundles, ML anomaly detection, advanced write-path enforcement) while keeping the core open and free for internal use. Without the Additional Use Grant, a hyperscaler could package Neksur Core as a managed service and undercut Neksur's commercial offering — eliminating the funding source for ongoing core development.
+The BSL approach lets us sustain commercial development of the Multi-Engine, Defense-in-Depth, and Intelligence tiers (cross-engine policy enforcement, Write-path enforcement, Continuous compliance scan, Compute isolation, ML classification and anomaly detection) while keeping the core open and free for internal use. Without the Additional Use Grant, a hyperscaler could package Neksur Core as a managed service and undercut Neksur's commercial offering — eliminating the funding source for ongoing core development.
 
 The four-year Change Date is a credible public commitment: we believe the core will be valuable to the open lakehouse ecosystem long after we stop being its primary commercial steward. Once Neksur has reached commercial maturity (or fails to), the source becomes Apache 2.0 — community owned.
 
